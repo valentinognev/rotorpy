@@ -133,7 +133,7 @@ R = 0.5
 for i in range(Nc):
     x0 = np.array([-2 + R*np.cos(i*2*np.pi/Nc), R*np.sin(i*2*np.pi/Nc), 0])
     xf = np.array([ 2 + R*np.cos(i*2*np.pi/Nc), R*np.sin(i*2*np.pi/Nc), 0])
-    config_list.append((MinSnap(points=np.row_stack((x0, xf)), v_avg=1.0, verbose=False), 0, tf, dt))
+    config_list.append((MinSnap(points=np.vstack((x0, xf)), v_avg=1.0, verbose=False), 0, tf, dt))
 
 # Run RotorPy in parallel. 
 with multiprocessing.Pool() as pool:

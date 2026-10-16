@@ -1,5 +1,9 @@
 # Updates
 
+## 3.2.0 - Camera homing animation
+- `examples/camera_homing.py` plays the nominal flight as a third-person 3D view beside the drone camera, using the same animation layout as `camera_demo.py`.
+- The sweep still prints one line per navigation constant.
+
 ## 3.1.0 - Camera homing example
 - `examples/camera_homing.py` prints one nominal camera-homing miss or timeout.
 - `--sweep` repeats the flight for navigation constants 2, 3, 4, and 5.

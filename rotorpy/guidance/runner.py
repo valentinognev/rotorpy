@@ -1,9 +1,17 @@
-"""Closed-loop camera-homing flight. Images are rendered and discarded."""
+"""Closed-loop camera-homing flight.
+
+Guidance renders each frame and drops it. A recorded flight keeps a
+downsampled copy for the example animation.
+"""
 
 import copy
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
+
+from rotorpy.sensors.camera import PinholeCamera
+from rotorpy.world import World
 
 from rotorpy.controllers.quadrotor_control import SE3Control
 from rotorpy.guidance.camera_geometry import (
@@ -29,6 +37,56 @@ from rotorpy.vehicles.multirotor import Multirotor
 _SIM_DT = 0.01
 _CAMERA_PERIOD = 0.05
 _CAMERA_TOL = 1e-9
+_PREVIEW_SIDE = 280
+
+
+@dataclass
+class HomingRecord:
+    """One homing flight, with camera frames small enough to animate."""
+
+    time: np.ndarray
+    position: np.ndarray
+    quaternion: np.ndarray
+    wind: np.ndarray
+    image_time: np.ndarray
+    image: np.ndarray
+    world: World
+    camera: PinholeCamera
+
+
+def preview_image(image: np.ndarray, side: int = _PREVIEW_SIDE) -> np.ndarray:
+    """Shrink `image` so its long side is at most `side` pixels.
+
+    Each output pixel is the reddest source pixel in its block. A plain
+    average or nearest sample would hide the box while it still covers
+    only a few pixels of the full frame.
+    """
+    frame = np.asarray(image)
+    height, width = frame.shape[:2]
+    step = max(1, int(np.ceil(max(height, width) / float(side))))
+    if step == 1:
+        return _as_uint8(frame)
+    cropped_h = (height // step) * step
+    cropped_w = (width // step) * step
+    # (block row, pixel row, block col, pixel col, channel)
+    blocks = frame[:cropped_h, :cropped_w].reshape(
+        cropped_h // step, step, cropped_w // step, step, frame.shape[2]
+    )
+    blocks = np.transpose(blocks, (0, 2, 1, 3, 4))
+    flat = blocks.reshape(
+        cropped_h // step, cropped_w // step, step * step, frame.shape[2]
+    )
+    redness = flat[..., 0] - np.maximum(flat[..., 1], flat[..., 2])
+    pick = np.argmax(redness, axis=2)
+    rows = np.arange(flat.shape[0])[:, None]
+    cols = np.arange(flat.shape[1])[None, :]
+    return _as_uint8(flat[rows, cols, pick])
+
+
+def _as_uint8(image: np.ndarray) -> np.ndarray:
+    if image.dtype == np.uint8:
+        return np.ascontiguousarray(image)
+    return np.ascontiguousarray(np.clip(np.asarray(image) * 255.0, 0, 255).astype(np.uint8))
 
 
 def flight_status(
@@ -73,8 +131,23 @@ def run_homing(nav_constant: float = 3.0, lock_pixels: int = 36) -> HomingOutcom
 
     Simulation is 100 Hz. The camera and homing law update at 20 Hz; other
     steps pass image=None. Wind stays zero. The flat-output position is the
-    position before the step.
+    position before the step. Images are discarded.
     """
+    outcome, _ = _fly_homing(nav_constant, lock_pixels, record=False)
+    return outcome
+
+
+def run_recorded_homing(
+    nav_constant: float = 3.0, lock_pixels: int = 36
+) -> Tuple[HomingOutcome, HomingRecord]:
+    """Same flight as `run_homing`, plus the poses and camera previews."""
+    outcome, record = _fly_homing(nav_constant, lock_pixels, record=True)
+    return outcome, record
+
+
+def _fly_homing(
+    nav_constant: float, lock_pixels: int, record: bool
+) -> Tuple[HomingOutcome, Optional[HomingRecord]]:
     world = nominal_world()
     camera = nominal_camera()
     width, height = square_resolution()
@@ -98,26 +171,58 @@ def run_homing(nav_constant: float = 3.0, lock_pixels: int = 36) -> HomingOutcom
         enable_ground=True,
     )
 
+    times: List[float] = []
+    positions: List[np.ndarray] = []
+    quaternions: List[np.ndarray] = []
+    winds: List[np.ndarray] = []
+    image_times: List[float] = []
+    images: List[np.ndarray] = []
+
+    def history() -> Optional[HomingRecord]:
+        if not record:
+            return None
+        return HomingRecord(
+            time=np.asarray(times, dtype=float),
+            position=np.vstack(positions),
+            quaternion=np.vstack(quaternions),
+            wind=np.vstack(winds),
+            image_time=np.asarray(image_times, dtype=float),
+            image=np.stack(images),
+            world=world,
+            camera=camera,
+        )
+
     locked = False
     step_index = 0
     while True:
         t = step_index * _SIM_DT
         status = flight_status(t, locked, float(state["x"][2]), state["v"])
-        if status == "ground":
-            return miss_outcome(sim_to_ned(state["x"]), t)
-        if status == "timeout":
-            return timeout_outcome(t)
+        if record:
+            times.append(t)
+            positions.append(np.array(state["x"], dtype=float, copy=True))
+            quaternions.append(np.array(state["q"], dtype=float, copy=True))
+            winds.append(np.array(state["wind"], dtype=float, copy=True))
 
-        if _camera_due(t):
-            image = camera.render(world, state)["image"]
-        else:
-            image = None
+        rendered = None
+        if status is None and _camera_due(t):
+            rendered = camera.render(world, state)["image"]
+        elif record and status is not None:
+            rendered = camera.render(world, state)["image"]
+        if record and rendered is not None:
+            images.append(preview_image(rendered))
+            image_times.append(t)
+
+        if status == "ground":
+            return miss_outcome(sim_to_ned(state["x"]), t), history()
+        if status == "timeout":
+            return timeout_outcome(t), history()
+
         command = guidance.update(
             t,
             float(state["x"][2]),
             state["q"],
             sim_to_ned(state["v"]),
-            image,
+            rendered,
         )
         if command.locked:
             locked = True

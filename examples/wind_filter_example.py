@@ -186,8 +186,8 @@ for i in range(num_trials):
     body_vel = (RT@vel)[:,:,0]
 
     # Extract the acceleration, compute the acceleration minus the commanded thrust to isolate aerodynamic forces
-    accel = calibration_data[['ax', 'ay', 'az']].to_numpy()
-    accel[:,2] -= (calibration_data['thrustdes']/trial_params['mass'])
+    accel = calibration_data[['ax', 'ay', 'az']].to_numpy(copy=True)
+    accel[:,2] -= calibration_data['thrustdes'].to_numpy() / trial_params['mass']
     abs_accel = np.abs(accel)
 
     # Fit aero parameters
