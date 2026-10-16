@@ -2,7 +2,7 @@
 A Python-based multirotor simulation environment with aerodynamic wrenches, useful for education and research in estimation, planning, and control for UAVs.
 <p align="center"><img src="/media/double_pillar.gif" width="32%"/><img src="/media/gusty.gif" width="32%"/><img src="/media/minsnap.gif" width="32%"/></p>
 
-**NEW in `v3.0`**: RotorPy now includes a fast (non-photorealistic) camera sensor for developing and testing vision algorithms (visual odometry, vision-based policies, etc.). Check out the new examples: [`camera_demo.py`](/examples/camera_demo.py), [`camera_visualization.py`](/examples/camera_visualization.png), and  [`visual_servoing_policy.py`](/examples/visual_servoing_policy.py).
+**NEW in `v3.0`**: RotorPy now includes a fast (non-photorealistic) camera sensor for developing and testing vision algorithms (visual odometry, vision-based policies, etc.). Check out the new examples: [`camera_demo.py`](/examples/camera_demo.py), [`camera_visualization.py`](/examples/camera_visualization.png), [`visual_servoing_policy.py`](/examples/visual_servoing_policy.py), and [`camera_homing.py`](/examples/camera_homing.py).
 <p align="center"><img src="/media/camera_demo.gif" width="50%"/><img src="/media/visual_servoing_example.gif" width="50%">
 <p align="center"><img src="/media/camera_highlight.png" width="100%">
 
@@ -133,4 +133,8 @@ See how academics have been using RotorPy:
 
 # Acknowledgements
 
-We would like to acknowledge [Jimmy Paulos](https://github.com/jpaulos) who wrote the majority of the underlying engine for RotorPy, and the teaching assistants who contributed code to the initial version of this simulator, especially [Dan Mox](https://github.com/danmox), [Laura Jarin-Lipschitz](https://github.com/ljarin), [Rebecca Li](https://github.com/rebeccali), [Shane Rozen-Levy](https://github.com/ShaneRozenLevy), [Xu Liu](https://github.com/XuRobotics), [Yuezhan Tao](https://github.com/tyuezhan), [Yu-Ming Chen](https://github.com/yminchen), and [Fernando Cladera](https://github.com/fcladera). 
+We would like to acknowledge [Jimmy Paulos](https://github.com/jpaulos) who wrote the majority of the underlying engine for RotorPy, and the teaching assistants who contributed code to the initial version of this simulator, especially [Dan Mox](https://github.com/danmox), [Laura Jarin-Lipschitz](https://github.com/ljarin), [Rebecca Li](https://github.com/rebeccali), [Shane Rozen-Levy](https://github.com/ShaneRozenLevy), [Xu Liu](https://github.com/XuRobotics), [Yuezhan Tao](https://github.com/tyuezhan), [Yu-Ming Chen](https://github.com/yminchen), and [Fernando Cladera](https://github.com/fcladera).
+
+## Reading order for agents
+1. Read this `README.md`.
+2. Read `UPDATES.md` for the change history and current state before working. 

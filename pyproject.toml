@@ -93,9 +93,10 @@ include = ["rotorpy", "rotorpy.*"]
 [tool.setuptools]
 
 [tool.pytest.ini_options]
-addopts = '-m "not run_examples"'
+addopts = '-m "not run_examples and not homing_e2e"'
 markers = [
     "run_examples: full end-to-end execution of just the examples in ./examples/",
+    "homing_e2e: full Hummingbird camera-homing flights",
 ]
 filterwarnings = [
     "ignore:Matplotlib is currently using agg.*:UserWarning",
