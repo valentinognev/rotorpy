@@ -24,6 +24,8 @@ dependencies = [
     'pyyaml',
     'cvxopt',
     'matplotlib',
+    'plotly>=5.18',
+    'pillow',
     'numpy>=1.24',
     'scipy',
     'pandas',

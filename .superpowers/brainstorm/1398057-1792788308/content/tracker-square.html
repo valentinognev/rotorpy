@@ -1,0 +1,59 @@
+<h2>The camera that has the target draws the tracker square</h2>
+<p class="subtitle">The cross is the center of that square. Homing aims through the cross, not through the middle of the red pixels.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Opening — forward camera has the target</div>
+    <div class="mockup-body">
+      <div style="display:flex; gap:12px; align-items:flex-start;">
+        <div>
+          <div class="label">Forward, 10° down</div>
+          <div style="position:relative; width:220px; height:220px; background:#1a1d24; border-radius:4px; overflow:hidden;">
+            <div style="position:absolute; left:78px; top:96px; width:28px; height:52px; background:#d62728; border-radius:2px;"></div>
+            <div style="position:absolute; left:62px; top:84px; width:76px; height:76px; border:2px solid #ffd23f; box-sizing:border-box;"></div>
+            <div style="position:absolute; left:98px; top:120px; width:8px; height:8px; margin:-4px 0 0 -4px; background:#7ec8ff; border-radius:50%; box-shadow:0 0 0 2px #0b1a28;"></div>
+            <div style="position:absolute; left:90px; top:122px; width:20px; height:1px; background:#7ec8ff;"></div>
+            <div style="position:absolute; left:99px; top:113px; width:1px; height:20px; background:#7ec8ff;"></div>
+          </div>
+        </div>
+        <div>
+          <div class="label">Upward, 70° up</div>
+          <div style="position:relative; width:220px; height:220px; background:#12141a; border-radius:4px;">
+            <div style="position:absolute; inset:0; background:linear-gradient(#2a3344, #12141a 70%);"></div>
+          </div>
+          <p class="subtitle" style="margin:8px 0 0;">No target, no square.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">Closing — upward camera has the target</div>
+    <div class="mockup-body">
+      <div style="display:flex; gap:12px; align-items:flex-start;">
+        <div>
+          <div class="label">Forward, 10° down</div>
+          <div style="position:relative; width:220px; height:220px; background:#12141a; border-radius:4px;">
+            <div style="position:absolute; inset:0; background:linear-gradient(#243044, #101218 60%);"></div>
+          </div>
+          <p class="subtitle" style="margin:8px 0 0;">Target has left this view. No square.</p>
+        </div>
+        <div>
+          <div class="label">Upward, 70° up</div>
+          <div style="position:relative; width:220px; height:220px; background:#1a1d24; border-radius:4px; overflow:hidden;">
+            <div style="position:absolute; left:118px; top:70px; width:36px; height:64px; background:#d62728; border-radius:2px;"></div>
+            <div style="position:absolute; left:96px; top:58px; width:88px; height:88px; border:2px solid #ffd23f; box-sizing:border-box;"></div>
+            <div style="position:absolute; left:140px; top:102px; width:8px; height:8px; margin:-4px 0 0 -4px; background:#7ec8ff; border-radius:50%;"></div>
+            <div style="position:absolute; left:128px; top:101px; width:24px; height:1px; background:#7ec8ff;"></div>
+            <div style="position:absolute; left:139px; top:90px; width:1px; height:24px; background:#7ec8ff;"></div>
+          </div>
+          <p class="subtitle" style="margin:8px 0 0;">This view flies the drone.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <p>The yellow box is a square around the red target. The blue cross is the center of that square, and that point is what the sightline is computed from. The square is only drawn on the camera that currently has the target.</p>
+</div>

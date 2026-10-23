@@ -1,5 +1,29 @@
 # Updates
 
+## 3.6.1 - One body frame on the homing page
+- The camera drawing is the frustum only. The body FRD axes are the only coordinate frame, beside the drone sketch.
+
+## 3.6.0 - FRD drone and camera frustum
+- The homing-page body axes and the X airframe are forward-right-down. Prop circles stay on the upper side, opposite the down axis.
+- The camera frustum and camera triad are drawn again, in the simulator camera frame.
+
+## 3.5.3 - Homing scene without the frustum
+- The Plotly scene no longer draws the camera frustum or the camera triad. The body axes and the drone remain.
+
+## 3.5.2 - Larger drone glyph
+- The homing-page drone is twice the 3.5.1 size. Prop circles stay just above the arm tips.
+
+## 3.5.1 - Smaller drone glyph
+- The homing-page drone is one tenth the previous size. Prop circles stay just above the arm tips.
+
+## 3.5.0 - Drone glyph on the homing page
+- The Plotly scene draws the Hummingbird as an X. Forward arms and their prop circles are green, rear arms and their prop circles are red.
+- Each prop circle sits a short distance above its arm tip, on the body-up side.
+
+## 3.4.0 - Camera homing Plotly page
+- `examples/camera_homing.py` writes `Results/camera_homing.html` instead of opening the matplotlib animation.
+- The page shows the 3D path, target box, body axes, and camera frustum beside that instant's camera image. The slider selects the capture time.
+
 ## 3.3.0 - FRD-NED world frame
 - The world switch is `World.frame`: a world chooses FLU-ENU or FRD-NED, and an unset frame stays FLU-ENU. Gravity, thrust, the IMU, wind filters, and the PX4 and ArduPilot bridges follow that choice.
 - `rotorpy/frames.py` converts vectors, attitudes, yaw, bounds, and flat outputs between FLU-ENU and FRD-NED, and `apply_frame` calls `set_frame` on objects that define it.
