@@ -1,5 +1,10 @@
 # Updates
 
+## 3.3.0 - FRD-NED world frame
+- The world switch is `World.frame`: a world chooses FLU-ENU or FRD-NED, and an unset frame stays FLU-ENU. Gravity, thrust, the IMU, wind filters, and the PX4 and ArduPilot bridges follow that choice.
+- `rotorpy/frames.py` converts vectors, attitudes, yaw, bounds, and flat outputs between FLU-ENU and FRD-NED, and `apply_frame` calls `set_frame` on objects that define it.
+- Example equivalence: the listed examples finish on the same physical state in FRD-NED as in FLU-ENU after those maps.
+
 ## 3.2.0 - Camera homing animation
 - `examples/camera_homing.py` plays the nominal flight as a third-person 3D view beside the drone camera, using the same animation layout as `camera_demo.py`.
 - The sweep still prints one line per navigation constant.

@@ -13,6 +13,7 @@ from time import perf_counter
  
 import rotorpy.wind
 from rotorpy.controllers.quadrotor_control import BatchedSE3Control
+from rotorpy.frames import apply_frame
 from rotorpy.vehicles.multirotor import BatchedMultirotor
 
 
@@ -26,6 +27,24 @@ class ExitStatus(Enum):
     OVER_SPIN    = 'Failure: Your quadrotor is out of control; it is spinning faster than 100 rad/s. The onboard IMU can only measure up to 52 rad/s (3000 deg/s).'
     FLY_AWAY     = 'Failure: Your quadrotor is out of control; it flew away with a position error greater than 20 meters.'
     COLLISION    = 'Failure: Your quadrotor collided with an object.'
+
+def _shared_world_frame(world):
+    """Return the one frame used by ``world``.
+
+    A list may contain ``None`` empty worlds, which do not vote. Disagreeing
+    frames raise ``ValueError``. No voting world returns ``None``.
+    """
+    if isinstance(world, (list, tuple)):
+        frames = [item.frame for item in world if item is not None]
+        if not frames:
+            return None
+        first = frames[0]
+        for frame in frames[1:]:
+            if frame != first:
+                raise ValueError("simulate_batch worlds must share one frame")
+        return first
+    return world.frame
+
 
 def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile, imu, mocap, estimator, t_final, t_step, safety_margin, use_mocap, terminate=None, print_fps=False, camera=None):
     """
@@ -101,6 +120,8 @@ def simulate(world, initial_state, vehicle, controller, trajectory, wind_profile
                 keypoint_depths, list of K (M_k,) arrays of visible feature depths
                 visible_features, list of K (M_k,3) arrays of visible feature positions
     """
+
+    apply_frame(world.frame, vehicle, controller, imu, mocap, estimator)
 
     # Coerce entries of initial state into numpy arrays, if they are not already.
     initial_state = {k: np.array(v) for k, v in initial_state.items()}
@@ -408,6 +429,10 @@ def simulate_batch(world,
             camera measurements with K frames captured at times camera_measurements['time']. See
             merge_batch_camera_measurements() for the keys and shapes.
     """
+
+    frame = _shared_world_frame(world)
+    if frame is not None:
+        apply_frame(frame, vehicles, controller, imu)
 
     assert(torch.is_tensor(initial_states[k]) for k in initial_states.keys())
 

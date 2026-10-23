@@ -11,6 +11,7 @@ from rotorpy.trajectories.lissajous_traj import TwoDLissajous
 from rotorpy.trajectories.speed_traj import ConstantSpeed
 from rotorpy.trajectories.minsnap import MinSnap 
 from rotorpy.world import World
+from rotorpy.frames import FrameConvention
 from rotorpy.utils.animate import animate
 from rotorpy.simulate import merge_dicts
 
@@ -24,7 +25,7 @@ import multiprocessing
 
 ####################### Helper functions
 
-def run_sim(trajectory, t_offset, t_final=10, t_step=1/100):
+def run_sim(trajectory, t_offset, t_final=10, t_step=1/100, frame=FrameConvention.FLU_ENU):
     """
     Runs an instance of the simulation environment which creates a vehicle object and tracking controller on
     an individual cpu process using Python's multiprocessing. 
@@ -33,6 +34,7 @@ def run_sim(trajectory, t_offset, t_final=10, t_step=1/100):
         t_offset: time offset (useful for offsetting multiple mavs on the same trajectory). 
         t_final: duration of the sim for this object. 
         t_step: timestep for the simulation. 
+        frame: world/body frame for the vehicle and controller. Defaults to FLU-ENU.
     Outputs:
         time: time array. 
         states: array of quadrotor states. 
@@ -41,6 +43,8 @@ def run_sim(trajectory, t_offset, t_final=10, t_step=1/100):
     """
     mav = Multirotor(quad_params)
     controller = SE3Control(quad_params)
+    mav.set_frame(frame)
+    controller.set_frame(frame)
 
     # Init mav at the first waypoint for the trajectory.
     x0 = {'x': trajectory.update(t_offset)['x'],
@@ -113,65 +117,67 @@ def find_collisions(all_positions, epsilon=1e-1):
 
 ####################### Start of user code
 
-# Construct the world.
-world = World.empty([-3, 3, -3, 3, -3, 3])
+if __name__ == "__main__":
 
-# Generate a list of configurations to run in parallel. Each config has a trajectory, time offset, sim duration, and sim time discretization.
-dt = 1/100
-tf = 10
+    # Construct the world.
+    world = World.empty([-3, 3, -3, 3, -3, 3])
 
-# Hard coded list of Lissajous maneuvers. 
-config_list = [(TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=-0.5, y_offset=0, height=2.0), 0, tf, dt),
-               (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=-0.25, y_offset=0, height=2.0), 0.5, tf, dt),
-               (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=0.0, y_offset=0, height=2.0), 1.0, tf, dt),
-               (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=0.25, y_offset=0, height=2.0), 1.5, tf, dt),
-               (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=0.50, y_offset=0, height=2.0), 2.0, tf, dt)]
+    # Generate a list of configurations to run in parallel. Each config has a trajectory, time offset, sim duration, sim time discretization, and frame.
+    dt = 1/100
+    tf = 10
 
-# Programmatic construction of a swarm of MAVs following a MinSnap trajectory. 
-Nc = 7
-R = 0.5
-for i in range(Nc):
-    x0 = np.array([-2 + R*np.cos(i*2*np.pi/Nc), R*np.sin(i*2*np.pi/Nc), 0])
-    xf = np.array([ 2 + R*np.cos(i*2*np.pi/Nc), R*np.sin(i*2*np.pi/Nc), 0])
-    config_list.append((MinSnap(points=np.vstack((x0, xf)), v_avg=1.0, verbose=False), 0, tf, dt))
+    # Hard coded list of Lissajous maneuvers. 
+    config_list = [(TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=-0.5, y_offset=0, height=2.0), 0, tf, dt, world.frame),
+                   (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=-0.25, y_offset=0, height=2.0), 0.5, tf, dt, world.frame),
+                   (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=0.0, y_offset=0, height=2.0), 1.0, tf, dt, world.frame),
+                   (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=0.25, y_offset=0, height=2.0), 1.5, tf, dt, world.frame),
+                   (TwoDLissajous(A=1, B=1, a=2, b=1, x_offset=0.50, y_offset=0, height=2.0), 2.0, tf, dt, world.frame)]
 
-# Run RotorPy in parallel. 
-with multiprocessing.Pool() as pool:
-    results = pool.map(worker_fn, config_list)
+    # Programmatic construction of a swarm of MAVs following a MinSnap trajectory. 
+    Nc = 7
+    R = 0.5
+    for i in range(Nc):
+        x0 = np.array([-2 + R*np.cos(i*2*np.pi/Nc), R*np.sin(i*2*np.pi/Nc), 0])
+        xf = np.array([ 2 + R*np.cos(i*2*np.pi/Nc), R*np.sin(i*2*np.pi/Nc), 0])
+        config_list.append((MinSnap(points=np.vstack((x0, xf)), v_avg=1.0, verbose=False), 0, tf, dt, world.frame))
 
-# Concatentate all the relevant states/inputs for animation. 
-all_pos = []
-all_rot = []
-all_wind = []
-all_time = results[0][0]
+    # Run RotorPy in parallel. 
+    with multiprocessing.Pool() as pool:
+        results = pool.map(worker_fn, config_list)
 
-for r in results:
-    all_pos.append(r[1]['x'])
-    all_wind.append(r[1]['wind'])
-    all_rot.append(Rotation.from_quat(r[1]['q']).as_matrix())
+    # Concatentate all the relevant states/inputs for animation. 
+    all_pos = []
+    all_rot = []
+    all_wind = []
+    all_time = results[0][0]
 
-all_pos = np.stack(all_pos, axis=1)
-all_wind = np.stack(all_wind, axis=1)
-all_rot = np.stack(all_rot, axis=1)
+    for r in results:
+        all_pos.append(r[1]['x'])
+        all_wind.append(r[1]['wind'])
+        all_rot.append(Rotation.from_quat(r[1]['q']).as_matrix())
 
-# Check for collisions.
-collisions = find_collisions(all_pos, epsilon=2e-1)
+    all_pos = np.stack(all_pos, axis=1)
+    all_wind = np.stack(all_wind, axis=1)
+    all_rot = np.stack(all_rot, axis=1)
 
-# Animate. 
-ani = animate(all_time, all_pos, all_rot, all_wind, animate_wind=False, world=world, filename=None)
+    # Check for collisions.
+    collisions = find_collisions(all_pos, epsilon=2e-1)
 
-# Plot the positions of each agent in 3D, alongside collision events (when applicable)
-fig = plt.figure()
-ax = fig.add_subplot(projection='3d')
-colors = plt.cm.tab10(range(all_pos.shape[1]))
-for mav in range(all_pos.shape[1]):
-    ax.plot(all_pos[:, mav, 0], all_pos[:, mav, 1], all_pos[:, mav, 2], color=colors[mav])
-    ax.plot([all_pos[-1, mav, 0]], [all_pos[-1, mav, 1]], [all_pos[-1, mav, 2]], '*', markersize=10, markerfacecolor=colors[mav], markeredgecolor='k')
-world.draw(ax)
-for event in collisions:
-    ax.plot([all_pos[event['timestep'], event['agents'][0], 0]], [all_pos[event['timestep'], event['agents'][0], 1]], [all_pos[event['timestep'], event['agents'][0], 2]], 'rx', markersize=10)
-ax.set_xlabel("x, m")
-ax.set_ylabel("y, m")
-ax.set_zlabel("z, m")
+    # Animate. 
+    ani = animate(all_time, all_pos, all_rot, all_wind, animate_wind=False, world=world, filename=None)
 
-plt.show()
+    # Plot the positions of each agent in 3D, alongside collision events (when applicable)
+    fig = plt.figure()
+    ax = fig.add_subplot(projection='3d')
+    colors = plt.cm.tab10(range(all_pos.shape[1]))
+    for mav in range(all_pos.shape[1]):
+        ax.plot(all_pos[:, mav, 0], all_pos[:, mav, 1], all_pos[:, mav, 2], color=colors[mav])
+        ax.plot([all_pos[-1, mav, 0]], [all_pos[-1, mav, 1]], [all_pos[-1, mav, 2]], '*', markersize=10, markerfacecolor=colors[mav], markeredgecolor='k')
+    world.draw(ax)
+    for event in collisions:
+        ax.plot([all_pos[event['timestep'], event['agents'][0], 0]], [all_pos[event['timestep'], event['agents'][0], 1]], [all_pos[event['timestep'], event['agents'][0], 2]], 'rx', markersize=10)
+    ax.set_xlabel("x, m")
+    ax.set_ylabel("y, m")
+    ax.set_zlabel("z, m")
+
+    plt.show()

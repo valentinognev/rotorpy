@@ -6,6 +6,8 @@ except ImportError:
     pass
 from scipy.spatial.transform import Rotation
 
+from rotorpy.frames import FrameConvention, M_FLU_TO_FRD
+
 class SE3Control(object):
     """
     Quadrotor trajectory tracking controller based on https://ieeexplore.ieee.org/document/5717652 
@@ -34,6 +36,7 @@ class SE3Control(object):
 
         self.num_rotors      = quad_params['num_rotors']
         self.rotor_pos       = quad_params['rotor_pos']
+        self._rotor_pos_flu  = {key: np.array(pos, dtype=float, copy=True) for key, pos in self.rotor_pos.items()}
         self.rotor_dir       = quad_params['rotor_directions']
 
         # Rotor parameters    
@@ -53,7 +56,10 @@ class SE3Control(object):
         self.inertia = np.array([[self.Ixx, self.Ixy, self.Ixz],
                                  [self.Ixy, self.Iyy, self.Iyz],
                                  [self.Ixz, self.Iyz, self.Izz]]) # kg*m^2
+        self._inertia_flu = np.array(self.inertia, dtype=float, copy=True)
         self.g = 9.81 # m/s^2
+        # Body-frame thrust direction: +z in FLU-ENU, -z in FRD-NED.
+        self.thrust_axis = np.array([0.0, 0.0, 1.0])
 
         # Gains  
         self.kp_pos = np.array([6.5,6.5,15])
@@ -64,13 +70,42 @@ class SE3Control(object):
 
         # Linear map from individual rotor forces to scalar thrust and vector
         # moment applied to the vehicle.
-        k = self.k_m/self.k_eta  # Ratio of torque to thrust coefficient. 
+        self._rebuild_allocation()
 
-        # Below is an automated generation of the control allocator matrix. It assumes that all thrust vectors are aligned
-        # with the z axis.
+    def set_frame(self, frame):
+        """Derive active geometry from the authored FLU copy.
+
+        Calling this twice with the same frame does not flip the rotors again.
+        """
+        if frame == FrameConvention.FRD_NED:
+            body_from_flu = M_FLU_TO_FRD
+        elif frame == FrameConvention.FLU_ENU:
+            body_from_flu = np.eye(3)
+        else:
+            raise ValueError("unknown frame convention: %r" % (frame,))
+
+        self.thrust_axis = body_from_flu @ np.array([0.0, 0.0, 1.0])
+        self.rotor_pos = {
+            key: body_from_flu @ position
+            for key, position in self._rotor_pos_flu.items()
+        }
+        self.inertia = body_from_flu @ self._inertia_flu @ body_from_flu
+        self.Ixx = self.inertia[0, 0]
+        self.Iyy = self.inertia[1, 1]
+        self.Izz = self.inertia[2, 2]
+        self.Ixy = self.inertia[0, 1]
+        self.Ixz = self.inertia[0, 2]
+        self.Iyz = self.inertia[1, 2]
+        self._rebuild_allocation()
+
+    def _rebuild_allocation(self):
+        """Rebuild f_to_TM from the active rotor positions and thrust axis."""
+        k = self.k_m/self.k_eta  # Ratio of torque to thrust coefficient.
+
+        # Thrust and yaw moment both lie on thrust_axis, matching Multirotor.
         self.f_to_TM = np.vstack((np.ones((1,self.num_rotors)),
-                                  np.hstack([np.cross(self.rotor_pos[key],np.array([0,0,1])).reshape(-1,1)[0:2] for key in self.rotor_pos]), 
-                                 (k * self.rotor_dir).reshape(1,-1)))
+                                  np.hstack([np.cross(self.rotor_pos[key], self.thrust_axis).reshape(-1,1)[0:2] for key in self.rotor_pos]),
+                                 (k * self.thrust_axis[2] * self.rotor_dir).reshape(1,-1)))
         self.TM_to_f = np.linalg.inv(self.f_to_TM)
     
     def update(self, t, state, flat_output):
@@ -123,18 +158,19 @@ class SE3Control(object):
         # Get the desired force vector.
         pos_err  = state['x'] - flat_output['x']
         dpos_err = state['v'] - flat_output['x_dot']
+        # FLU-ENU adds +g on world z. FRD-NED adds -g, along the thrust axis sign.
         F_des = self.mass * (- self.kp_pos*pos_err
                              - self.kd_pos*dpos_err
                              + flat_output['x_ddot']
-                             + np.array([0, 0, self.g]))
+                             + np.array([0, 0, self.thrust_axis[2]*self.g]))
 
-        # Desired thrust is force projects onto b3 axis.
+        # Desired thrust is the force projected onto the thrust direction.
         R = Rotation.from_quat(state['q']).as_matrix()
-        b3 = R @ np.array([0, 0, 1])
+        b3 = R @ self.thrust_axis
         u1 = np.dot(F_des, b3)
 
-        # Desired orientation to obtain force vector.
-        b3_des = normalize(F_des)
+        # Body +z follows the force in FLU-ENU and opposes it in FRD-NED.
+        b3_des = self.thrust_axis[2] * normalize(F_des)
         yaw_des = flat_output['yaw']
         c1_des = np.array([np.cos(yaw_des), np.sin(yaw_des), 0])
         b2_des = normalize(np.cross(b3_des, c1_des))
@@ -220,6 +256,58 @@ class BatchedSE3Control(object):
                 self.kd_att = self.kd_att.unsqueeze(-1)
 
         self.kp_vel = 0.1 * self.kp_pos
+        # Body +z in FLU-ENU, body -z in FRD-NED.
+        self.thrust_axis = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=torch.double)
+        self._inertia_flu = self.params.inertia.detach().clone()
+        self._rotor_pos_flu = [
+            {key: np.array(position, dtype=float, copy=True) for key, position in rotors.items()}
+            for rotors in self.params.rotor_pos
+        ]
+
+    def set_frame(self, frame):
+        """Derive active geometry from the stored FLU copy.
+
+        Calling this twice with the same frame does not flip the rotors again.
+        The shared allocation yaw row is ``k * thrust_axis[2] * rotor_dir``,
+        matching ``BatchedMultirotor``, so either ``set_frame`` can run last.
+        """
+        if frame == FrameConvention.FRD_NED:
+            transform = M_FLU_TO_FRD
+            thrust = np.array([0.0, 0.0, -1.0])
+        elif frame == FrameConvention.FLU_ENU:
+            transform = np.eye(3)
+            thrust = np.array([0.0, 0.0, 1.0])
+        else:
+            raise ValueError("unknown frame convention: %r" % (frame,))
+
+        self.thrust_axis = torch.tensor(thrust, device=self.device, dtype=torch.double)
+        self.params.rotor_pos = [
+            {
+                key: transform @ np.array(position, dtype=float, copy=True)
+                for key, position in rotors.items()
+            }
+            for rotors in self._rotor_pos_flu
+        ]
+        body_from_flu = torch.tensor(transform, device=self.device, dtype=torch.double)
+        self.params.inertia = body_from_flu @ self._inertia_flu @ body_from_flu
+        self.params.inv_inertia = torch.linalg.inv(self.params.inertia).double()
+        self.params.extract_geometry()
+
+        matrices = []
+        for i in range(self.params.num_drones):
+            k_ratio = float((self.params.k_m[i] / self.params.k_eta[i]).detach().cpu().reshape(-1)[0])
+            moment_xy = np.hstack([
+                np.cross(self.params.rotor_pos[i][key], thrust).reshape(-1, 1)[0:2]
+                for key in self.params.rotor_pos[i]
+            ])
+            yaw_row = (k_ratio * thrust[2] * self.params.rotor_dir_np[i]).reshape(1, -1)
+            matrices.append(np.vstack((
+                np.ones((1, self.params.num_rotors)),
+                moment_xy,
+                yaw_row,
+            )))
+        self.params.f_to_TM = torch.tensor(np.array(matrices), device=self.device, dtype=torch.double)
+        self.params.TM_to_f = torch.linalg.inv(self.params.f_to_TM)
 
     def normalize(self, x):
         return x / torch.norm(x, dim=-1, keepdim=True)
@@ -237,17 +325,21 @@ class BatchedSE3Control(object):
         pos_err = states['x'][idxs].double() - flat_outputs['x'][idxs].double()
         dpos_err = states['v'][idxs].double() - flat_outputs['x_dot'][idxs].double()
 
+        # FLU-ENU adds +g on world z. FRD-NED adds -g, along the thrust axis sign.
+        gravity = torch.zeros(3, device=self.device, dtype=torch.double)
+        gravity[2] = self.thrust_axis[2] * self.params.g
         F_des = self.params.mass[idxs] * (-self.kp_pos[idxs] * pos_err
                              - self.kd_pos[idxs] * dpos_err
                              + flat_outputs['x_ddot'][idxs].double()
-                             + torch.tensor([0, 0, self.params.g], device=self.device))
+                             + gravity)
 
 
         R = roma.unitquat_to_rotmat(states['q'][idxs]).double()
-        b3 = R @ torch.tensor([0.0, 0.0, 1.0], device=self.device).double()
+        b3 = R @ self.thrust_axis
         u1 = torch.sum(F_des * b3, dim=-1).double()
 
-        b3_des = self.normalize(F_des)
+        # Body +z follows the force in FLU-ENU and opposes it in FRD-NED.
+        b3_des = self.thrust_axis[2] * self.normalize(F_des)
         yaw_des = flat_outputs['yaw'][idxs].double()
         c1_des = torch.stack([torch.cos(yaw_des), torch.sin(yaw_des), torch.zeros_like(yaw_des)], dim=-1)
         b2_des = self.normalize(torch.cross(b3_des, c1_des, dim=-1))

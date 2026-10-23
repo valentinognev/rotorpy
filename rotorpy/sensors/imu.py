@@ -6,6 +6,8 @@ except ImportError:
     pass
 import copy
 
+from rotorpy.frames import FrameConvention, M_FLU_TO_FRD
+
 class Imu:
     """
     Simulated IMU measurement given
@@ -69,12 +71,29 @@ class Imu:
         self.gyro_variance = gyroscope_params['noise_density'].astype('float64')
         self.gyro_random_walk = gyroscope_params['random_walk'].astype('float64')
         self.gyro_bias = gyroscope_params['initial_bias'].astype('float64')
+        self._frame = FrameConvention.FLU_ENU
+
+    def set_frame(self, frame):
+        """Select the world frame. Gravity is assigned absolutely, so a repeat call does not flip it."""
+        self._frame = FrameConvention(frame)
+        if self._frame is FrameConvention.FRD_NED:
+            self.gravity_vector = np.array([0.0, 0.0, 9.81])
+        else:
+            self.gravity_vector = np.array([0.0, 0.0, -9.81])
+
+    def _in_body_frame(self, sample):
+        """Map a body-frame draw into the active body axes. FLU-ENU leaves it unchanged."""
+        if self._frame is FrameConvention.FRD_NED:
+            return M_FLU_TO_FRD @ np.asarray(sample, dtype=float)
+        return sample
 
     def bias_step(self):
         """Simulate bias drift"""
 
-        self.accel_bias += np.random.normal(scale=self.accel_random_walk) / self.rate_scale
-        self.gyro_bias += np.random.normal(scale=self.gyro_random_walk) / self.rate_scale
+        accel_walk = np.random.normal(scale=self.accel_random_walk)
+        gyro_walk = np.random.normal(scale=self.gyro_random_walk)
+        self.accel_bias += self._in_body_frame(accel_walk) / self.rate_scale
+        self.gyro_bias += self._in_body_frame(gyro_walk) / self.rate_scale
 
         return
 
@@ -124,8 +143,10 @@ class Imu:
         accelerometer_measurement += self.accel_bias
         gyroscope_measurement += self.gyro_bias
         if with_noise:
-            accelerometer_measurement += self.rate_scale * np.random.normal(scale=np.abs(self.accel_variance))
-            gyroscope_measurement +=  self.rate_scale * np.random.normal(scale=np.abs(self.gyro_variance))
+            accel_noise = np.random.normal(scale=np.abs(self.accel_variance))
+            gyro_noise = np.random.normal(scale=np.abs(self.gyro_variance))
+            accelerometer_measurement += self.rate_scale * self._in_body_frame(accel_noise)
+            gyroscope_measurement += self.rate_scale * self._in_body_frame(gyro_noise)
 
         return {'accel': accelerometer_measurement, 'gyro': gyroscope_measurement}
 
@@ -166,10 +187,28 @@ class BatchedImu:
         self.gyro_noise = torch.Tensor(gyro_params['noise_density']).double()
         self.accel_random_walk = torch.Tensor(accel_params['random_walk']).double()
         self.gyro_random_walk = torch.Tensor(gyro_params['random_walk']).double()
+        self._frame = FrameConvention.FLU_ENU
+
+    def set_frame(self, frame):
+        """Select the world frame. Gravity is a (3,) tensor on this IMU's device."""
+        self._frame = FrameConvention(frame)
+        g_z = 9.81 if self._frame is FrameConvention.FRD_NED else -9.81
+        self.gravity_vector = torch.tensor(
+            [0.0, 0.0, g_z], device=self.device, dtype=torch.double
+        )
+
+    def _in_body_frame(self, sample):
+        """Map a body-frame draw into the active body axes. FLU-ENU leaves it unchanged."""
+        if self._frame is FrameConvention.FRD_NED:
+            mapping = torch.tensor(M_FLU_TO_FRD, device=sample.device, dtype=sample.dtype)
+            return sample @ mapping.T
+        return sample
 
     def bias_step(self):
-        self.accel_bias += torch.randn_like(self.accel_bias) * (self.accel_random_walk / self.rate_scale)
-        self.gyro_bias += torch.randn_like(self.gyro_bias) * (self.gyro_random_walk / self.rate_scale)
+        accel_walk = torch.randn_like(self.accel_bias) * (self.accel_random_walk / self.rate_scale)
+        gyro_walk = torch.randn_like(self.gyro_bias) * (self.gyro_random_walk / self.rate_scale)
+        self.accel_bias += self._in_body_frame(accel_walk)
+        self.gyro_bias += self._in_body_frame(gyro_walk)
 
     def measurement(self, state, acceleration, idxs=None, with_noise=True):
         """
@@ -206,8 +245,10 @@ class BatchedImu:
         w_meas = w_WB + self.gyro_bias[idxs]
 
         if with_noise:
-            a_meas += self.rate_scale * torch.randn_like(a_meas) * self.accel_noise
-            w_meas += self.rate_scale * torch.randn_like(w_meas) * self.gyro_noise
+            accel_noise = self.rate_scale * torch.randn_like(a_meas) * self.accel_noise
+            gyro_noise = self.rate_scale * torch.randn_like(w_meas) * self.gyro_noise
+            a_meas += self._in_body_frame(accel_noise)
+            w_meas += self._in_body_frame(gyro_noise)
 
         a_meas_out = torch.full((self.num_drones, 3), float("nan"), device=a_meas.device).double()
         w_meas_out = torch.full((self.num_drones, 3), float("nan"), device=w_meas.device).double()

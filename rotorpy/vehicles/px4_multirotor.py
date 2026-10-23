@@ -1,3 +1,4 @@
+from rotorpy.frames import FrameConvention
 from rotorpy.vehicles.ardupilot_multirotor import Ardupilot
 from rotorpy.vehicles.multirotor import Multirotor
 from rotorpy.sensors.imu import Imu
@@ -12,6 +13,92 @@ R_EARTH = 6378137.0  # meters
 rad2deg = 180.0 / np.pi
 INT_MAX = 32767
 INT_MIN = -32768
+
+
+def _as_vec3(vector):
+    return np.array(vector, dtype=float, copy=True).reshape(3)
+
+
+def _as_quat(q_xyzw):
+    return np.array(q_xyzw, dtype=float, copy=True).reshape(4)
+
+
+def _px4_body_axes(frame, vector):
+    """FLU-ENU negates body y and z. FRD-NED keeps the measured axes."""
+    body = _as_vec3(vector)
+    if frame == FrameConvention.FRD_NED:
+        return body
+    if frame == FrameConvention.FLU_ENU:
+        return np.array([body[0], -body[1], -body[2]], dtype=float)
+    raise ValueError("frame must be FLU_ENU or FRD_NED")
+
+
+def _milli_g(accel_body):
+    scaled = np.round(_as_vec3(accel_body) / 9.80665 * 1000.0)
+    clipped = np.clip(scaled, INT_MIN, INT_MAX)
+    return int(clipped[0]), int(clipped[1]), int(clipped[2])
+
+
+def _inverse_body_to_world_scalar_first(q_xyzw):
+    """Inverse of a scalar-last body-to-world quaternion, packed scalar-first."""
+    q = _as_quat(q_xyzw)
+    return [float(q[3]), float(-q[0]), float(-q[1]), float(-q[2])]
+
+
+def _ned_cmps(north_mps, east_mps, down_mps):
+    return (
+        int(np.round(float(north_mps) * 100.0)),
+        int(np.round(float(east_mps) * 100.0)),
+        int(np.round(float(down_mps) * 100.0)),
+    )
+
+
+def px4_hil_fields(frame, state, accel_body, gyro_body):
+    """Pack PX4 HIL fields. Does not open a socket.
+
+    FLU-ENU matches the historical axis rewrite. FRD-NED skips that rewrite.
+    ``rollspeed``, ``pitchspeed``, and ``yawspeed`` are ``state['w']`` in both frames.
+    ``gyro`` is the HIL_SENSOR body rate.
+    """
+    if frame == FrameConvention.FRD_NED:
+        position = _as_vec3(state["x"])
+        velocity = _as_vec3(state["v"])
+        east = float(position[1])
+        north = float(position[0])
+        up = float(-position[2])
+        vx_cms, vy_cms, vz_cms = _ned_cmps(velocity[0], velocity[1], velocity[2])
+        quaternion = _inverse_body_to_world_scalar_first(state["q"])
+    elif frame == FrameConvention.FLU_ENU:
+        position = _as_vec3(state["x"])
+        velocity = _as_vec3(state["v"])
+        east = float(position[0])
+        north = float(position[1])
+        up = float(position[2])
+        vx_cms, vy_cms, vz_cms = PX4Multirotor._enu_to_ned_cmps(velocity)
+        quaternion = Ardupilot._quaternion_rotorpy_to_aerospace(np.asarray(state["q"], dtype=float))
+    else:
+        raise ValueError("frame must be FLU_ENU or FRD_NED")
+
+    lat_deg, lon_deg, alt_m = PX4Multirotor.enu_to_geodetic(east, north, up)
+    xacc_mg, yacc_mg, zacc_mg = _milli_g(_px4_body_axes(frame, accel_body))
+    rates = _as_vec3(state["w"])
+    return {
+        "lat_deg": lat_deg,
+        "lon_deg": lon_deg,
+        "alt_m": alt_m,
+        "quaternion": quaternion,
+        "vx_cms": vx_cms,
+        "vy_cms": vy_cms,
+        "vz_cms": vz_cms,
+        "xacc_mg": xacc_mg,
+        "yacc_mg": yacc_mg,
+        "zacc_mg": zacc_mg,
+        "rollspeed": float(rates[0]),
+        "pitchspeed": float(rates[1]),
+        "yawspeed": float(rates[2]),
+        "gyro": _px4_body_axes(frame, gyro_body),
+    }
+
 
 class SensorSource:
     """ The binary codes to signal which simulated data is being sent through mavlink
@@ -79,6 +166,7 @@ class PX4Multirotor(Multirotor):
         # Simulated IMU (with noise)
         self.imu = Imu()
         self._enable_imu_noise = True  # Always add a bit of noise to avoid stale detection
+        self._frame = FrameConvention.FLU_ENU
         self.t = 0.0
 
         print("PX4Multirotor: Initializing MAVLink connection... on {}".format(mavlink_url))
@@ -143,6 +231,12 @@ class PX4Multirotor(Multirotor):
 
         return lat_deg, lon_deg, alt_msl_m
 
+    def set_frame(self, frame):
+        """Remember the world frame and apply it to the simulated IMU."""
+        super(PX4Multirotor, self).set_frame(frame)
+        self._frame = FrameConvention(frame)
+        self.imu.set_frame(self._frame)
+
     @staticmethod
     def geodetic_to_mavlink(lat_deg: float, lon_deg: float, alt_msl_m: float) -> Tuple[int, int, int]:
         """
@@ -170,7 +264,8 @@ class PX4Multirotor(Multirotor):
         if msg is not None:
             return {'cmd_motor_speeds': [c * self.rotor_speed_max for c in msg.controls[:self.num_rotors]]}
 
-    def _enu_to_ned_cmps(self, v_enu):
+    @staticmethod
+    def _enu_to_ned_cmps(v_enu):
         v_n = float(v_enu[1])
         v_e = float(v_enu[0])
         v_d = float(-v_enu[2])
@@ -182,12 +277,8 @@ class PX4Multirotor(Multirotor):
 
     def _imu(self, state, statedot):
         meas = self.imu.measurement(state, statedot, with_noise=self._enable_imu_noise)
-        a_flu = meas["accel"]
-        omega_flu = meas["gyro"]
-        # FLU -> FRD
-        a_frd = np.array([a_flu[0], -a_flu[1], -a_flu[2]], dtype=float)
-        omega_frd = np.array([omega_flu[0], -omega_flu[1], -omega_flu[2]], dtype=float)
-        return a_frd, omega_frd
+        fields = px4_hil_fields(self._frame, state, meas["accel"], meas["gyro"])
+        return _px4_body_axes(self._frame, meas["accel"]), fields["gyro"]
 
     def _send_hil_state_quaternion(self, state, statedot):
         """
@@ -197,27 +288,21 @@ class PX4Multirotor(Multirotor):
             state: Current vehicle state
             statedot: State derivative (from the `Multirotor.statedot` method)
         """
-        # Convert cartesian ENU position to geodetic coordinates (latitude, longitude and height)
-        lat_deg, lon_deg, height_meters = self.enu_to_geodetic(*state['x'])
-        lat_e7, lon_e7, alt_mm = self.geodetic_to_mavlink(lat_deg, lon_deg, height_meters)
-        
-        # Convert quaternion from rotorpy to aerospace convention using ArduPilot's method
-        quaternion_flu2ned = Ardupilot._quaternion_rotorpy_to_aerospace(state['q'])
-        vx_cms, vy_cms, vz_cms = self._enu_to_ned_cmps(state['v'])
-
-        # Send the ground truth acceleration in the state message (without imu noise)
-        a_flu_gt = self.imu.measurement(state, statedot, with_noise=False)["accel"]
-        a_frd_gt = np.array([a_flu_gt[0], -a_flu_gt[1], -a_flu_gt[2]], dtype=float)
-        a_frd_mg = np.clip(np.round(a_frd_gt / 9.80665 * 1000.0), INT_MIN, INT_MAX).astype(np.int16)
+        # Ground-truth specific force (no extra IMU noise) packed for the active frame.
+        accel_body = self.imu.measurement(state, statedot, with_noise=False)["accel"]
+        fields = px4_hil_fields(self._frame, state, accel_body, state["w"])
+        lat_e7, lon_e7, alt_mm = self.geodetic_to_mavlink(
+            fields["lat_deg"], fields["lon_deg"], fields["alt_m"]
+        )
 
         self.conn.mav.hil_state_quaternion_send(
             int(self.t * 1e6),
-            quaternion_flu2ned,
-            *tuple(state['w']),
+            fields["quaternion"],
+            fields["rollspeed"], fields["pitchspeed"], fields["yawspeed"],
             lat_e7, lon_e7, alt_mm,
-            vx_cms, vy_cms, vz_cms,
+            fields["vx_cms"], fields["vy_cms"], fields["vz_cms"],
             0, 0,  # Indicated airspeed, true airspeed
-            int(a_frd_mg[0]), int(a_frd_mg[1]), int(a_frd_mg[2])
+            fields["xacc_mg"], fields["yacc_mg"], fields["zacc_mg"]
         )
 
     def _send_hil_sensor(self, state, statedot):
@@ -229,15 +314,15 @@ class PX4Multirotor(Multirotor):
             statedot: State derivative (computed externally)
         """
         # Get IMU measurements
-        a_ned, omega_ned = self._imu(state, statedot)
+        a_body, omega_body = self._imu(state, statedot)
 
         # Only flag accel/gyro as updated (exclude mag and baro-related fields)
         updated_bitmask = SensorSource.ACCEL | SensorSource.GYRO
 
         self.conn.mav.hil_sensor_send(
             int(self.t * 1e6),
-            *tuple(a_ned),
-            *tuple(omega_ned),
+            *tuple(a_body),
+            *tuple(omega_body),
             *(0.0, 0.0, 0.0),       # Magnetometer (body frame)
             0.0,                    # Abs pressure
             0,                      # Differential pressure

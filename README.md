@@ -44,7 +44,7 @@ There are a few example scripts found in `rotorpy/examples/` that demonstrate ho
 #### Regular usage
 A good place to start would be to reference the `rotorpy/examples/basic_usage.py` script. It goes through the necessary imports and how to create and execute an instance of the base simulation environment. 
  
-At minimum the simulator requires vehicle, controller, and trajectory objects. The vehicle (and potentially the controller) is parameterized by a unique parameter file, such as `rotorpy/vehicles/hummingbird_params.py`. There is also the option to specify your own IMU, world bounds, and how long you would like to run the simulator for. 
+At minimum the simulator requires vehicle, controller, and trajectory objects. The vehicle (and potentially the controller) is parameterized by a unique parameter file, such as `rotorpy/vehicles/hummingbird_params.py`. There is also the option to specify your own IMU, world bounds, and how long you would like to run the simulator for. A `World` chooses FLU-ENU or FRD-NED, and unset stays FLU-ENU. 
 
 The output of the simulator is a dictionary containing a time vector and the time histories of all the vehicle's states, inputs, and measurements.
 

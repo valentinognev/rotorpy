@@ -3,9 +3,10 @@ It sends the state to the SITL to verify that the conversion is correct.
 """
 import copy
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
+from rotorpy.frames import FrameConvention, M_FLU_TO_FRD
 from rotorpy.vehicles.multirotor import Multirotor
 from rotorpy.sensors.imu import Imu
 from rotorpy.vehicles.hummingbird_params import quad_params as crazyflie_params
@@ -53,6 +54,56 @@ class SensorData:
         assert len(self.sim_attitude) == 4
 
 
+def _as_vec3(vector: np.ndarray) -> np.ndarray:
+    return np.array(vector, dtype=float, copy=True).reshape(3)
+
+
+def _inverse_body_to_world_scalar_first(q_xyzw: np.ndarray) -> List[float]:
+    """Inverse of a scalar-last body-to-world quaternion, packed scalar-first."""
+    q = np.array(q_xyzw, dtype=float, copy=True).reshape(4)
+    return [float(q[3]), float(-q[0]), float(-q[1]), float(-q[2])]
+
+
+def _body_frd(frame: FrameConvention, vector: np.ndarray) -> np.ndarray:
+    """FLU-ENU applies ``M_FLU_TO_FRD``. FRD-NED keeps the measured axes."""
+    body = _as_vec3(vector)
+    if frame == FrameConvention.FRD_NED:
+        return body
+    if frame == FrameConvention.FLU_ENU:
+        return M_FLU_TO_FRD @ body
+    raise ValueError("frame must be FLU_ENU or FRD_NED")
+
+
+def ardupilot_sensor_fields(
+    frame: FrameConvention,
+    state: Dict[str, np.ndarray],
+    accel_body: np.ndarray,
+    gyro_body: np.ndarray,
+) -> dict:
+    """Pack ArduPilot sensor fields. Does not construct ``Ardupilot``.
+
+    Position and velocity are ``state['x']`` and ``state['v']`` in both frames.
+    FLU-ENU applies ``M_FLU_TO_FRD`` to accel and gyro and uses
+    ``Ardupilot._quaternion_rotorpy_to_aerospace``. FRD-NED packs accel and gyro
+    as given. The FRD quaternion is the inverse, scalar-first, with no axis sandwich.
+    """
+    if frame == FrameConvention.FRD_NED:
+        attitude = _inverse_body_to_world_scalar_first(state["q"])
+    elif frame == FrameConvention.FLU_ENU:
+        attitude = Ardupilot._quaternion_rotorpy_to_aerospace(
+            np.asarray(state["q"], dtype=float)
+        )
+    else:
+        raise ValueError("frame must be FLU_ENU or FRD_NED")
+    return {
+        "sim_position": _as_vec3(state["x"]).tolist(),
+        "sim_velocity_inertial": _as_vec3(state["v"]).tolist(),
+        "sim_attitude": attitude,
+        "accel": _body_frd(frame, accel_body),
+        "gyro": _body_frd(frame, gyro_body),
+    }
+
+
 class Ardupilot(Multirotor):
     M_glu2frd = R.from_euler('x', np.pi)
     M_enu2ned = R.from_matrix([[0, 1, 0], [1, 0, 0], [0, 0, -1]])
@@ -64,9 +115,12 @@ class Ardupilot(Multirotor):
         statedot = {'vdot' : np.zeros(3,), 'wdot' : np.zeros(3,)}
         self.t = 0.0
         self.imu = Imu()
+        self._frame = FrameConvention.FLU_ENU
         self.__enable_imu_noise = enable_imu_noise
 
-        self.sensor_data = self._create_sensor_data(self.initial_state, statedot, self.imu, self.__enable_imu_noise)
+        self.sensor_data = self._create_sensor_data(
+            self.initial_state, statedot, self.imu, self.__enable_imu_noise, self._frame
+        )
         self.ap_link = ArduPilotPlugin()
         self.ap_link.drain_unread_packets()
 
@@ -83,7 +137,9 @@ class Ardupilot(Multirotor):
         state =  super().step(state, control, t_step)
         self.t += t_step
 
-        self.sensor_data = self._create_sensor_data(state, statedot, self.imu, self.__enable_imu_noise)
+        self.sensor_data = self._create_sensor_data(
+            state, statedot, self.imu, self.__enable_imu_noise, self._frame
+        )
         
         self.ap_link.post_update(self.sensor_data, self.t)
         if received: # TODO: is this being handled correctly?
@@ -107,6 +163,12 @@ class Ardupilot(Multirotor):
         normalized_commands = [(c-PWM_MIN)/(PWM_MAX-PWM_MIN) for c in reordered_pwm_commands]
         angular_velocities = [838.0*c for c in normalized_commands] # TODO: remove magic constant
         return angular_velocities
+
+    def set_frame(self, frame):
+        """Remember the world frame and apply it to the simulated IMU."""
+        super(Ardupilot, self).set_frame(frame)
+        self._frame = FrameConvention(frame)
+        self.imu.set_frame(self._frame)
 
     @staticmethod
     def _quaternion_rotorpy_to_aerospace(quaternion_glu2enu: np.ndarray) -> List[float]:
@@ -136,12 +198,13 @@ class Ardupilot(Multirotor):
         # Return as scalar-first quaternion [w, x, y, z]
         return R_frd2ned.as_quat(scalar_first=True).tolist()      
 
-    @staticmethod
     def _create_sensor_data(
+        self,
         state: Dict[str, np.ndarray],
         statedot: Dict[str, np.ndarray],
         imu: Imu,
         enable_imu_noise: bool = False,
+        frame: Optional[FrameConvention] = None,
     ) -> SensorData:
         """
         Converts the state and state derivative of a `rotorpy.vehicles.multirotor` object to the Ardupilot convention
@@ -151,9 +214,12 @@ class Ardupilot(Multirotor):
             statedot (np.ndarray): The state derivative, representing the acceleration.
             imu (Imu): The IMU object used to obtain measurements.
             enable_imu_noise (bool, optional): Flag to enable or disable IMU noise in the measurements. Defaults to False.
+            frame (FrameConvention, optional): Active world/body pair. Defaults to the frame stored by ``set_frame``
+                (FLU-ENU until then). FLU-ENU keeps the historical axis rewrite. FRD-NED packs the measured accel and
+                gyro and the inverse attitude.
         Notes:
             - The attitude quaternion in rotorpy is in scalar-last representation (x, y, z, w) and represents the rotation
-              from the body frame (GLU) to the world frame (ENU).
+              from the body frame to the world frame.
             - The attitude quaternion in Ardupilot is in scalar-first representation (w, x, y, z) and represents the rotation
               from the world frame (NED) to the body frame (FRD).
 
@@ -162,26 +228,23 @@ class Ardupilot(Multirotor):
                         attitude quaternion, and angular velocities.
         """
 
-        # 1. Convert quaternion from rotorpy to aerospace convention
-        quaternion_aerospace = Ardupilot._quaternion_rotorpy_to_aerospace(state["q"])
-
-        # 2. Obtain the IMU measurements in the GLU frame and transform to FRD
+        if frame is None:
+            frame = self._frame
         acceleration = copy.deepcopy(statedot)
         meas_dict = imu.measurement(state, acceleration, with_noise=enable_imu_noise)
-        a_glu, omega_glu = meas_dict["accel"], meas_dict["gyro"]
-        a_frd = Ardupilot.M_glu2frd.apply(a_glu).tolist()
-        omega_frd = Ardupilot.M_glu2frd.apply(omega_glu).tolist()
-
+        fields = ardupilot_sensor_fields(frame, state, meas_dict["accel"], meas_dict["gyro"])
+        accel = fields["accel"]
+        gyro = fields["gyro"]
         return SensorData(
-            state["x"].tolist(),
-            quaternion_aerospace,
-            state["v"].tolist(),
-            xgyro=omega_frd[0],
-            ygyro=omega_frd[1],
-            zgyro=omega_frd[2],
-            xacc=a_frd[0],
-            yacc=a_frd[1],
-            zacc=a_frd[2],
+            fields["sim_position"],
+            fields["sim_attitude"],
+            fields["sim_velocity_inertial"],
+            xgyro=float(gyro[0]),
+            ygyro=float(gyro[1]),
+            zgyro=float(gyro[2]),
+            xacc=float(accel[0]),
+            yacc=float(accel[1]),
+            zacc=float(accel[2]),
         )
 
 

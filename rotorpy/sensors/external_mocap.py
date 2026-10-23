@@ -2,6 +2,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import copy
 
+from rotorpy.frames import FrameConvention, M_ENU_TO_NED, M_FLU_TO_FRD
+
 def hat_map(s):
         """
         Given vector s in R^3, return associate skew symmetric matrix S in R^3x3
@@ -57,6 +59,23 @@ class MotionCapture():
 
         self.initialized = True
         self.with_artifacts = with_artifacts
+        self._frame = FrameConvention.FLU_ENU
+
+    def set_frame(self, frame):
+        """Map noise draws into the active frame. A repeat call does not flip them again."""
+        self._frame = FrameConvention(frame)
+
+    def _in_world_frame(self, sample):
+        """ENU noise stays put. FRD-NED applies ``M_ENU_TO_NED``."""
+        if self._frame is FrameConvention.FRD_NED:
+            return M_ENU_TO_NED @ np.asarray(sample, dtype=float)
+        return sample
+
+    def _in_body_frame(self, sample):
+        """FLU body noise stays put. FRD-NED applies ``M_FLU_TO_FRD``."""
+        if self._frame is FrameConvention.FRD_NED:
+            return M_FLU_TO_FRD @ np.asarray(sample, dtype=float)
+        return sample
 
     def measurement(self, state, with_noise=False, with_artifacts=False):
         """
@@ -86,14 +105,15 @@ class MotionCapture():
 
         if with_noise:
             # Add noise to the measurements based on the provided measurement noise.
-            x_measured += self.rate_scale * np.random.normal(scale=np.abs(self.pos_density))
-            v_measured += self.rate_scale * np.random.normal(scale=np.abs(self.vel_density))
-            w_measured += self.rate_scale * np.random.normal(scale=np.abs(self.rate_density))
+            # World-frame draws are mapped with M_ENU_TO_NED; body-frame draws with M_FLU_TO_FRD.
+            x_measured += self.rate_scale * self._in_world_frame(np.random.normal(scale=np.abs(self.pos_density)))
+            v_measured += self.rate_scale * self._in_world_frame(np.random.normal(scale=np.abs(self.vel_density)))
+            w_measured += self.rate_scale * self._in_body_frame(np.random.normal(scale=np.abs(self.rate_density)))
 
             # Noise has to be treated differently with quaternions... 
             # Following https://www.iri.upc.edu/people/jsola/JoanSola/objectes/notes/kinematics.pdf  pg 43
             # First, let's produce a perturbation vector in R3
-            delta_phi = self.rate_scale*np.random.normal(scale=np.abs(self.att_density))
+            delta_phi = self.rate_scale * self._in_body_frame(np.random.normal(scale=np.abs(self.att_density)))
 
             # Now convert that to a rotation matrix
             delta_rotation = Rotation.from_matrix(np.eye(3) + hat_map(delta_phi))

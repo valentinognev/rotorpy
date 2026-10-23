@@ -2,6 +2,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import copy
 
+from rotorpy.frames import FrameConvention
+
 try:
     from filterpy.kalman import UnscentedKalmanFilter
     from filterpy.kalman import MerweScaledSigmaPoints
@@ -54,6 +56,7 @@ class WindUKF:
         self.c_Dz            = quad_params['c_Dz']  # drag coeff, N/(m/s)**2
 
         self.g = 9.81 # m/s^2
+        self._frame = FrameConvention.FLU_ENU
 
         # Filter parameters
         self.xhat = xhat0
@@ -97,14 +100,18 @@ class WindUKF:
         # Extract the appropriate u vector based on the controller commands.
         self.uk = self.construct_control_vector(ground_truth_state, controller_command)
 
-        # Construct the measurement vector yk
-        orientation = Rotation.from_quat(copy.deepcopy(mocap_measurement['q']))
-        euler_angles = orientation.as_euler('zyx', degrees=False)  # Get Euler angles from current orientation
+        # Construct the measurement vector yk.
+        # Body velocity uses the true attitude. Euler angles for the
+        # small-angle model are taken relative to level hover. That hover
+        # is the identity quaternion in both frames.
+        true_orientation = Rotation.from_quat(copy.deepcopy(mocap_measurement['q']))
+        orientation = self._tilt_orientation(mocap_measurement['q'])
+        euler_angles = orientation.as_euler('zyx', degrees=False)
         inertial_speed = mocap_measurement['v']
-        body_speed = (orientation.as_matrix()).T@inertial_speed
-        zk = np.array([euler_angles[0],                 # phi
+        body_speed = (true_orientation.as_matrix()).T@inertial_speed
+        zk = np.array([euler_angles[0],                 # psi
                        euler_angles[1],                 # theta
-                       euler_angles[2],                 # psi
+                       euler_angles[2],                 # phi
                        body_speed[0],                   # vx
                        body_speed[1],                   # vy
                        body_speed[2],                   # vz
@@ -117,6 +124,20 @@ class WindUKF:
         self.filter.update(zk)
 
         return {'filter_state': self.filter.x, 'covariance': self.filter.P}
+
+    def set_frame(self, frame):
+        """Select the gravity sign. A repeated call assigns the same sign again."""
+        self._frame = FrameConvention(frame)
+
+    def _tilt_orientation(self, quaternion):
+        """Attitude relative to level hover. FRD-NED hover is the identity."""
+        return Rotation.from_quat(np.array(quaternion, dtype=float, copy=True))
+
+    def _gravity_body_z(self):
+        """Body-z gravity at level hover. FLU-ENU is up; FRD-NED is down."""
+        if self._frame is FrameConvention.FRD_NED:
+            return self.g
+        return -self.g
 
     def f(self, xk, dt):
         """
@@ -137,12 +158,13 @@ class WindUKF:
         #                 0])
 
         # The process model, below assumes Euler angles are given in the order of [psi, theta, phi] (ZYX)
+        gz = self._gravity_body_z()
         xdot = np.array([xk[2]*self.uk[2] + self.uk[3], 
                         self.uk[2] - xk[2]*self.uk[3], 
                         self.uk[1] + xk[2]*xk[1]*self.uk[2] + xk[0]*self.uk[3], 
-                        -self.c_Dx/self.mass*(xk[3]-xk[6])*va + self.g*xk[1] + xk[4]*self.uk[3] - xk[5]*self.uk[1],
-                        -self.c_Dy/self.mass*(xk[4]-xk[7])*va - self.g*xk[2] + xk[5]*self.uk[1] - xk[3]*self.uk[3], 
-                        self.uk[0] - self.c_Dz/self.mass*(xk[5]-xk[8])*va - self.g + xk[3]*self.uk[2] - xk[4]*self.uk[1], 
+                        -self.c_Dx/self.mass*(xk[3]-xk[6])*va - gz*xk[1] + xk[4]*self.uk[3] - xk[5]*self.uk[2],
+                        -self.c_Dy/self.mass*(xk[4]-xk[7])*va + gz*xk[2] + xk[5]*self.uk[1] - xk[3]*self.uk[3], 
+                        self.uk[0] - self.c_Dz/self.mass*(xk[5]-xk[8])*va + gz + xk[3]*self.uk[2] - xk[4]*self.uk[1], 
                         0,
                         0,
                         0])
@@ -173,7 +195,10 @@ class WindUKF:
         """
         Constructs control vector
         """
-        uk = np.array([controller_command['cmd_thrust']/self.mass,    # Compute mass normalized thrust from the command thrust, note that this is not the actual thrust...
+        thrust = controller_command['cmd_thrust']/self.mass
+        if self._frame is FrameConvention.FRD_NED:
+            thrust = -thrust
+        uk = np.array([thrust,                                        # Body-z thrust acceleration. Positive command is up.
                        ground_truth_state['w'][0],                      # Body rate in x axis
                        ground_truth_state['w'][1],                      # Body rate in y axis
                        ground_truth_state['w'][2]]                      # Body rate in z axis

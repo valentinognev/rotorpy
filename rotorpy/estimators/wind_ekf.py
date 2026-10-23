@@ -2,6 +2,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import copy
 
+from rotorpy.frames import FrameConvention
+
 
 class WindEKF:
     """
@@ -42,6 +44,7 @@ class WindEKF:
         self.c_Dz            = quad_params['c_Dz']  # drag coeff, N/(m/s)**2
 
         self.g = 9.81 # m/s^2
+        self._frame = FrameConvention.FLU_ENU
 
         # Filter parameters
         self.Q = Q
@@ -136,6 +139,18 @@ class WindEKF:
 
         return self.pack_results()
 
+    def set_frame(self, frame):
+        """Select the gravity sign and refresh the Jacobian at the last linearization point."""
+        self._frame = FrameConvention(frame)
+        if hasattr(self, "_lin_x"):
+            self.computeJacobians(self._lin_x, self._lin_u)
+
+    def _gravity_body_z(self):
+        """Body-z gravity at level hover. FLU-ENU is up; FRD-NED is down."""
+        if self._frame is FrameConvention.FRD_NED:
+            return self.g
+        return -self.g
+
     def process_model(self, xk, uk):
         """
         Process model
@@ -143,13 +158,15 @@ class WindEKF:
 
         va = np.sqrt((xk[3]-xk[6])**2 + (xk[4]-xk[7])**2 + (xk[5]-xk[8])**2)  # Compute the norm of the airspeed vector
 
-        # The process model is integrated using forward Euler. 
+        # The process model is integrated using forward Euler.
+        # Euler order stays [phi, theta, psi], so pitch is xk[1] and roll is xk[0].
+        gz = self._gravity_body_z()
         xdot = np.array([uk[1] + xk[0]*xk[1]*uk[2] + xk[2]*uk[3], 
                         uk[2] - xk[0]*uk[3], 
                         xk[0]*uk[2] + uk[3], 
-                        -self.c_Dx/self.mass*(xk[3]-xk[6])*va + self.g*xk[1] + xk[4]*uk[3] - xk[5]*uk[1],
-                        -self.c_Dy/self.mass*(xk[4]-xk[7])*va - self.g*xk[0] + xk[5]*uk[1] - xk[3]*uk[3], 
-                        uk[0] - self.c_Dz/self.mass*(xk[5]-xk[8])*va - self.g + xk[3]*uk[2] - xk[4]*uk[1], 
+                        -self.c_Dx/self.mass*(xk[3]-xk[6])*va - gz*xk[1] + xk[4]*uk[3] - xk[5]*uk[2],
+                        -self.c_Dy/self.mass*(xk[4]-xk[7])*va + gz*xk[0] + xk[5]*uk[1] - xk[3]*uk[3], 
+                        uk[0] - self.c_Dz/self.mass*(xk[5]-xk[8])*va + gz + xk[3]*uk[2] - xk[4]*uk[1], 
                         0,
                         0,
                         0])
@@ -181,12 +198,20 @@ class WindEKF:
         Compute the Jacobians of the process and measurement model at the operating points x and u.
         """
 
+        self._lin_x = np.array(x, dtype=float, copy=True)
+        self._lin_u = np.array(u, dtype=float, copy=True)
+
         va = np.sqrt((x[3]-x[6])**2 + (x[4]-x[7])**2 + (x[5]-x[8])**2)  # Compute the norm of the airspeed vector
 
-        # Partial derivatives of va for chain rule
-        dvadu = (x[3]-x[6])/va
-        dvadv = (x[4]-x[7])/va
-        dvadw = (x[5]-x[8])/va
+        # Partial derivatives of va for chain rule. At zero airspeed the drag map v*|v| is flat.
+        if va == 0.0:
+            dvadu = 0.0
+            dvadv = 0.0
+            dvadw = 0.0
+        else:
+            dvadu = (x[3]-x[6])/va
+            dvadv = (x[4]-x[7])/va
+            dvadw = (x[5]-x[8])/va
         dvadwx = -dvadu
         dvadwy = -dvadv
         dvadwz = -dvadw
@@ -199,11 +224,12 @@ class WindEKF:
         vay = x[4] - x[7]
         vaz = x[5] - x[8]
 
+        gz = self._gravity_body_z()
         self.A = np.array([[x[1]*u[2], x[0]*u[2] + u[3], 0, 0, 0, 0, 0, 0, 0],
                            [-u[3], 0, 0, 0, 0, 0, 0, 0, 0],
                            [ u[2], 0, 0, 0, 0, 0, 0, 0, 0],
-                           [0, self.g, 0, -kx*(dvadu*vax + va), u[3] - kx*(dvadv*vax), -u[1] - kx*(dvadw*vax), -kx*(dvadwx*vax-va), -kx*(dvadwy*vax), -kx*(dvadwz*vax)],
-                           [-self.g, 0, 0, -ky*(dvadu*vay)-u[3], -ky*(dvadv*vay + va), u[1]-ky*(dvadw*vay), -ky*(dvadwx*vay), -ky*(dvadv*vay - va), -ky*(dvadw*vay)],
+                           [0, -gz, 0, -kx*(dvadu*vax + va), u[3] - kx*(dvadv*vax), -u[2] - kx*(dvadw*vax), -kx*(dvadwx*vax-va), -kx*(dvadwy*vax), -kx*(dvadwz*vax)],
+                           [gz, 0, 0, -ky*(dvadu*vay)-u[3], -ky*(dvadv*vay + va), u[1]-ky*(dvadw*vay), -ky*(dvadwx*vay), -ky*(dvadv*vay - va), -ky*(dvadw*vay)],
                            [0, 0, 0, u[2] - kz*(dvadu*vaz), -u[1] - kz*(dvadv*vaz), -kz*(dvadw*vaz + va), -kz*(dvadwx*vaz), -kz*(dvadwy*vaz), -kz*(dvadwz*vaz - va)],
                            [0, 0, 0, 0, 0, 0, 0, 0, 0],
                            [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -225,7 +251,10 @@ class WindEKF:
         """
         Constructs control vector
         """
-        uk = np.array([controller_command['cmd_thrust']/self.mass,    # Compute mass normalized thrust from the command thrust, note that this is not the actual thrust...
+        thrust = controller_command['cmd_thrust']/self.mass
+        if self._frame is FrameConvention.FRD_NED:
+            thrust = -thrust
+        uk = np.array([thrust,                                        # Body-z thrust acceleration. Positive command is up.
                        ground_truth_state['w'][0],                      # Body rate in x axis
                        ground_truth_state['w'][1],                      # Body rate in y axis
                        ground_truth_state['w'][2]]                      # Body rate in z axis

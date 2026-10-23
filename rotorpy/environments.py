@@ -3,6 +3,7 @@ from scipy.spatial.transform import Rotation
 import matplotlib.pyplot as plt
 import time as clk
 
+from rotorpy.frames import apply_frame
 from rotorpy.simulate import simulate
 from rotorpy.utils.plotter import *
 from rotorpy.world import World
@@ -91,6 +92,8 @@ class Environment():
         # expensive, and there is nothing useful to render if the user did not
         # ask for it. Frames are captured during run() at camera.frame_rate.
         self.camera = camera
+
+        apply_frame(self.world.frame, self.vehicle, self.controller, self.imu, self.mocap, self.estimator)
 
         return 
 

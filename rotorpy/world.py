@@ -1,6 +1,7 @@
 import json
 import numpy as np
 
+from rotorpy.frames import FrameConvention
 from rotorpy.utils.shapes import Cuboid
 from rotorpy.utils.numpy_encoding import NumpyJSONEncoder, to_ndarray
 from rotorpy.world_features import features_from_config
@@ -26,7 +27,7 @@ class World(object):
     def __init__(self, world_data, add_features=False, feature_mode='regular', feature_spacing=0.2,
                  N_features_per_surface=100, seed=None, descriptor_noise=0.05,
                  feature_density=50.0, edge_spacing=0.1, edge_density=50.0,
-                 descriptor_dim=None):
+                 descriptor_dim=None, frame=FrameConvention.FLU_ENU):
         """
         Construct World object from data. Instead of using this constructor
         directly, see also class methods 'World.from_file()' for building a
@@ -79,8 +80,11 @@ class World(object):
             edge_density, features per meter of edge (only for 'edge_random' mode)
             descriptor_dim, if set, each generated feature also carries a
                 synthetic L2-normalized descriptor vector of this dimension
+            frame, FrameConvention stored on the world. Defaults to FLU_ENU.
+                Extents are stored as given and are not rewritten for the frame.
         """
         self.world = world_data
+        self.frame = frame
         self.add_features = add_features
         self.feature_mode = feature_mode
         self.feature_spacing = feature_spacing
@@ -119,12 +123,16 @@ class World(object):
             self.generate_surface_features(config=self.features_config)
 
     @classmethod
-    def from_file(cls, filename):
+    def from_file(cls, filename, frame=None):
         """
         Read world definition from a .json text file and return World object.
 
         Parameters:
             filename
+            frame, optional FrameConvention. When not None, this overrides the
+                file. Otherwise the JSON string "frame" is parsed with
+                FrameConvention when present, else FLU_ENU. Extents are not
+                rewritten.
 
         Returns:
             world, World object
@@ -133,7 +141,13 @@ class World(object):
             my_world = World.from_file('my_filename.json')
         """
         with open(filename) as file:
-            return cls(to_ndarray(json.load(file)))
+            world_data = to_ndarray(json.load(file))
+        if frame is None:
+            if "frame" in world_data:
+                frame = FrameConvention(world_data["frame"])
+            else:
+                frame = FrameConvention.FLU_ENU
+        return cls(world_data, frame=frame)
 
     def to_file(self, filename, include_features=False):
         """
@@ -454,13 +468,14 @@ class World(object):
         return {key: surface_kwargs.get(key, default) for key, default in defaults.items()}
 
     @classmethod
-    def empty(cls, extents, add_features=False, **surface_kwargs):
+    def empty(cls, extents, add_features=False, frame=FrameConvention.FLU_ENU, **surface_kwargs):
         """
         Return World object for bounded empty space.
 
         Parameters:
             extents, tuple of (xmin, xmax, ymin, ymax, zmin, zmax)
             add_features, if True, generates surface features
+            frame, FrameConvention stored on the world. Defaults to FLU_ENU.
             surface_kwargs, keyword arguments for surface feature generation (see generate_surface_features)
 
         Returns:
@@ -472,10 +487,11 @@ class World(object):
         bounds = {'extents': extents}
         blocks = []
         world_data = {'bounds': bounds, 'blocks': blocks}
-        return cls(world_data, add_features=add_features, **World._feature_kwargs(surface_kwargs))
+        return cls(world_data, add_features=add_features, frame=frame, **World._feature_kwargs(surface_kwargs))
 
     @classmethod
-    def grid_forest(cls, n_rows, n_cols, width, height, spacing, add_features=False, **surface_kwargs):
+    def grid_forest(cls, n_rows, n_cols, width, height, spacing, add_features=False,
+                    frame=FrameConvention.FLU_ENU, **surface_kwargs):
         """
         Return World object describing a grid forest world parameterized by
         arguments. The boundary extents fit tightly to the included trees.
@@ -487,6 +503,7 @@ class World(object):
             height, height of trees
             spacing, spacing between centers of rows and columns
             add_features, if True, generates surface features
+            frame, FrameConvention stored on the world. Defaults to FLU_ENU.
             surface_kwargs, keyword arguments for surface feature generation (see generate_surface_features)
 
         Returns:
@@ -510,7 +527,7 @@ class World(object):
                 blocks.append({'extents': [x, x+width, y, y+width, 0, height], 'color': [1, 0, 0]})
 
         world_data = {'bounds': bounds, 'blocks': blocks}
-        return cls(world_data, add_features=add_features, **World._feature_kwargs(surface_kwargs))
+        return cls(world_data, add_features=add_features, frame=frame, **World._feature_kwargs(surface_kwargs))
 
     @classmethod
     def random_forest(cls, world_dims, tree_width, tree_height, num_trees, add_features=False, **surface_kwargs):

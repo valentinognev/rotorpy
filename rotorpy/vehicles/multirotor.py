@@ -3,6 +3,7 @@ import numpy as np
 from numpy.linalg import inv, norm
 import scipy.integrate
 from scipy.spatial.transform import Rotation
+from rotorpy.frames import FrameConvention, M_FLU_TO_FRD
 from rotorpy.vehicles.hummingbird_params import quad_params
 
 from scipy.spatial.transform import Rotation as R
@@ -20,6 +21,85 @@ import time
 """
 Multirotor models
 """
+
+# Position, velocity, quaternion, body rate, and wind. Rotor speeds stay
+# component-wise: they are the same numbers in both frames.
+_INVARIANT_STATE_GROUPS = ((0, 3), (3, 6), (6, 10), (10, 13), (13, 16))
+
+
+def _invariant_scale(y, y_new, rtol, atol):
+    """Scale an RK error by group norms that a frame change does not alter.
+
+    scipy's component scale ``atol + rtol * |y_i|`` sees a different number
+    after a yaw of pi/2, so FLU-ENU and FRD-NED accept different steps for the
+    same motion. Each world or body block is scaled by its Euclidean norm.
+    """
+    rtol_a = np.broadcast_to(np.asarray(rtol, dtype=float), y.shape)
+    atol_a = np.broadcast_to(np.asarray(atol, dtype=float), y.shape)
+    scale = atol_a + np.maximum(np.abs(y), np.abs(y_new)) * rtol_a
+    if y.size < 16:
+        return scale
+    for start, end in _INVARIANT_STATE_GROUPS:
+        magnitude = max(
+            float(np.linalg.norm(y[start:end])),
+            float(np.linalg.norm(y_new[start:end])),
+        )
+        scale[start:end] = atol_a[start:end] + magnitude * rtol_a[start:end]
+    return scale
+
+
+def _rms_norm(x):
+    return float(np.linalg.norm(x) / x.size ** 0.5)
+
+
+def _select_initial_step_invariant(fun, t0, y0, t_bound, max_step, f0,
+                                   direction, order, rtol, atol):
+    """Hairer initial step, with the frame-invariant error scale."""
+    if y0.size == 0:
+        return np.inf
+    interval_length = abs(t_bound - t0)
+    if interval_length == 0.0:
+        return 0.0
+    scale = _invariant_scale(y0, y0, rtol, atol)
+    d0 = _rms_norm(y0 / scale)
+    d1 = _rms_norm(f0 / scale)
+    if d0 < 1e-5 or d1 < 1e-5:
+        h0 = 1e-6
+    else:
+        h0 = 0.01 * d0 / d1
+    h0 = min(h0, interval_length)
+    y1 = y0 + h0 * direction * f0
+    f1 = fun(t0 + h0 * direction, y1)
+    d2 = _rms_norm((f1 - f0) / scale) / h0
+    if d1 <= 1e-15 and d2 <= 1e-15:
+        h1 = max(1e-6, h0 * 1e-3)
+    else:
+        h1 = (0.01 / max(d1, d2)) ** (1 / (order + 1))
+    return min(100 * h0, h1, interval_length, max_step)
+
+
+class FrameInvariantRK45(scipy.integrate.RK45):
+    """Dormand-Prince RK45 whose step test is unchanged by FLU/FRD or ENU/NED."""
+
+    def __init__(self, fun, t0, y0, t_bound, max_step=np.inf,
+                 rtol=1e-3, atol=1e-6, vectorized=False,
+                 first_step=None, **extraneous):
+        super().__init__(
+            fun, t0, y0, t_bound, max_step=max_step, rtol=rtol, atol=atol,
+            vectorized=vectorized, first_step=first_step, **extraneous,
+        )
+        if first_step is None and self.y.size:
+            self.h_abs = _select_initial_step_invariant(
+                self.fun, self.t, self.y, t_bound, self.max_step, self.f,
+                self.direction, self.error_estimator_order, self.rtol, self.atol,
+            )
+
+    def _estimate_error_norm(self, K, h, scale):
+        error = self._estimate_error(K, h)
+        y_new = self.y + h * np.dot(K[:-1].T, self.B)
+        inv_scale = _invariant_scale(self.y, y_new, self.rtol, self.atol)
+        return _rms_norm(error / inv_scale)
+
 
 def quat_dot(quat, omega):
     """
@@ -118,6 +198,10 @@ class Multirotor(object):
 
         self.num_rotors      = quad_params['num_rotors']
         self.rotor_pos       = quad_params['rotor_pos']
+        self._rotor_pos_flu  = {
+            key: np.array(position, dtype=float, copy=True)
+            for key, position in self.rotor_pos.items()
+        }
 
         self.rotor_dir       = quad_params['rotor_directions']
 
@@ -148,6 +232,7 @@ class Multirotor(object):
         self.inertia = np.array([[self.Ixx, self.Ixy, self.Ixz],
                                  [self.Ixy, self.Iyy, self.Iyz],
                                  [self.Ixz, self.Iyz, self.Izz]])
+        self._inertia_flu = np.array(self.inertia, dtype=float, copy=True)
         self.rotor_drag_matrix = np.array([[self.k_d,   0,                 0],
                                            [0,          self.k_d,          0],
                                            [0,          0,          self.k_z]])
@@ -162,6 +247,7 @@ class Multirotor(object):
         self.ground_friction_beta = max(0.1, min(0.5, self.ground_friction_beta))
 
         self.inv_inertia = inv(self.inertia)
+        self.thrust_axis = np.array([0.0, 0.0, 1.0])
         self.weight = np.array([0, 0, -self.mass*self.g])
 
         # Control allocation
@@ -199,6 +285,42 @@ class Multirotor(object):
             self.rotor_geometry = np.vstack([self.rotor_geometry, r])
 
         return
+
+    def set_frame(self, frame):
+        """Derive active geometry from the stored FLU copy.
+
+        FLU-ENU keeps authored positions and ``I``. FRD-NED applies
+        ``M_FLU_TO_FRD`` once; a repeated call does not flip them again.
+        """
+        if frame == FrameConvention.FRD_NED:
+            transform = M_FLU_TO_FRD
+            self.thrust_axis = np.array([0.0, 0.0, -1.0])
+            self.weight = np.array([0.0, 0.0, self.mass * self.g])
+        elif frame == FrameConvention.FLU_ENU:
+            transform = np.eye(3)
+            self.thrust_axis = np.array([0.0, 0.0, 1.0])
+            self.weight = np.array([0.0, 0.0, -self.mass * self.g])
+        else:
+            raise ValueError("frame must be FLU_ENU or FRD_NED")
+
+        self.rotor_pos = {
+            key: transform @ np.array(position, dtype=float, copy=True)
+            for key, position in self._rotor_pos_flu.items()
+        }
+        self.inertia = transform @ self._inertia_flu @ transform
+        self.inv_inertia = inv(self.inertia)
+        self.extract_geometry()
+
+        k = self.k_m / self.k_eta
+        self.f_to_TM = np.vstack((
+            np.ones((1, self.num_rotors)),
+            np.hstack([
+                np.cross(self.rotor_pos[key], self.thrust_axis).reshape(-1, 1)[0:2]
+                for key in self.rotor_pos
+            ]),
+            (k * self.thrust_axis[2] * self.rotor_dir).reshape(1, -1),
+        ))
+        self.TM_to_f = np.linalg.inv(self.f_to_TM)
 
     def statedot(self, state, control, t_step):
         """
@@ -238,12 +360,18 @@ class Multirotor(object):
             return self._s_dot_fn(t, s, cmd_rotor_speeds)
         s = Multirotor._pack_state(state)
 
-        # Integrate
+        # RK45 is the script integrator. Its acceptance test uses group norms
+        # so a yaw of pi/2 does not change the physical step sequence.
+        kwargs = dict(self.integrator_kwargs)
+        method = kwargs.pop("method", "RK45")
+        if method == "RK45":
+            method = FrameInvariantRK45
         sol = scipy.integrate.solve_ivp(
             s_dot_fn,
             (0.0, t_step),
             s,
-            **self.integrator_kwargs
+            method=method,
+            **kwargs
         )
         s = sol['y'][:, -1]
 
@@ -295,11 +423,12 @@ class Multirotor(object):
         # Rotate the force from the body frame to the inertial frame
         Ftot = R@FtotB
 
-        # Ground reaction force: apply normal force when on ground to prevent penetration
+        # Ground reaction force: cancel a further-down net force.
+        # FLU-ENU: negative Fz is cancelled by +z. FRD-NED: positive Fz is cancelled by -z.
         if self._enable_ground and self._on_ground(state):
             total_force_no_ground = self.weight + Ftot
-            if total_force_no_ground[2] < 0:
-                ground_normal_force = np.array([0, 0, -total_force_no_ground[2]])
+            if total_force_no_ground[2] * self.weight[2] > 0:
+                ground_normal_force = np.array([0.0, 0.0, -total_force_no_ground[2]])
                 Ftot += ground_normal_force
 
         # Velocity derivative.
@@ -337,8 +466,8 @@ class Multirotor(object):
         # Get the local airspeeds for each rotor
         local_airspeeds = body_airspeed_vector[:, np.newaxis] + Multirotor.hat_map(body_rates)@(self.rotor_geometry.T)
 
-        # Compute the thrust of each rotor, assuming that the rotors all point in the body z direction!
-        T = np.array([0, 0, self.k_eta])[:, np.newaxis]*rotor_speeds**2 
+        # Rotor thrust lies along thrust_axis (body +z in FLU, body -z in FRD).
+        T = (self.k_eta * rotor_speeds**2) * self.thrust_axis[:, np.newaxis]
         
         # Add in aero wrenches (if applicable)
         if self.aero:
@@ -348,9 +477,9 @@ class Multirotor(object):
             H = -rotor_speeds*(self.rotor_drag_matrix@local_airspeeds)
 
             # Pitching flapping moment acting at each propeller hub.
-            M_flap = -self.k_flap*rotor_speeds*((Multirotor.hat_map(local_airspeeds.T).transpose(2, 0, 1))@np.array([0,0,1])).T
-            # Translational lift. 
-            T += np.array([0, 0, self.k_h])[:, np.newaxis]*(local_airspeeds[0, :]**2 + local_airspeeds[1, :]**2)
+            M_flap = -self.k_flap*rotor_speeds*((Multirotor.hat_map(local_airspeeds.T).transpose(2, 0, 1))@self.thrust_axis).T
+            # Translational lift along the same rotor axis.
+            T += self.thrust_axis[:, np.newaxis]*(self.k_h*(local_airspeeds[0, :]**2 + local_airspeeds[1, :]**2))
 
         else:
             D = np.zeros(3,)
@@ -359,7 +488,7 @@ class Multirotor(object):
 
         # Compute the moments due to the rotor thrusts, rotor drag (if applicable), and rotor drag torques
         M_force = -np.einsum('ijk, ik->j', Multirotor.hat_map(self.rotor_geometry), T+H)
-        M_yaw = self.rotor_dir*(np.array([0, 0, self.k_m])[:, np.newaxis]*rotor_speeds**2)
+        M_yaw = (self.k_m * rotor_speeds**2 * self.rotor_dir) * self.thrust_axis[:, np.newaxis]
 
         # Sum all elements to compute the total body wrench
         FtotB = np.sum(T + H, axis=1) + D
@@ -411,17 +540,18 @@ class Multirotor(object):
             # Get desired acceleration based on P control of velocity error. 
             a_cmd = -self.k_v*v_err
 
-            # Get desired force from this acceleration. 
-            F_des = self.mass*(a_cmd + np.array([0, 0, self.g]))
+            # Get desired force from this acceleration.
+            # g_feedforward is [0, 0, +g] in FLU-ENU and [0, 0, -g] in FRD-NED.
+            F_des = self.mass*a_cmd - self.weight
 
             R = Rotation.from_quat(state['q']).as_matrix()
-            b3 = R @ np.array([0, 0, 1])
+            b3 = R @ self.thrust_axis
             cmd_thrust = np.dot(F_des, b3)
 
             # Follow rest of SE3 controller to compute cmd moment. 
 
-            # Desired orientation to obtain force vector.
-            b3_des = F_des/np.linalg.norm(F_des)
+            # Desired body +z is normalize(F_des) in FLU-ENU and -normalize(F_des) in FRD-NED.
+            b3_des = np.sign(self.thrust_axis[2]) * F_des/np.linalg.norm(F_des)
             c1_des = np.array([1, 0, 0])
             b2_des = np.cross(b3_des, c1_des)/np.linalg.norm(np.cross(b3_des, c1_des))
             b1_des = np.cross(b2_des, b3_des)
@@ -454,11 +584,12 @@ class Multirotor(object):
             F_des = control['cmd_acc']*self.mass
 
             R = Rotation.from_quat(state['q']).as_matrix()
-            b3 = R @ np.array([0, 0, 1])
+            b3 = R @ self.thrust_axis
             cmd_thrust = np.dot(F_des, b3)
 
-            # Desired orientation to obtain force vector.
-            b3_des = F_des/np.linalg.norm(F_des)
+            # Desired body +z is normalize(F_des) in FLU-ENU and -normalize(F_des) in FRD-NED.
+            # cmd_acc already includes gravity compensation.
+            b3_des = np.sign(self.thrust_axis[2]) * F_des/np.linalg.norm(F_des)
             c1_des = np.array([1, 0, 0])
             b2_des = np.cross(b3_des, c1_des)/np.linalg.norm(np.cross(b3_des, c1_des))
             b1_des = np.cross(b2_des, b3_des)
@@ -483,23 +614,25 @@ class Multirotor(object):
 
     def _on_ground(self, state):
         """
-        Check if the vehicle is on the ground. 
+        Check if the vehicle is on the ground.
+        FLU-ENU (weight along -z): z <= 0.001.
+        FRD-NED (weight along +z): z >= -0.001.
         """
-        return state['x'][2] <= 0.001
+        return bool(state['x'][2] * np.sign(self.weight[2]) >= -0.001)
 
     def _handle_vehicle_on_ground(self, state):
         """
         Handle vehicle state while on ground.
         - Clamp altitude to ground plane (z = 0)
-        - Prevent downward motion (v_z >= 0)
+        - Prevent velocity further into the ground
         - Apply horizontal velocity damping to emulate friction
         - Zero angular velocity and flatten attitude (keep yaw)
         """
         # Clamp position to ground
         state['x'][2] = 0.0
 
-        # Prevent downward velocity
-        if state['v'][2] < 0.0:
+        # Prevent velocity further into the ground (negative z in FLU-ENU, positive z in FRD-NED).
+        if state['v'][2] * np.sign(self.weight[2]) > 0.0:
             state['v'][2] = 0.0
 
         # Horizontal velocity damping (friction-like)
@@ -677,9 +810,15 @@ class BatchedMultirotorParams:
     def update_mass(self, idx, mass):
         """
         Update the mass and weight of the drone at index idx.
+
+        Weight stays on the frame already in ``self.weight``: +z after
+        FRD-NED, -z for the default FLU-ENU sign.
         """
         self.mass[idx] = mass
-        self.weight[idx,-1] = -mass * self.g
+        z_sign = float(torch.sign(self.weight[idx, -1]))
+        if z_sign == 0.0:
+            z_sign = -1.0
+        self.weight[idx, -1] = z_sign * mass * self.g
 
     def update_thrust_and_rotor_params(self, idx, k_eta = None, k_m = None, rotor_pos = None):
         """
@@ -805,6 +944,62 @@ class BatchedMultirotor(object):
 
         assert integrator == 'dopri5' or integrator == "rk4"
         self.integrator = integrator
+
+        # Active body thrust direction. FLU-ENU is +z; set_frame switches it.
+        self.thrust_axis = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=torch.double)
+        self._inertia_flu = self.params.inertia.detach().clone()
+        self._rotor_pos_flu = [
+            {key: np.array(position, dtype=float, copy=True) for key, position in rotors.items()}
+            for rotors in self.params.rotor_pos
+        ]
+
+    def set_frame(self, frame):
+        """Derive active geometry from the stored FLU copy.
+
+        FLU-ENU keeps authored positions and inertia. FRD-NED applies
+        ``M_FLU_TO_FRD`` once; a repeated call does not flip them again.
+        """
+        if frame == FrameConvention.FRD_NED:
+            transform = M_FLU_TO_FRD
+            thrust = np.array([0.0, 0.0, -1.0])
+            weight_z = self.params.mass.squeeze(-1) * self.params.g
+        elif frame == FrameConvention.FLU_ENU:
+            transform = np.eye(3)
+            thrust = np.array([0.0, 0.0, 1.0])
+            weight_z = -self.params.mass.squeeze(-1) * self.params.g
+        else:
+            raise ValueError("frame must be FLU_ENU or FRD_NED")
+
+        self.thrust_axis = torch.tensor(thrust, device=self.device, dtype=torch.double)
+        self.params.rotor_pos = [
+            {
+                key: transform @ np.array(position, dtype=float, copy=True)
+                for key, position in rotors.items()
+            }
+            for rotors in self._rotor_pos_flu
+        ]
+        body_from_flu = torch.tensor(transform, device=self.device, dtype=torch.double)
+        self.params.inertia = body_from_flu @ self._inertia_flu @ body_from_flu
+        self.params.inv_inertia = torch.linalg.inv(self.params.inertia).double()
+        self.params.weight = torch.zeros(self.num_drones, 3, device=self.device, dtype=torch.double)
+        self.params.weight[:, -1] = weight_z
+        self.params.extract_geometry()
+
+        matrices = []
+        for i in range(self.num_drones):
+            k_ratio = float((self.params.k_m[i] / self.params.k_eta[i]).detach().cpu().reshape(-1)[0])
+            moment_xy = np.hstack([
+                np.cross(self.params.rotor_pos[i][key], thrust).reshape(-1, 1)[0:2]
+                for key in self.params.rotor_pos[i]
+            ])
+            yaw_row = (k_ratio * thrust[2] * self.params.rotor_dir_np[i]).reshape(1, -1)
+            matrices.append(np.vstack((
+                np.ones((1, self.params.num_rotors)),
+                moment_xy,
+                yaw_row,
+            )))
+        self.params.f_to_TM = torch.tensor(np.array(matrices), device=self.device, dtype=torch.double)
+        self.params.TM_to_f = torch.linalg.inv(self.params.f_to_TM)
 
     def statedot(self, state, control, t_step, idxs):
         """
@@ -957,9 +1152,10 @@ class BatchedMultirotor(object):
         local_airspeeds = body_airspeed_vector.unsqueeze(-1) + (
             BatchedMultirotor.hat_map(body_rates).permute(2, 0, 1)) @ (self.params.rotor_geometry[idxs].transpose(1, 2))
 
-        # Compute the thrust of each rotor, assuming that the rotors all point in the body z direction!
-        T = torch.zeros(num_drones, 3, 4, device=self.device)
-        T[..., -1, :] = self.params.k_eta[idxs] * rotor_speeds ** 2
+        # Rotor thrust lies along thrust_axis (body +z in FLU, body -z in FRD).
+        axis = self.thrust_axis.view(1, 3, 1)
+        thrust_mag = self.params.k_eta[idxs] * rotor_speeds ** 2
+        T = thrust_mag.unsqueeze(1) * axis
 
         # Add in aero wrenches (if applicable)
         if self.aero:
@@ -972,11 +1168,11 @@ class BatchedMultirotor(object):
             # Pitching flapping moment acting at each propeller hub.
             M_flap = BatchedMultirotor.hat_map(local_airspeeds.transpose(1, 2).reshape(num_drones * 4, 3))
             M_flap = M_flap.permute(2, 0, 1).reshape(num_drones, 4, 3, 3).double()
-            M_flap = M_flap @ torch.tensor([0, 0, 1.0], device=self.device).double()
+            M_flap = M_flap @ self.thrust_axis
             M_flap = (-self.params.k_flap[idxs] * rotor_speeds).unsqueeze(1) * M_flap.transpose(-1, -2)
 
-            lift = torch.zeros(num_drones, 3, 1, device=self.device).double()
-            lift[:, 2, :] = self.params.k_h[idxs]
+            # Translational lift along the same rotor axis.
+            lift = self.thrust_axis.view(1, 3, 1) * self.params.k_h[idxs].view(-1, 1, 1)
             lift = torch.bmm(lift, (local_airspeeds[:, 0, :] ** 2 + local_airspeeds[:, 1, :] ** 2).unsqueeze(1))
             T += lift
         else:
@@ -986,8 +1182,8 @@ class BatchedMultirotor(object):
 
         # Compute the moments due to the rotor thrusts, rotor drag (if applicable), and rotor drag torques
         M_force = -torch.einsum('bijk, bik->bj', self.params.rotor_geometry_hat_maps[idxs], T + H)
-        M_yaw = torch.zeros(num_drones, 3, 4, device=self.device)
-        M_yaw[..., -1, :] = self.params.rotor_dir[idxs] * self.params.k_m[idxs] * rotor_speeds ** 2
+        yaw_mag = self.params.rotor_dir[idxs] * self.params.k_m[idxs] * rotor_speeds ** 2
+        M_yaw = yaw_mag.unsqueeze(1) * axis
 
         # Sum all elements to compute the total body wrench
         FtotB = torch.sum(T + H, dim=2) + D
@@ -1030,15 +1226,16 @@ class BatchedMultirotor(object):
             a_cmd = -self.params.k_v[idxs] * v_err
 
             # Get desired force from this acceleration.
-            F_des = self.params.mass[idxs] * (a_cmd + np.array([0, 0, self.params.g]))
+            # +g on world z in FLU-ENU and -g in FRD-NED, via the active weight.
+            F_des = self.params.mass[idxs] * a_cmd - self.params.weight[idxs]
 
             R = roma.unitquat_to_rotmat(state['q'][idxs]).double()
-            b3 = R @ torch.tensor([0.0, 0.0, 1.0], device=self.device).double()
+            b3 = R @ self.thrust_axis
             cmd_thrust = torch.sum(F_des * b3, dim=-1).double().unsqueeze(-1)
 
             # Follow rest of SE3 controller to compute cmd moment.
-            # Desired orientation to obtain force vector.
-            b3_des = F_des / torch.norm(F_des, dim=-1, keepdim=True)
+            # Desired body +z follows the force in FLU-ENU and opposes it in FRD-NED.
+            b3_des = torch.sign(self.thrust_axis[2]) * F_des / torch.norm(F_des, dim=-1, keepdim=True)
             c1_des = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).double()
             b2_des = torch.cross(b3_des, c1_des, dim=-1) / torch.norm(torch.cross(b3_des, c1_des, dim=-1), dim=-1,
                                                                       keepdim=True)
@@ -1067,14 +1264,15 @@ class BatchedMultirotor(object):
                                                                                                    Iw.squeeze(-1),
                                                                                                    dim=-1)
         elif self.control_abstraction == "cmd_acc":
+            # cmd_acc already includes gravity compensation.
             F_des = control['cmd_acc'][idxs] * self.params.mass[idxs]
             R = roma.unitquat_to_rotmat(state['q'][idxs]).double()
-            b3 = R @ torch.tensor([0.0, 0.0, 1.0], device=self.device).double()
+            b3 = R @ self.thrust_axis
             cmd_thrust = torch.sum(F_des * b3, dim=-1).double().unsqueeze(-1)
 
             # Follow rest of SE3 controller to compute cmd moment.
-            # Desired orientation to obtain force vector.
-            b3_des = F_des / torch.norm(F_des, dim=-1, keepdim=True)
+            # Desired body +z follows the force in FLU-ENU and opposes it in FRD-NED.
+            b3_des = torch.sign(self.thrust_axis[2]) * F_des / torch.norm(F_des, dim=-1, keepdim=True)
             c1_des = torch.tensor([1.0, 0.0, 0.0], device=self.device).unsqueeze(0).double()
             b2_des = torch.cross(b3_des, c1_des, dim=-1) / torch.norm(torch.cross(b3_des, c1_des, dim=-1), dim=-1,
                                                                       keepdim=True)
