@@ -1,5 +1,8 @@
 # Updates
 
+## 3.7.1 - Upright homing acceleration
+- The flat output accelerates along the homing velocity miss over half a second, scaled so the specific force stays inside a 45° upright cone. The opening motion is a pitch on the short arc.
+
 ## 3.7.0 - Upward camera for the homing close
 - A second camera, aimed 70° above the nose, steers once it sees the target. Homing aims through the center of the square around that target.
 - The flight stops at the ground or at 20 seconds. The homing page shows both pictures, that square, and both frustums.

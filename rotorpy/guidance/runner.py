@@ -251,7 +251,7 @@ def _fly_homing(
         if status == "timeout":
             return timeout_outcome(t), history()
 
-        flat = flat_output(state["x"], command)
+        flat = flat_output(state["x"], command, state["v"])
         control = controller.update(t, state, flat)
         state = vehicle.step(state, control, _SIM_DT)
         state["wind"] = np.zeros(3)

@@ -3,7 +3,13 @@ from scipy.spatial.transform import Rotation
 
 from rotorpy.guidance.camera_geometry import boresight_frd, pitched_extrinsics
 from rotorpy.guidance.frames import ned_to_sim
-from rotorpy.guidance.homing import HomingGuidance, _sightline_ned, body_frd_velocity, flat_output
+from rotorpy.guidance.homing import (
+    HomingCommand,
+    HomingGuidance,
+    _sightline_ned,
+    body_frd_velocity,
+    flat_output,
+)
 from rotorpy.guidance.sightline import ground_relative_position
 from rotorpy.guidance.speed import desired_velocity
 
@@ -25,6 +31,59 @@ def _guidance():
         3.0, 36, _course(), INTRINSICS, pitched_extrinsics(10.0), pitched_extrinsics(-70),
     )
 
+def _held_command(velocity_ned, acceleration_ned):
+    return HomingCommand(
+        velocity_ned,
+        acceleration_ned,
+        np.zeros(3),
+        0.2,
+        True,
+        True,
+        "forward",
+        np.array([1.0, 2.0]),
+        4.0,
+    )
+
+
+def test_small_velocity_error_is_a_gentle_acceleration():
+    """Half a second toward a 0.4 m/s miss is 0.8 m/s², with no extra velocity step."""
+    command = _held_command(np.array([10.4, 0.0, 0.0]), np.zeros(3))
+    measured = np.array([10.0, 0.0, 0.0])
+    flat = flat_output(np.zeros(3), command, measured)
+    assert np.allclose(flat["x_dot"], measured)
+    assert np.allclose(flat["x_ddot"], [0.8, 0.0, 0.0])
+    assert flat["yaw"] == 0.2 and flat["yaw_dot"] == 0.0
+
+
+def test_steep_velocity_step_stays_inside_an_upright_cone():
+    """The opening homing step must pitch, not invert.
+
+    A goal near [19, 9.5, -6] m/s from a slower level flight used to demand
+    a downward specific force, and the attitude on that force was the long arc.
+    """
+    command = _held_command(np.array([19.0, 9.5, 6.0]), np.zeros(3))
+    measured = np.array([8.0, 4.0, 0.0])
+    flat = flat_output(np.zeros(3), command, measured)
+    assert np.allclose(flat["x_dot"], measured)
+    specific = flat["x_ddot"] + np.array([0.0, 0.0, 9.81])
+    assert specific[2] >= 0.3 * 9.81 - 1e-9
+    tilt = np.arctan2(np.linalg.norm(specific[:2]), specific[2])
+    assert tilt <= np.deg2rad(45.0) + 1e-9
+    miss = ned_to_sim(command.velocity_ned) - measured
+    assert np.linalg.norm(np.cross(flat["x_ddot"], miss)) <= 1e-6 * (
+        np.linalg.norm(flat["x_ddot"]) * np.linalg.norm(miss)
+    )
+
+
+def test_downward_navigation_cannot_invert_the_specific_force():
+    command = _held_command(np.zeros(3), np.array([0.0, 0.0, 100.0]))
+    flat = flat_output(np.zeros(3), command, np.zeros(3))
+    specific = flat["x_ddot"] + np.array([0.0, 0.0, 9.81])
+    assert specific[2] >= 0.3 * 9.81 - 1e-9
+    tilt = np.arctan2(np.linalg.norm(specific[:2]), specific[2])
+    assert tilt <= np.deg2rad(45.0) + 1e-9
+
+
 def test_identity_attitude_frd_velocity():
     assert np.allclose(body_frd_velocity(np.array([4.0, 5.0, 6.0]), IDENTITY), [4.0, -5.0, 6.0])
 
@@ -38,7 +97,9 @@ def test_coast_below_lock_and_flat_output():
     short[13, 13] = 0.0  # 35 red pixels
     command = guidance.update(0.05, 30.0, IDENTITY, _course(), short, np.zeros((32, 32, 3)))
     assert command.locked is False
-    flat = flat_output(np.array([1.0, 2.0, 3.0]), command)
+    flat = flat_output(
+        np.array([1.0, 2.0, 3.0]), command, ned_to_sim(command.velocity_ned)
+    )
     assert np.allclose(flat["x"], [1.0, 2.0, 3.0])
     assert np.allclose(flat["x_dot"], ned_to_sim(command.velocity_ned))
     assert flat["yaw_dot"] == 0.0

@@ -77,12 +77,71 @@ def _sightline_ned(
     return sim_to_ned(sim_world_ray)
 
 
-def flat_output(position_sim: np.ndarray, command: HomingCommand) -> dict:
-    """Flat output that tracks the homing velocity without a position fight."""
+_GRAVITY = 9.81
+_TRACK_TAU = 0.5
+_MAX_TILT_RAD = np.deg2rad(45.0)
+_MIN_SPECIFIC_UP = 0.3 * _GRAVITY
+
+
+def track_acceleration(
+    velocity_sim: np.ndarray,
+    goal_sim: np.ndarray,
+    pn_sim: np.ndarray,
+) -> np.ndarray:
+    """Acceleration toward `goal_sim` that keeps the specific force upright.
+
+    The request is proportional navigation plus the velocity miss over half a
+    second. It is scaled, never reshaped, until the specific force stays
+    upright. Specific force is that acceleration plus gravity on simulator +z.
+    Its up component stays at least 0.3 g, and its tilt from +z stays within
+    45°. A raw velocity step through the SE3 law asks for a downward force,
+    and the attitude on that force is the long arc.
+    """
+    velocity = np.asarray(velocity_sim, dtype=float)
+    goal = np.asarray(goal_sim, dtype=float)
+    pn = np.asarray(pn_sim, dtype=float)
+    requested = np.array(pn + (goal - velocity) / _TRACK_TAU, dtype=float, copy=True)
+    return _largest_upright_scale(requested) * requested
+
+
+def _largest_upright_scale(requested: np.ndarray) -> float:
+    """Largest scale in [0, 1] whose specific force stays inside the upright cone.
+
+    Scaling the whole request keeps it parallel to the velocity miss. Clamping
+    one axis and then another turns a pursuit correction into a dive.
+    """
+    tan_tilt = float(np.tan(_MAX_TILT_RAD))
+    horizontal = float(np.linalg.norm(requested[:2]))
+    vertical = float(requested[2])
+    scale = 1.0
+    if vertical < 0.0:
+        scale = min(scale, (_GRAVITY - _MIN_SPECIFIC_UP) / (-vertical))
+    # k * H <= (k * vertical + g) * tan(tilt)
+    denom = horizontal - vertical * tan_tilt
+    if denom > 0.0:
+        scale = min(scale, (_GRAVITY * tan_tilt) / denom)
+    return max(0.0, scale)
+
+
+def flat_output(
+    position_sim: np.ndarray,
+    command: HomingCommand,
+    velocity_sim: np.ndarray,
+) -> dict:
+    """Flat output that tracks the homing velocity without a position fight.
+
+    The velocity setpoint is the measured velocity, so the SE3 velocity term
+    adds nothing. `track_acceleration` carries the homing request.
+    """
+    measured = np.array(velocity_sim, dtype=float, copy=True)
     return {
         "x": np.array(position_sim, dtype=float, copy=True),
-        "x_dot": ned_to_sim(command.velocity_ned),
-        "x_ddot": ned_to_sim(command.acceleration_ned),
+        "x_dot": measured,
+        "x_ddot": track_acceleration(
+            measured,
+            ned_to_sim(command.velocity_ned),
+            ned_to_sim(command.acceleration_ned),
+        ),
         "x_dddot": np.zeros(3),
         "x_ddddot": np.zeros(3),
         "yaw": command.yaw_rad,
