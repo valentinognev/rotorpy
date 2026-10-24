@@ -1,5 +1,17 @@
 # Updates
 
+## 3.10.0 - Camera homing JSONC
+- `examples/camera_homing.jsonc` holds the homing scene, positions, and controller. `controller` is `geometric` (SE3Control) or `pid` (Px4Cascade). The shipped choice is `pid`.
+- `examples/camera_homing.py` reads that file for the flight and the sweep.
+
+## 3.9.0 - One folder per controller
+- `SE3Control`, `Px4Cascade`, `RaptorFoundationPolicy`, and the control template each live in their own package under `rotorpy/controllers/`.
+- Class imports stay `rotorpy.controllers.quadrotor_control`, `rotorpy.controllers.px4_cascade`, and `rotorpy.controllers.raptor`. PX4 gains and math import from `rotorpy.controllers.px4_cascade`.
+
+## 3.8.0 - PX4 cascade on homing
+- `Px4Cascade` runs the PX4 position, velocity, attitude, and rate loops and outputs Hummingbird motor speeds.
+- The homing runner commands the velocity tier in PX4 NED. Firmware gains are unchanged.
+
 ## 3.7.1 - Upright homing acceleration
 - The flat output accelerates along the homing velocity miss over half a second, scaled so the specific force stays inside a 45° upright cone. The opening motion is a pitch on the short arc.
 

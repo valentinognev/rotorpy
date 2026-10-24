@@ -1,0 +1,119 @@
+// Camera-homing example. examples/camera_homing.py reads this file.
+// North-east-down positions are metres. Down is negative above the ground.
+// The simulator uses the same north and east, with up in place of down.
+// Yaw is the heading of the initial course, and the rotors start at hover.
+{
+  // Inner loop. "geometric" is SE3Control. "pid" is the PX4 cascade, Px4Cascade.
+  "controller": "geometric",
+
+  // Drone start, north, east, down.
+  "start_ned": [0.0, 0.0, -30.0],
+
+  // Ground point the box stands on, north, east, down.
+  "target_ground_ned": [100.0, 50.0, 0.0],
+
+  // Horizontal speed at the start, metres per second, from the start xy toward the target xy.
+  "initial_speed_m_s": 10.0,
+
+  // Body angular rate at the start, radians per second.
+  "initial_body_rate_rad_s": [0.0, 0.0, 0.0],
+
+  // Wind held for the whole flight, simulator metres per second.
+  "initial_wind_m_s": [0.0, 0.0, 0.0],
+
+  // Box volume center used to score the miss, north, east, down.
+  "box_center_ned": [100.0, 50.0, -0.5],
+
+  // Target block extents in the simulator, metres: x min, x max, y min, y max, z min, z max.
+  "box_extents_m": [99.75, 100.25, 49.75, 50.25, 0.0, 1.0],
+
+  // Target block color, red, green, blue, each from 0 to 1.
+  "box_color_rgb": [1, 0, 0],
+
+  // World bounds in the simulator, metres: x min, x max, y min, y max, z min, z max.
+  "world_bounds_m": [-50, 300, -50, 200, -20, 80],
+
+  // Navigation constant for the single flight. --sweep replaces this one value.
+  "nav_constant": 3.0,
+
+  // Navigation constants printed by --sweep, in order.
+  "sweep_nav_constants": [2, 3, 4, 5],
+
+  // Target pixels a camera must see before it may steer.
+  "lock_pixels": 36,
+
+  // Simulation rate, hertz.
+  "sim_rate_hz": 100,
+
+  // Rate of both cameras and the homing law, hertz.
+  "camera_rate_hz": 20,
+
+  // Stop time when the vehicle has not met the ground, seconds.
+  "timeout_s": 20.0,
+
+  // Ground contact is simulator z at or below this height, metres.
+  "ground_z_m": 0.0,
+
+  // Spacing of the visual features on the block faces, metres.
+  "feature_spacing_m": 0.05,
+
+  // How those features are laid out on each face.
+  "feature_mode": "regular",
+
+  // Descriptor noise. Zero keeps each face one color.
+  "descriptor_noise": 0,
+
+  // Shared camera width, pixels.
+  "image_width_px": 2236,
+
+  // Shared camera height, pixels.
+  "image_height_px": 2236,
+
+  // Horizontal field of view, degrees.
+  "fov_x_deg": 90.0,
+
+  // Vertical field of view, degrees.
+  "fov_y_deg": 90.0,
+
+  // Camera mount in the simulator body, metres. Both cameras use this position.
+  "camera_position_body_m": [0.0, 0.0, 0.0],
+
+  // Forward camera pitch, degrees. Positive looks down from the body forward axis.
+  "forward_pitch_deg": 10.0,
+
+  // Upward camera pitch, degrees. Negative looks up. -70 is 70 degrees above the nose.
+  "upward_pitch_deg": -70.0,
+
+  // Radius of each splatted feature, pixels.
+  "splat_radius_px": 1,
+
+  // What each camera returns for a feature.
+  "feature_output": "rgb",
+
+  // Longest side of the pictures stored for the page, pixels.
+  "preview_side_px": 280,
+
+  // Largest absolute NED velocity component the homing speed law commands, metres per second.
+  "speed_component_cap_m_s": 19.0,
+
+  // Time constant of the geometric controller's velocity tracking, seconds.
+  "track_tau_s": 0.5,
+
+  // Largest tilt of the geometric controller's specific force from vertical, degrees.
+  "max_tilt_deg": 45.0,
+
+  // Smallest upward specific force for the geometric controller, as a fraction of gravity.
+  "min_specific_up_g": 0.3,
+
+  // Vehicle parameter set. This example flies the AscTec Hummingbird.
+  "vehicle": "hummingbird",
+
+  // Command the vehicle reads from the inner loop.
+  "control_abstraction": "cmd_motor_speeds",
+
+  // Aerodynamic wrenches on the vehicle.
+  "aero": true,
+
+  // Ground contact inside the vehicle dynamics.
+  "enable_ground": true
+}

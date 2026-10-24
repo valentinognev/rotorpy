@@ -3,9 +3,9 @@ import numpy as np
 COMPONENT_CAP = 19.0
 
 
-def desired_velocity(direction_ned: np.ndarray) -> np.ndarray:
+def desired_velocity(direction_ned: np.ndarray, component_cap: float = COMPONENT_CAP) -> np.ndarray:
     """
-    Longest velocity parallel to a NED direction with each component at most COMPONENT_CAP m/s.
+    Longest velocity parallel to a NED direction with each component at most `component_cap` m/s.
 
     The direction is not necessarily a unit vector. A zero direction returns zeros.
     """
@@ -14,4 +14,4 @@ def desired_velocity(direction_ned: np.ndarray) -> np.ndarray:
     if norm == 0.0:
         return np.zeros(3)
     unit = direction / norm
-    return unit * (COMPONENT_CAP / float(np.max(np.abs(unit))))
+    return unit * (float(component_cap) / float(np.max(np.abs(unit))))

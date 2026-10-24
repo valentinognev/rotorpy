@@ -105,12 +105,15 @@ For an example of how to interface with this environment, see `rotorpy/examples/
 
 You can find this new environment in the `rotorpy/learning/` module. 
 
+#### Camera homing
+[`examples/camera_homing.py`](/examples/camera_homing.py) flies a Hummingbird at a red box and writes `Results/camera_homing.html`. The start, the target, both cameras, the timing, and the inner loop are [`examples/camera_homing.jsonc`](/examples/camera_homing.jsonc). `controller` is `pid` for `Px4Cascade` (the file as shipped) or `geometric` for `SE3Control`. `--sweep` repeats the flight for the navigation constants in that file.
+
 #### And much more
 RotorPy is intended to be flexible to support the aerial robotics field as it expands. Explore the examples in this repository and [citations](https://scholar.google.com/scholar?oi=bibs&hl=en&cites=17472125763442225756) to see the many ways RotorPy can be used to learn more about aerial robotics. 
 
 # Development
 
-It is rather straightforward if you would like to add more tracking methods into the simulator. For instance, if you'd like to add a new trajectory generator or a new controller, we've added respective templates that you can use under `rotorpy/trajectories/` and `rotorpy/controllers/` to help structure your code appropriately. If you'd like to add your own wind field, you can add a new class in `rotorpy/wind/` following the template there. 
+It is rather straightforward if you would like to add more tracking methods into the simulator. For instance, if you'd like to add a new trajectory generator or a new controller, we've added respective templates that you can use under `rotorpy/trajectories/` and `rotorpy/controllers/`. Each controller is its own package there: `quadrotor_control/` (`SE3Control`), `px4_cascade/` (`Px4Cascade`), `raptor/`, and `controller_template/`. If you'd like to add your own wind field, you can add a new class in `rotorpy/wind/` following the template there. 
 
 As for adding more core functionality (e.g., sensors, new vehicle dynamics, animations, etc.), those require a bit more effort to make sure that all the inputs and outputs are set up accordingly. One piece of advice is that the main loop occurs in `rotorpy/simulate.py`. Under the `while` loop, you can see the process by which the vehicle dynamics, trajectory generator, IMU sensor, and controller interface with each other. 
 
@@ -134,6 +137,9 @@ See how academics have been using RotorPy:
 # Acknowledgements
 
 We would like to acknowledge [Jimmy Paulos](https://github.com/jpaulos) who wrote the majority of the underlying engine for RotorPy, and the teaching assistants who contributed code to the initial version of this simulator, especially [Dan Mox](https://github.com/danmox), [Laura Jarin-Lipschitz](https://github.com/ljarin), [Rebecca Li](https://github.com/rebeccali), [Shane Rozen-Levy](https://github.com/ShaneRozenLevy), [Xu Liu](https://github.com/XuRobotics), [Yuezhan Tao](https://github.com/tyuezhan), [Yu-Ming Chen](https://github.com/yminchen), and [Fernando Cladera](https://github.com/fcladera).
+
+## Architecture
+Each controller is a package under `rotorpy/controllers/`. `Px4Cascade` in `rotorpy/controllers/px4_cascade/` outputs Hummingbird `cmd_motor_speeds` from the PX4 position, velocity, attitude, and rate loops. `examples/camera_homing.jsonc` selects that cascade with `"controller": "pid"`, or `SE3Control` from `rotorpy/controllers/quadrotor_control/` with `"controller": "geometric"`. Other examples keep `SE3Control`.
 
 ## Reading order for agents
 1. Read this `README.md`.

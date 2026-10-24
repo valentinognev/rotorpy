@@ -10,7 +10,7 @@ from rotorpy.guidance.frames import ned_to_sim, sim_body_to_frd, sim_to_ned
 from rotorpy.guidance.navigation import pn_acceleration
 from rotorpy.guidance.pixels import target_pixel_count, target_square
 from rotorpy.guidance.sightline import ground_relative_position
-from rotorpy.guidance.speed import desired_velocity
+from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity
 
 
 class HomingCommand(object):
@@ -87,6 +87,9 @@ def track_acceleration(
     velocity_sim: np.ndarray,
     goal_sim: np.ndarray,
     pn_sim: np.ndarray,
+    tau_s: float = _TRACK_TAU,
+    max_tilt_deg: float = 45.0,
+    min_specific_up_g: float = 0.3,
 ) -> np.ndarray:
     """Acceleration toward `goal_sim` that keeps the specific force upright.
 
@@ -100,22 +103,30 @@ def track_acceleration(
     velocity = np.asarray(velocity_sim, dtype=float)
     goal = np.asarray(goal_sim, dtype=float)
     pn = np.asarray(pn_sim, dtype=float)
-    requested = np.array(pn + (goal - velocity) / _TRACK_TAU, dtype=float, copy=True)
-    return _largest_upright_scale(requested) * requested
+    requested = np.array(pn + (goal - velocity) / float(tau_s), dtype=float, copy=True)
+    return _largest_upright_scale(
+        requested,
+        max_tilt_rad=np.deg2rad(max_tilt_deg),
+        min_specific_up=float(min_specific_up_g) * _GRAVITY,
+    ) * requested
 
 
-def _largest_upright_scale(requested: np.ndarray) -> float:
+def _largest_upright_scale(
+    requested: np.ndarray,
+    max_tilt_rad: float = _MAX_TILT_RAD,
+    min_specific_up: float = _MIN_SPECIFIC_UP,
+) -> float:
     """Largest scale in [0, 1] whose specific force stays inside the upright cone.
 
     Scaling the whole request keeps it parallel to the velocity miss. Clamping
     one axis and then another turns a pursuit correction into a dive.
     """
-    tan_tilt = float(np.tan(_MAX_TILT_RAD))
+    tan_tilt = float(np.tan(max_tilt_rad))
     horizontal = float(np.linalg.norm(requested[:2]))
     vertical = float(requested[2])
     scale = 1.0
     if vertical < 0.0:
-        scale = min(scale, (_GRAVITY - _MIN_SPECIFIC_UP) / (-vertical))
+        scale = min(scale, (_GRAVITY - min_specific_up) / (-vertical))
     # k * H <= (k * vertical + g) * tan(tilt)
     denom = horizontal - vertical * tan_tilt
     if denom > 0.0:
@@ -127,6 +138,9 @@ def flat_output(
     position_sim: np.ndarray,
     command: HomingCommand,
     velocity_sim: np.ndarray,
+    tau_s: float = _TRACK_TAU,
+    max_tilt_deg: float = 45.0,
+    min_specific_up_g: float = 0.3,
 ) -> dict:
     """Flat output that tracks the homing velocity without a position fight.
 
@@ -141,6 +155,9 @@ def flat_output(
             measured,
             ned_to_sim(command.velocity_ned),
             ned_to_sim(command.acceleration_ned),
+            tau_s=tau_s,
+            max_tilt_deg=max_tilt_deg,
+            min_specific_up_g=min_specific_up_g,
         ),
         "x_dddot": np.zeros(3),
         "x_ddddot": np.zeros(3),
@@ -160,9 +177,11 @@ class HomingGuidance(object):
         intrinsics: dict,
         forward_extrinsics: dict,
         upward_extrinsics: dict,
+        component_cap: float = COMPONENT_CAP,
     ) -> None:
         self.nav_constant = float(nav_constant)
         self.lock_pixels = int(lock_pixels)
+        self._component_cap = float(component_cap)
         self.intrinsics = intrinsics
         self.forward_extrinsics = forward_extrinsics
         self.upward_extrinsics = upward_extrinsics
@@ -286,7 +305,7 @@ class HomingGuidance(object):
             previous_sightline,
             dt,
         )
-        self._velocity_ned = desired_velocity(relative)
+        self._velocity_ned = desired_velocity(relative, self._component_cap)
         self._yaw_rad = float(np.arctan2(sightline[1], sightline[0]))
         self._tracking = True
         self._last_sightline = sightline / np.linalg.norm(sightline)

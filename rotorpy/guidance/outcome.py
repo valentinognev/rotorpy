@@ -13,8 +13,9 @@ class HomingOutcome:
     time_s: float
 
 
-def miss_outcome(position_ned: np.ndarray, time_s: float) -> HomingOutcome:
-    miss_m = float(np.linalg.norm(np.asarray(position_ned, dtype=float) - BOX_CENTER_NED))
+def miss_outcome(position_ned: np.ndarray, time_s: float, box_center_ned: np.ndarray = None) -> HomingOutcome:
+    center = BOX_CENTER_NED if box_center_ned is None else np.asarray(box_center_ned, dtype=float)
+    miss_m = float(np.linalg.norm(np.asarray(position_ned, dtype=float) - center))
     return HomingOutcome(miss_m=miss_m, timed_out=False, time_s=time_s)
 
 

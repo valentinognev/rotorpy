@@ -5,6 +5,7 @@ downsampled copies of both cameras for the example animation.
 """
 
 import copy
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -13,9 +14,11 @@ import numpy as np
 from rotorpy.sensors.camera import PinholeCamera
 from rotorpy.world import World
 
+from rotorpy.controllers.px4_cascade import Px4Cascade
 from rotorpy.controllers.quadrotor_control import SE3Control
 from rotorpy.guidance.frames import sim_to_ned
 from rotorpy.guidance.homing import HomingCommand, HomingGuidance, flat_output
+from rotorpy.guidance.homing_config import initial_velocity_from_config, scene_from_config
 from rotorpy.guidance.outcome import HomingOutcome, miss_outcome, timeout_outcome
 from rotorpy.guidance.scene import (
     INITIAL_SPEED,
@@ -96,22 +99,24 @@ def _as_uint8(image: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.clip(np.asarray(image) * 255.0, 0, 255).astype(np.uint8))
 
 
-def flight_status(t: float, sim_z: float) -> Optional[str]:
+def flight_status(
+    t: float, sim_z: float, timeout_s: float = 20.0, ground_z: float = 0.0
+) -> Optional[str]:
     """Stop reason for the state about to be used, or None to continue.
 
-    Ground when simulator z is at or below 0. That is checked first.
-    Otherwise timeout when t >= 20 seconds. There is no speed stop.
+    Ground when simulator z is at or below `ground_z`. That is checked first.
+    Otherwise timeout when t >= `timeout_s`. There is no speed stop.
     """
-    if sim_z <= 0.0:
+    if sim_z <= ground_z:
         return "ground"
-    if t >= 20.0:
+    if t >= timeout_s:
         return "timeout"
     return None
 
 
-def _camera_due(t: float) -> bool:
-    """True at t = 0 and within 1e-9 s of a multiple of 0.05 s."""
-    nearest = round(float(t) / _CAMERA_PERIOD) * _CAMERA_PERIOD
+def _camera_due(t: float, period: float = _CAMERA_PERIOD) -> bool:
+    """True at t = 0 and within 1e-9 s of a multiple of `period`."""
+    nearest = round(float(t) / period) * period
     return abs(float(t) - nearest) <= _CAMERA_TOL
 
 
@@ -122,24 +127,42 @@ def _nav_label(nav_constant: float) -> str:
     return "{:g}".format(value)
 
 
-def run_homing(nav_constant: float = 3.0, lock_pixels: int = 36) -> HomingOutcome:
+def _nav_and_lock(nav_constant, lock_pixels, config):
+    """Explicit arguments win. Otherwise the config, otherwise 3 and 36."""
+    if nav_constant is None:
+        nav_constant = 3.0 if config is None else float(config["nav_constant"])
+    if lock_pixels is None:
+        lock_pixels = 36 if config is None else int(config["lock_pixels"])
+    return float(nav_constant), int(lock_pixels)
+
+
+def run_homing(
+    nav_constant: Optional[float] = None,
+    lock_pixels: Optional[int] = None,
+    config: Optional[dict] = None,
+) -> HomingOutcome:
     """Fly the nominal scene until ground contact or a 20 second timeout.
 
     Simulation is 100 Hz. Both cameras and the homing law update at 20 Hz.
     The stopping sample is rendered and updated once, including when it is
     not a 20 Hz tick. Other steps pass both images as None. Wind stays zero.
     The flat-output position is the position before the step. Images are
-    discarded.
+    discarded. `config` is a camera-homing JSONC dict; omitted fields stay
+    at the nominal scene.
     """
-    outcome, _ = _fly_homing(nav_constant, lock_pixels, record=False)
+    nav_constant, lock_pixels = _nav_and_lock(nav_constant, lock_pixels, config)
+    outcome, _ = _fly_homing(nav_constant, lock_pixels, record=False, config=config)
     return outcome
 
 
 def run_recorded_homing(
-    nav_constant: float = 3.0, lock_pixels: int = 36
+    nav_constant: Optional[float] = None,
+    lock_pixels: Optional[int] = None,
+    config: Optional[dict] = None,
 ) -> Tuple[HomingOutcome, HomingRecord]:
     """Same flight as `run_homing`, plus the poses and both camera previews."""
-    outcome, record = _fly_homing(nav_constant, lock_pixels, record=True)
+    nav_constant, lock_pixels = _nav_and_lock(nav_constant, lock_pixels, config)
+    outcome, record = _fly_homing(nav_constant, lock_pixels, record=True, config=config)
     return outcome, record
 
 
@@ -153,30 +176,113 @@ def _tracker_sample(command: HomingCommand) -> Tuple[Optional[str], np.ndarray, 
     return command.source, center, side
 
 
+def make_controller(kind: str, params: dict):
+    """`geometric` is SE3Control. `pid` is the PX4 cascade."""
+    if kind == "pid":
+        return Px4Cascade(params)
+    if kind == "geometric":
+        return SE3Control(params)
+    raise ValueError("controller must be 'geometric' or 'pid'")
+
+
+def control_from_homing(kind: str, controller, t: float, state: dict, command: HomingCommand, config: Optional[dict]):
+    """One inner-loop update. `pid` takes a PX4 velocity command. `geometric` takes a flat output."""
+    if kind == "pid":
+        return controller.update(t, state, px4_command_from_homing(command))
+    if kind == "geometric":
+        if config is None:
+            output = flat_output(state["x"], command, state["v"])
+        else:
+            output = flat_output(
+                state["x"],
+                command,
+                state["v"],
+                tau_s=config["track_tau_s"],
+                max_tilt_deg=config["max_tilt_deg"],
+                min_specific_up_g=config["min_specific_up_g"],
+            )
+        return controller.update(t, state, output)
+    raise ValueError("controller must be 'geometric' or 'pid'")
+
+
+def px4_command_from_homing(command: HomingCommand) -> dict:
+    """Velocity-tier PX4 command. Homing north/east/down becomes east/north/down."""
+    velocity = command.velocity_ned
+    acceleration = command.acceleration_ned
+    return {
+        "tier": "velocity",
+        "velocity_ned": np.array([velocity[1], velocity[0], velocity[2]], dtype=float),
+        "acceleration_ned": np.array(
+            [acceleration[1], acceleration[0], acceleration[2]], dtype=float
+        ),
+        "yaw": math.pi / 2.0 - command.yaw_rad,
+        "yaw_rate": 0.0,
+    }
+
+
 def _fly_homing(
-    nav_constant: float, lock_pixels: int, record: bool
+    nav_constant: float,
+    lock_pixels: int,
+    record: bool,
+    config: Optional[dict] = None,
 ) -> Tuple[HomingOutcome, Optional[HomingRecord]]:
-    world = nominal_world()
-    forward_camera = nominal_camera()
-    upward_camera = nominal_upward_camera()
+    if config is None:
+        world = nominal_world()
+        forward_camera = nominal_camera()
+        upward_camera = nominal_upward_camera()
+        state = copy.deepcopy(nominal_initial_state())
+        course = initial_velocity_ned(START_NED, TARGET_GROUND_NED, INITIAL_SPEED)
+        kind = "pid"
+        sim_dt = _SIM_DT
+        camera_period = _CAMERA_PERIOD
+        timeout_s = 20.0
+        ground_z = 0.0
+        preview_side = _PREVIEW_SIDE
+        image_height = 2236
+        image_width = 2236
+        box_center = None
+        held_wind = np.zeros(3)
+        component_cap = None
+        control_abstraction = "cmd_motor_speeds"
+        aero = True
+        enable_ground = True
+    else:
+        state, world, forward_camera, upward_camera = scene_from_config(config)
+        state = copy.deepcopy(state)
+        course = initial_velocity_from_config(config)
+        kind = config["controller"]
+        sim_dt = 1.0 / float(config["sim_rate_hz"])
+        camera_period = 1.0 / float(config["camera_rate_hz"])
+        timeout_s = float(config["timeout_s"])
+        ground_z = float(config["ground_z_m"])
+        preview_side = int(config["preview_side_px"])
+        image_height = int(config["image_height_px"])
+        image_width = int(config["image_width_px"])
+        box_center = np.array(config["box_center_ned"], dtype=float)
+        held_wind = np.array(config["initial_wind_m_s"], dtype=float)
+        component_cap = float(config["speed_component_cap_m_s"])
+        control_abstraction = config["control_abstraction"]
+        aero = bool(config["aero"])
+        enable_ground = bool(config["enable_ground"])
+    guidance_kwargs = {}
+    if component_cap is not None:
+        guidance_kwargs["component_cap"] = component_cap
     guidance = HomingGuidance(
         nav_constant=nav_constant,
         lock_pixels=lock_pixels,
-        initial_velocity_ned=initial_velocity_ned(
-            START_NED, TARGET_GROUND_NED, INITIAL_SPEED
-        ),
+        initial_velocity_ned=course,
         intrinsics=forward_camera.intrinsics,
         forward_extrinsics=forward_camera.extrinsics,
         upward_extrinsics=upward_camera.extrinsics,
+        **guidance_kwargs,
     )
-    controller = SE3Control(quad_params)
-    state = copy.deepcopy(nominal_initial_state())
+    controller = make_controller(kind, quad_params)
     vehicle = Multirotor(
         quad_params,
         initial_state=state,
-        control_abstraction="cmd_motor_speeds",
-        aero=True,
-        enable_ground=True,
+        control_abstraction=control_abstraction,
+        aero=aero,
+        enable_ground=enable_ground,
     )
 
     times: List[float] = []
@@ -207,14 +313,14 @@ def _fly_homing(
             world=world,
             forward_camera=forward_camera,
             upward_camera=upward_camera,
-            preview_step=preview_step(2236, 2236),
+            preview_step=preview_step(image_height, image_width, preview_side),
         )
 
     step_index = 0
     while True:
-        t = step_index * _SIM_DT
+        t = step_index * sim_dt
         sim_z = float(state["x"][2])
-        status = flight_status(t, sim_z)
+        status = flight_status(t, sim_z, timeout_s, ground_z)
         if record:
             times.append(t)
             positions.append(np.array(state["x"], dtype=float, copy=True))
@@ -222,7 +328,7 @@ def _fly_homing(
             winds.append(np.array(state["wind"], dtype=float, copy=True))
 
         stopping = status is not None
-        if stopping or _camera_due(t):
+        if stopping or _camera_due(t, camera_period):
             forward_image = forward_camera.render(world, state)["image"]
             upward_image = upward_camera.render(world, state)["image"]
         else:
@@ -247,23 +353,32 @@ def _fly_homing(
             tracker_sides.append(side)
 
         if status == "ground":
-            return miss_outcome(sim_to_ned(state["x"]), t), history()
+            return miss_outcome(sim_to_ned(state["x"]), t, box_center), history()
         if status == "timeout":
             return timeout_outcome(t), history()
 
-        flat = flat_output(state["x"], command, state["v"])
-        control = controller.update(t, state, flat)
-        state = vehicle.step(state, control, _SIM_DT)
-        state["wind"] = np.zeros(3)
+        control = control_from_homing(kind, controller, t, state, command, config)
+        state = vehicle.step(state, control, sim_dt)
+        state["wind"] = np.array(held_wind, dtype=float, copy=True)
         step_index += 1
 
 
 def sweep(
-    nav_constants: Tuple[float, ...] = (2, 3, 4, 5),
+    nav_constants: Optional[Tuple[float, ...]] = None,
+    config: Optional[dict] = None,
 ) -> List[Tuple[float, HomingOutcome]]:
-    """One nominal flight per navigation constant, in the given order."""
+    """One flight per navigation constant, in the given order.
+
+    Omitted constants are 2, 3, 4, and 5, or `sweep_nav_constants` when
+    `config` is set.
+    """
+    if nav_constants is None:
+        if config is None:
+            nav_constants = (2, 3, 4, 5)
+        else:
+            nav_constants = tuple(config["sweep_nav_constants"])
     return [
-        (nav_constant, run_homing(nav_constant=nav_constant))
+        (nav_constant, run_homing(nav_constant=nav_constant, config=config))
         for nav_constant in nav_constants
     ]
 

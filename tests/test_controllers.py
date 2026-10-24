@@ -4,7 +4,6 @@ Test the controller module.
 
 import inspect
 import numpy as np
-import glob
 import os
 import importlib
 
@@ -42,19 +41,24 @@ def check_update_signature(class_obj):
 # Test case to check all controllers adhere to input requirement. 
 def test_controllers_update_method():
 
-    # Import all controllers from the controllers module
-    controller_files = glob.glob(os.path.join(os.path.dirname(__file__), '..', 'rotorpy', 'controllers', '*.py'))
+    # Import each controller package under rotorpy/controllers/.
+    controllers_dir = os.path.join(os.path.dirname(__file__), '..', 'rotorpy', 'controllers')
     controller_objects = []
     print("\n")
-    for file in controller_files:
-        controller_name = os.path.basename(file)[:-3]  # Remove '.py' extension
-        if controller_name != '__init__': # Ignore the __init__.py file
-            print(f"Importing controller classes from {controller_name}")
-            controller_module = importlib.import_module(f"rotorpy.controllers.{controller_name}")  # Import the module
-            controller_classes = inspect.getmembers(controller_module, inspect.isclass)            # Get all classes in the module
+    for controller_name in sorted(os.listdir(controllers_dir)):
+        package_dir = os.path.join(controllers_dir, controller_name)
+        if not os.path.isdir(package_dir) or controller_name.startswith('_'):
+            continue
+        print(f"Importing controller classes from {controller_name}")
+        module_name = f"rotorpy.controllers.{controller_name}"
+        controller_module = importlib.import_module(module_name)
+        controller_classes = inspect.getmembers(controller_module, inspect.isclass)
 
-            # Ignore any dependency classes in the controllers module
-            controller_objects.extend([controller_class for controller_class in controller_classes if controller_class[1].__module__ == f"rotorpy.controllers.{controller_name}"])
+        # Ignore any dependency classes in the controllers module
+        controller_objects.extend([
+            controller_class for controller_class in controller_classes
+            if controller_class[1].__module__.startswith(module_name)
+        ])
 
     # Iterate over all imported classes from the controllers module
     for controller_class in controller_objects:

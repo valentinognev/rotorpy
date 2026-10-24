@@ -22,6 +22,8 @@ The forward camera loses the target when the nose drops, and the homing law then
 
 ## Constraints
 
+The nominal camera, lock, rate, and stop values below are the shipped fields in `examples/camera_homing.jsonc`. That file also selects `pid` or `geometric`.
+
 - Simulator body is forward-left-up. In `pitched_extrinsics`, positive pitch looks down. The forward camera stays at +10°. The upward camera is the same mount at −70°, so its optical axis is 70° above the body forward axis, toward body up.
 - Both cameras use `nominal_camera`'s intrinsics: 2236×2236, 90° by 90° field of view, 20 Hz, splat radius 1, RGB features, position `[0, 0, 0]`.
 - Target pixels stay `red > 0.5` and red strictly greater than green and blue.

@@ -19,7 +19,7 @@ A runnable example of a Hummingbird that finds a red box with a fixed camera and
 
 ## Scenario parameters
 
-These are the nominal values. Each is a parameter of the example.
+These are the nominal values. Each is a field in `examples/camera_homing.jsonc`, which `examples/camera_homing.py` reads for the flight and the sweep. `controller` in that file is `pid` (`Px4Cascade`, the shipped choice) or `geometric` (`SE3Control`).
 
 | Parameter | Value |
 |---|---|
@@ -59,7 +59,7 @@ The camera is fixed, so the 10° pitch never moves relative to the body. While t
 5. That velocity is expressed in body FRD, and the desired acceleration is proportional navigation on the estimated line of sight: navigation constant times closing speed times the line-of-sight rate, perpendicular to the sightline. Closing speed is the component of the drone’s velocity toward the estimated target. The line-of-sight rate comes from successive estimated sightlines. On the first locked frame the rate is zero and the acceleration command is zero.
 6. The commanded yaw puts the sightline in the body zx plane, so the target sits on the vertical centerline of the image. Pitch centering is only as good as the thrust attitude allows, because the camera cannot move independently of the body. The phrase for this is “as much as possible.”
 
-The inner loop is the existing SE3 controller. The flat output it tracks uses the current position as the position setpoint, so the position gains do not fight the homing. The velocity setpoint is the desired NED velocity. The acceleration setpoint is the proportional-navigation acceleration. Yaw is the centering yaw. Yaw rate is zero.
+The inner loop is the `controller` field in `examples/camera_homing.jsonc`. `pid` runs `Px4Cascade` on the velocity tier: the homing NED velocity and acceleration, with yaw `pi/2 - yaw_rad`. `geometric` runs `SE3Control`. Its flat output uses the current position as the position setpoint and the measured velocity as the velocity setpoint, so those gains do not fight the homing. `track_acceleration` carries the homing request inside the upright specific-force cone. Yaw is the centering yaw. Yaw rate is zero.
 
 Height, attitude, and velocity fed to this law are the vehicle state. RotorPy’s default estimator returns an empty estimate, so there is no filter in this example. The guidance functions take height, attitude, and velocity as arguments so a later estimator can replace the true state without changing the law.
 
