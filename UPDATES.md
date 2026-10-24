@@ -1,5 +1,9 @@
 # Updates
 
+## 3.7.0 - Upward camera for the homing close
+- A second camera, aimed 70° above the nose, steers once it sees the target. Homing aims through the center of the square around that target.
+- The flight stops at the ground or at 20 seconds. The homing page shows both pictures, that square, and both frustums.
+
 ## 3.6.1 - One body frame on the homing page
 - The camera drawing is the frustum only. The body FRD axes are the only coordinate frame, beside the drone sketch.
 

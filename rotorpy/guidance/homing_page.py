@@ -1,10 +1,11 @@
 """Plotly page for one recorded camera-homing flight.
 
-The page is a 3D scene beside the drone's camera image. A slider selects a
-camera snapshot and moves the drone, its FRD body axes, and the camera
-frustum to that pose. The drone is an X: forward arms and their props
+The page is a 3D scene beside the forward and upward pictures. A slider
+selects a snapshot and moves the drone, its FRD body axes, and both camera
+frustums to that pose. The drone is an X: forward arms and their props
 are green, rear arms and their props are red, and each prop is a circle a
-short distance above the arm tip.
+short distance above the arm tip. The tracking square is drawn on the
+picture named by that frame's source.
 """
 
 import base64
@@ -154,6 +155,18 @@ def _jpeg_data_url(image: np.ndarray) -> str:
     return "data:image/jpeg;base64," + encoded
 
 
+def _preview_square(source, center, side, step):
+    """Tracking square in preview pixels, or None when this frame is not steering."""
+    if source is None:
+        return None
+    scale = float(step)
+    return {
+        "u": float(center[0]) / scale,
+        "v": float(center[1]) / scale,
+        "side": float(side) / scale,
+    }
+
+
 def _snapshots(record):
     rotations = Rotation.from_quat(record.quaternion).as_matrix()
     state_index = np.searchsorted(record.time, record.image_time, side="left")
@@ -166,7 +179,6 @@ def _snapshots(record):
         position = np.asarray(record.position[row], dtype=float)
         rotation = rotations[row]
         frd = _frd_axes(rotation)
-        frustum = _camera_frustum(position, rotation, record.camera, frustum_scale)
         front, back, front_props, back_props = _airframe(
             position, rotation, 0.11 * axis_length
         )
@@ -179,8 +191,21 @@ def _snapshots(record):
             "back": back,
             "front_props": front_props,
             "back_props": back_props,
-            "frustum": frustum,
-            "image": _jpeg_data_url(record.image[frame]),
+            "frustum": _camera_frustum(
+                position, rotation, record.forward_camera, frustum_scale
+            ),
+            "upward_frustum": _camera_frustum(
+                position, rotation, record.upward_camera, frustum_scale
+            ),
+            "forward_image": _jpeg_data_url(record.forward_image[frame]),
+            "upward_image": _jpeg_data_url(record.upward_image[frame]),
+            "source": record.source[frame],
+            "square": _preview_square(
+                record.source[frame],
+                record.tracker_center[frame],
+                record.tracker_side[frame],
+                record.preview_step,
+            ),
         })
     return snapshots, axis_length, low_high
 
@@ -229,6 +254,7 @@ def _figure(record, snapshots, low_high):
     fig.add_trace(_line(first["front_props"], "#2ca02c", "front props", width=2))
     fig.add_trace(_line(first["back_props"], "#d62728", "back props", width=2))
     fig.add_trace(_line(first["frustum"], "black", "frustum", width=2))
+    fig.add_trace(_line(first["upward_frustum"], "#9467bd", "upward frustum", width=2))
     fig.update_layout(
         autosize=True,
         margin={"l": 0, "r": 0, "t": 0, "b": 0},
@@ -278,8 +304,9 @@ def _html(graph: str, payload: dict) -> str:
   main { flex: 1; min-height: 0; display: grid; grid-template-columns: 3fr 2fr; }
   #scene-wrap { min-width: 0; min-height: 0; }
   #homing-scene { width: 100% !important; height: 100% !important; }
-  #camera-wrap { min-width: 0; min-height: 0; margin: 0; background: #111; display: flex; flex-direction: column; }
-  #homing-camera { width: 100%; height: 100%; object-fit: contain; }
+  #cameras { min-width: 0; min-height: 0; display: grid; grid-template-columns: 1fr 1fr; background: #111; }
+  .shot { min-width: 0; min-height: 0; margin: 0; display: flex; flex-direction: column; }
+  .shot canvas { flex: 1; min-height: 0; width: 100%; height: 100%; object-fit: contain; }
   figcaption { padding: 4px 8px; color: #ddd; }
 </style>
 </head>
@@ -290,32 +317,67 @@ def _html(graph: str, payload: dict) -> str:
 </header>
 <main>
   <div id="scene-wrap">""" + graph + """</div>
-  <figure id="camera-wrap">
-    <img id="homing-camera" alt="Camera view">
-    <figcaption>Camera view</figcaption>
-  </figure>
+  <div id="cameras">
+    <figure class="shot">
+      <canvas id="forward-camera" aria-label="Forward camera"></canvas>
+      <figcaption>Forward</figcaption>
+    </figure>
+    <figure class="shot">
+      <canvas id="upward-camera" aria-label="Upward camera"></canvas>
+      <figcaption>Upward</figcaption>
+    </figure>
+  </div>
 </main>
 <script type="application/json" id="homing-data">""" + data + """</script>
 <script>
 const data = JSON.parse(document.getElementById("homing-data").textContent);
 const slider = document.getElementById("homing-slider");
-const photo = document.getElementById("homing-camera");
+const forwardPhoto = document.getElementById("forward-camera");
+const upwardPhoto = document.getElementById("upward-camera");
 const readout = document.getElementById("homing-time");
+function showPicture(canvas, url, square) {
+  const ticket = (canvas._ticket || 0) + 1;
+  canvas._ticket = ticket;
+  const image = new Image();
+  image.onload = () => {
+    if (canvas._ticket !== ticket) return;
+    const width = image.naturalWidth;
+    const height = image.naturalHeight;
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(image, 0, 0);
+    if (!square) return;
+    const half = square.side / 2;
+    ctx.lineWidth = Math.max(1, Math.round(Math.max(width, height) / 140));
+    ctx.strokeStyle = "#ffd23f";
+    ctx.strokeRect(square.u - half, square.v - half, square.side, square.side);
+    ctx.beginPath();
+    ctx.strokeStyle = "#7ec8ff";
+    ctx.moveTo(square.u - half, square.v);
+    ctx.lineTo(square.u + half, square.v);
+    ctx.moveTo(square.u, square.v - half);
+    ctx.lineTo(square.u, square.v + half);
+    ctx.stroke();
+  };
+  image.src = url;
+}
 function show(index) {
   const snap = data.snapshots[index];
   readout.textContent = "t = " + data.times[index].toFixed(2) + " s";
-  photo.src = snap.image;
+  showPicture(forwardPhoto, snap.forward_image, snap.source === "forward" ? snap.square : null);
+  showPicture(upwardPhoto, snap.upward_image, snap.source === "upward" ? snap.square : null);
   Plotly.restyle("homing-scene", {
     x: [[snap.marker[0]], snap.body[0].x, snap.body[1].x, snap.body[2].x,
         snap.front.x, snap.back.x, snap.front_props.x, snap.back_props.x,
-        snap.frustum.x],
+        snap.frustum.x, snap.upward_frustum.x],
     y: [[snap.marker[1]], snap.body[0].y, snap.body[1].y, snap.body[2].y,
         snap.front.y, snap.back.y, snap.front_props.y, snap.back_props.y,
-        snap.frustum.y],
+        snap.frustum.y, snap.upward_frustum.y],
     z: [[snap.marker[2]], snap.body[0].z, snap.body[1].z, snap.body[2].z,
         snap.front.z, snap.back.z, snap.front_props.z, snap.back_props.z,
-        snap.frustum.z]
-  }, [2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        snap.frustum.z, snap.upward_frustum.z]
+  }, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 }
 slider.addEventListener("input", () => show(Number(slider.value)));
 function fit() {

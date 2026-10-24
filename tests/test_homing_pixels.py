@@ -1,5 +1,5 @@
 import numpy as np
-from rotorpy.guidance.pixels import target_centroid, target_pixel_count
+from rotorpy.guidance.pixels import target_centroid, target_pixel_count, target_square
 
 def test_empty_image_has_no_target():
     image = np.zeros((4, 4, 3))
@@ -26,3 +26,12 @@ def test_red_equal_blue_is_not_a_target():
     image[1, 1] = [0.8, 0.1, 0.8]  # red == blue, red > 0.5, red > green
     assert target_pixel_count(image) == 0
     assert target_centroid(image) is None
+
+def test_target_square_is_the_bounding_square():
+    image = np.zeros((32, 32, 3))
+    assert target_square(image) is None
+    image[20:26, 10:16, 0] = 1.0
+    image[20, 20, 0] = 1.0
+    center_u, center_v, side = target_square(image)
+    assert (center_u, center_v, side) == (15.0, 22.5, 11)
+    assert not np.allclose([center_u, center_v], target_centroid(image))

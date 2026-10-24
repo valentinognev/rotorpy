@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import re
 
@@ -5,10 +7,23 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from rotorpy.guidance.camera_geometry import pitched_extrinsics
 from rotorpy.guidance.homing_page import homing_page, write_homing_page
 from rotorpy.guidance.runner import HomingRecord
 from rotorpy.sensors.camera import PinholeCamera
 from rotorpy.world import World
+
+
+def _camera(extrinsics):
+    return PinholeCamera(
+        intrinsics={
+            "fx": 16.0, "fy": 16.0, "width": 32, "height": 32,
+            "cx": 16.0, "cy": 16.0, "dist_coeffs": np.zeros(5),
+        },
+        extrinsics=extrinsics,
+        splat_radius=1,
+        feature_output="rgb",
+    )
 
 
 def _record():
@@ -16,15 +31,6 @@ def _record():
         "bounds": {"extents": [-5, 5, -5, 5, -5, 5]},
         "blocks": [{"extents": [1, 2, 3, 4, 0, 1], "color": [1, 0, 0]}],
     })
-    camera = PinholeCamera(
-        intrinsics={
-            "fx": 16.0, "fy": 16.0, "width": 32, "height": 32,
-            "cx": 16.0, "cy": 16.0, "dist_coeffs": np.zeros(5),
-        },
-        extrinsics={"position": np.zeros(3), "orientation": np.array([0.0, 0.0, 0.0, 1.0])},
-        splat_radius=1,
-        feature_output="rgb",
-    )
     red = np.zeros((8, 8, 3), dtype=np.uint8)
     red[:, :, 0] = 255
     blue = np.zeros((8, 8, 3), dtype=np.uint8)
@@ -35,10 +41,24 @@ def _record():
         quaternion=np.tile([0.0, 0.0, 0.0, 1.0], (3, 1)),
         wind=np.zeros((3, 3)),
         image_time=np.array([0.0, 0.05]),
-        image=np.stack([red, blue]),
+        forward_image=np.stack([red, blue]),
+        upward_image=np.stack([blue, red]),
+        source=["forward", None],
+        tracker_center=np.array([[4.0, 4.0], [np.nan, np.nan]]),
+        tracker_side=np.array([2.0, np.nan]),
         world=world,
-        camera=camera,
+        forward_camera=_camera({
+            "position": np.zeros(3),
+            "orientation": np.array([0.0, 0.0, 0.0, 1.0]),
+        }),
+        upward_camera=_camera(pitched_extrinsics(-70)),
+        preview_step=1,
     )
+
+
+def _jpeg(data_url):
+    encoded = data_url.split(",", 1)[1]
+    return np.asarray(Image.open(io.BytesIO(base64.b64decode(encoded))))
 
 
 def _payload(html):
@@ -69,17 +89,30 @@ def test_slider_snapshots_follow_the_camera_frames():
     assert body_y["y"] == pytest.approx([2.0, 2.0 - length])
     assert body_z["z"] == pytest.approx([3.0, 3.0 - length])
     assert payload["snapshots"][1]["body"][0]["x"][0] == pytest.approx(4.0)
+    assert payload["snapshots"][0]["square"] == {"u": 4.0, "v": 4.0, "side": 2.0}
+    assert payload["snapshots"][1]["square"] is None
+    assert payload["snapshots"][0]["source"] == "forward"
+    assert payload["snapshots"][1]["source"] is None
     assert payload["snapshots"][0]["frustum"]["x"][0] == pytest.approx(1.0)
     assert payload["snapshots"][1]["frustum"]["x"][0] == pytest.approx(4.0)
+    assert payload["snapshots"][0]["upward_frustum"]["x"][0] == pytest.approx(1.0)
+    assert payload["snapshots"][1]["upward_frustum"]["x"][0] == pytest.approx(4.0)
+    assert payload["snapshots"][0]["upward_frustum"]["z"] != pytest.approx(
+        payload["snapshots"][0]["frustum"]["z"]
+    )
     assert "triad" not in payload["snapshots"][0]
-    red = np.asarray(Image.open(__import__("io").BytesIO(
-        __import__("base64").b64decode(payload["snapshots"][0]["image"].split(",", 1)[1])
-    )))
-    blue = np.asarray(Image.open(__import__("io").BytesIO(
-        __import__("base64").b64decode(payload["snapshots"][1]["image"].split(",", 1)[1])
-    )))
-    assert red[:, :, 0].mean() > 200
-    assert blue[:, :, 2].mean() > 200
+    assert "[2, 3, 4, 5, 6, 7, 8, 9, 10, 11]" in page
+    assert page.index('id="forward-camera"') < page.index('id="upward-camera"')
+    assert "#ffd23f" in page
+    assert "#7ec8ff" in page
+    forward_red = _jpeg(payload["snapshots"][0]["forward_image"])
+    forward_blue = _jpeg(payload["snapshots"][1]["forward_image"])
+    upward_blue = _jpeg(payload["snapshots"][0]["upward_image"])
+    upward_red = _jpeg(payload["snapshots"][1]["upward_image"])
+    assert forward_red[:, :, 0].mean() > 200
+    assert forward_blue[:, :, 2].mean() > 200
+    assert upward_blue[:, :, 2].mean() > 200
+    assert upward_red[:, :, 0].mean() > 200
 
 
 def _pieces(line):

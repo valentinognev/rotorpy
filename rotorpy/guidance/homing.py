@@ -8,7 +8,7 @@ from scipy.spatial.transform import Rotation
 from rotorpy.guidance.camera_geometry import pixel_to_camera_ray
 from rotorpy.guidance.frames import ned_to_sim, sim_body_to_frd, sim_to_ned
 from rotorpy.guidance.navigation import pn_acceleration
-from rotorpy.guidance.pixels import target_centroid, target_pixel_count
+from rotorpy.guidance.pixels import target_pixel_count, target_square
 from rotorpy.guidance.sightline import ground_relative_position
 from rotorpy.guidance.speed import desired_velocity
 
@@ -24,6 +24,9 @@ class HomingCommand(object):
         yaw_rad: float,
         locked: bool,
         tracking: bool,
+        source: Optional[str],
+        tracker_center: Optional[np.ndarray],
+        tracker_side: Optional[float],
     ) -> None:
         self.velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
         self.acceleration_ned = np.array(acceleration_ned, dtype=float, copy=True)
@@ -31,6 +34,12 @@ class HomingCommand(object):
         self.yaw_rad = float(yaw_rad)
         self.locked = bool(locked)
         self.tracking = bool(tracking)
+        self.source = source
+        if tracker_center is None:
+            self.tracker_center = None
+        else:
+            self.tracker_center = np.array(tracker_center, dtype=float, copy=True)
+        self.tracker_side = None if tracker_side is None else float(tracker_side)
 
 
 def body_frd_velocity(velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -> np.ndarray:
@@ -45,18 +54,18 @@ def body_frd_velocity(velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -
 
 
 def _sightline_ned(
-    centroid: np.ndarray,
+    square_center: np.ndarray,
     attitude_sim_quat: np.ndarray,
     intrinsics: dict,
     extrinsics: dict,
 ) -> np.ndarray:
-    """NED sightline from a pixel centroid.
+    """NED sightline from the tracking-square center in (column, row) order.
 
     Camera ray, inverse extrinsics into the simulator body, body FRD, then
     the vehicle attitude applied to that simulator-body vector and
     sim_to_ned. At the identity quaternion, FRD (f, r, d) is NED (f, -r, d).
     """
-    camera_ray = pixel_to_camera_ray(float(centroid[0]), float(centroid[1]), intrinsics)
+    camera_ray = pixel_to_camera_ray(float(square_center[0]), float(square_center[1]), intrinsics)
     body_to_camera = Rotation.from_quat(np.asarray(extrinsics["orientation"], dtype=float))
     sim_body_ray = body_to_camera.inv().apply(camera_ray)
     frd_ray = sim_body_to_frd(sim_body_ray)
@@ -82,7 +91,7 @@ def flat_output(position_sim: np.ndarray, command: HomingCommand) -> dict:
 
 
 class HomingGuidance(object):
-    """Latch on the target, then home until the track is lost."""
+    """Home from the forward camera until the upward camera latches, then from upward."""
 
     def __init__(
         self,
@@ -90,12 +99,14 @@ class HomingGuidance(object):
         lock_pixels: int,
         initial_velocity_ned: np.ndarray,
         intrinsics: dict,
-        extrinsics: dict,
+        forward_extrinsics: dict,
+        upward_extrinsics: dict,
     ) -> None:
         self.nav_constant = float(nav_constant)
         self.lock_pixels = int(lock_pixels)
         self.intrinsics = intrinsics
-        self.extrinsics = extrinsics
+        self.forward_extrinsics = forward_extrinsics
+        self.upward_extrinsics = upward_extrinsics
         self._initial_velocity_ned = np.array(initial_velocity_ned, dtype=float, copy=True)
         self._velocity_ned = np.array(self._initial_velocity_ned, dtype=float, copy=True)
         self._acceleration_ned = np.zeros(3)
@@ -103,6 +114,11 @@ class HomingGuidance(object):
         self._locked = False
         self._tracking = False
         self._lost = False
+        self._upward_latched = False
+        self._upward_steered = False
+        self._source: Optional[str] = None
+        self._tracker_center: Optional[np.ndarray] = None
+        self._tracker_side: Optional[float] = None
         self._last_image_time: Optional[float] = None
         self._last_sightline: Optional[np.ndarray] = None
 
@@ -112,58 +128,115 @@ class HomingGuidance(object):
         height_m: float,
         attitude_sim_quat: np.ndarray,
         velocity_ned: np.ndarray,
-        image: Optional[np.ndarray],
+        forward_image: Optional[np.ndarray],
+        upward_image: Optional[np.ndarray],
     ) -> HomingCommand:
-        """Advance the homing law. ``image`` is None on sim steps with no new frame."""
-        if image is None:
+        """Advance the homing law.
+
+        Both images None means no new frame. One None image is a camera tick
+        whose missing picture has no target pixels.
+        """
+        if forward_image is None and upward_image is None:
             return self._command(attitude_sim_quat)
-
-        previous_time = self._last_image_time
-        previous_sightline = self._last_sightline
-        count = target_pixel_count(image)
-        if count >= self.lock_pixels:
-            self._locked = True
-
         if self._lost:
-            self._last_image_time = float(t)
             return self._command(attitude_sim_quat)
 
-        relative = None
-        sightline = None
-        centroid = target_centroid(image)
-        if centroid is not None:
-            sightline = _sightline_ned(centroid, attitude_sim_quat, self.intrinsics, self.extrinsics)
-            relative = ground_relative_position(height_m, sightline)
+        forward_sees = self._sees(forward_image)
+        upward_sees = self._sees(upward_image)
+        if forward_sees or upward_sees:
+            self._locked = True
+        if upward_sees:
+            self._upward_latched = True
 
-        if self._locked and count >= self.lock_pixels and relative is not None:
-            if previous_time is None:
-                dt = 0.0
-            else:
-                dt = float(t) - float(previous_time)
-            self._acceleration_ned = pn_acceleration(
-                self.nav_constant,
-                velocity_ned,
-                sightline,
-                previous_sightline,
-                dt,
-            )
-            self._velocity_ned = desired_velocity(relative)
-            self._yaw_rad = float(np.arctan2(sightline[1], sightline[0]))
-            self._tracking = True
-            self._last_sightline = sightline / np.linalg.norm(sightline)
-            self._last_image_time = float(t)
-            return self._command(attitude_sim_quat)
+        if self._upward_latched and not upward_sees:
+            return self._permanent_loss(attitude_sim_quat)
 
-        self._last_image_time = float(t)
-        if self._locked:
-            self._lost = True
-            self._tracking = False
-            self._acceleration_ned = np.zeros(3)
-            return self._command(attitude_sim_quat)
+        if self._upward_latched:
+            source = "upward"
+            image = upward_image
+            extrinsics = self.upward_extrinsics
+        elif forward_sees:
+            source = "forward"
+            image = forward_image
+            extrinsics = self.forward_extrinsics
+        else:
+            return self._hold(attitude_sim_quat)
 
+        if image is None:
+            return self._hold(attitude_sim_quat)
+        square = target_square(image)
+        if square is None:
+            return self._hold(attitude_sim_quat)
+        center = np.array([square[0], square[1]], dtype=float)
+        sightline = _sightline_ned(center, attitude_sim_quat, self.intrinsics, extrinsics)
+        relative = ground_relative_position(height_m, sightline)
+        if relative is None:
+            return self._hold(attitude_sim_quat)
+        return self._steer(
+            t, attitude_sim_quat, velocity_ned, source, center, square[2], sightline, relative,
+        )
+
+    def _sees(self, image: Optional[np.ndarray]) -> bool:
+        count = 0 if image is None else target_pixel_count(image)
+        return count >= self.lock_pixels
+
+    def _hold(self, attitude_sim_quat: np.ndarray) -> HomingCommand:
+        """Camera tick that is not steering: zero acceleration, and not a permanent loss."""
         self._tracking = False
-        self._velocity_ned = np.array(self._initial_velocity_ned, dtype=float, copy=True)
         self._acceleration_ned = np.zeros(3)
+        self._source = None
+        self._tracker_center = None
+        self._tracker_side = None
+        if not self._locked:
+            self._velocity_ned = np.array(self._initial_velocity_ned, dtype=float, copy=True)
+        return self._command(attitude_sim_quat)
+
+    def _permanent_loss(self, attitude_sim_quat: np.ndarray) -> HomingCommand:
+        self._lost = True
+        self._tracking = False
+        self._acceleration_ned = np.zeros(3)
+        self._source = None
+        self._tracker_center = None
+        self._tracker_side = None
+        return self._command(attitude_sim_quat)
+
+    def _steer(
+        self,
+        t: float,
+        attitude_sim_quat: np.ndarray,
+        velocity_ned: np.ndarray,
+        source: str,
+        center: np.ndarray,
+        side: int,
+        sightline: np.ndarray,
+        relative: np.ndarray,
+    ) -> HomingCommand:
+        if source == "upward" and not self._upward_steered:
+            previous_sightline = None
+            dt = 0
+        elif self._last_image_time is None:
+            previous_sightline = self._last_sightline
+            dt = 0.0
+        else:
+            previous_sightline = self._last_sightline
+            dt = float(t) - float(self._last_image_time)
+        self._acceleration_ned = pn_acceleration(
+            self.nav_constant,
+            velocity_ned,
+            sightline,
+            previous_sightline,
+            dt,
+        )
+        self._velocity_ned = desired_velocity(relative)
+        self._yaw_rad = float(np.arctan2(sightline[1], sightline[0]))
+        self._tracking = True
+        self._last_sightline = sightline / np.linalg.norm(sightline)
+        self._last_image_time = float(t)
+        self._source = source
+        self._tracker_center = np.array(center, dtype=float, copy=True)
+        self._tracker_side = float(side)
+        if source == "upward":
+            self._upward_steered = True
         return self._command(attitude_sim_quat)
 
     def _command(self, attitude_sim_quat: np.ndarray) -> HomingCommand:
@@ -175,4 +248,9 @@ class HomingGuidance(object):
             self._yaw_rad,
             self._locked,
             self._tracking,
+            self._source,
+            None if self._tracker_center is None else np.array(
+                self._tracker_center, dtype=float, copy=True
+            ),
+            self._tracker_side,
         )

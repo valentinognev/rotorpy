@@ -63,12 +63,30 @@ def nominal_world() -> World:
     )
 
 
+def _nominal_intrinsics() -> dict:
+    """2236 by 2236, 90 by 90 degree lens. Distortion is a tuple so two cameras compare with ==."""
+    width, height = square_resolution()
+    intrinsics = pinhole_intrinsics(width, height, 90.0, 90.0)
+    intrinsics["dist_coeffs"] = tuple(float(coeff) for coeff in intrinsics["dist_coeffs"])
+    return intrinsics
+
+
 def nominal_camera() -> PinholeCamera:
     """2236 by 2236 pinhole camera, 90 by 90 degree FOV, pitched 10 degrees down."""
-    width, height = square_resolution()
     return PinholeCamera(
-        intrinsics=pinhole_intrinsics(width, height, 90.0, 90.0),
+        intrinsics=_nominal_intrinsics(),
         extrinsics=pitched_extrinsics(10),
+        frame_rate=20,
+        splat_radius=SPLAT_RADIUS,
+        feature_output="rgb",
+    )
+
+
+def nominal_upward_camera() -> PinholeCamera:
+    """2236 by 2236 pinhole camera, 90 by 90 degree FOV, pitched 70 degrees up."""
+    return PinholeCamera(
+        intrinsics=_nominal_intrinsics(),
+        extrinsics=pitched_extrinsics(-70),
         frame_rate=20,
         splat_radius=SPLAT_RADIUS,
         feature_output="rgb",

@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
+from scipy.spatial.transform import Rotation
 from rotorpy.guidance.pixels import target_pixel_count
-from rotorpy.guidance.scene import hover_rotor_speed, initial_velocity_ned, nominal_camera, nominal_initial_state, nominal_world
+from rotorpy.guidance.scene import hover_rotor_speed, initial_velocity_ned, nominal_camera, nominal_initial_state, nominal_upward_camera, nominal_world
 from rotorpy.vehicles.hummingbird_params import quad_params
 
 def test_initial_course_and_hover_thrust():
@@ -20,3 +22,13 @@ def test_nominal_start_sees_a_stable_target_of_at_least_36_pixels():
     assert first == second
     assert first >= 36
     assert np.allclose(state["x"], [0.0, 0.0, 30.0])
+
+def test_upward_camera_matches_the_forward_lens_and_looks_up():
+    forward = nominal_camera()
+    upward = nominal_upward_camera()
+    assert upward.intrinsics == forward.intrinsics
+    assert np.allclose(upward.extrinsics["position"], 0.0)
+    body_to_camera = Rotation.from_quat(upward.extrinsics["orientation"]).as_matrix()
+    optical_axis = body_to_camera[2]
+    assert optical_axis[2] > optical_axis[0] > 0.0
+    assert optical_axis[1] == pytest.approx(0.0)

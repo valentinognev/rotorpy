@@ -2,8 +2,9 @@
 Camera homing.
 
 Prints one nominal miss or timeout, then writes a Plotly page of the flight
-to Results/camera_homing.html. The page is a 3D scene beside the camera
-snapshot, with a slider for the capture time. With --sweep, prints one line
+to Results/camera_homing.html. The page is a 3D scene beside the forward and
+upward pictures, with both camera frustums and the tracking square, and a
+slider for the capture time. With --sweep, prints one line
 each for navigation constants 2, 3, 4, and 5.
 """
 

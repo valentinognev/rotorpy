@@ -1,21 +1,21 @@
 import numpy as np
 from rotorpy.guidance.outcome import HomingOutcome
-from rotorpy.guidance.runner import flight_status, format_nominal, format_sweep_line, preview_image
+from rotorpy.guidance.runner import (
+    flight_status,
+    format_nominal,
+    format_sweep_line,
+    preview_image,
+    preview_step,
+)
 
 def test_stop_rules():
-    assert flight_status(20.0, False, 30.0, np.zeros(3)) == "timeout"
-    assert flight_status(19.99, False, 30.0, np.zeros(3)) is None
-    assert flight_status(0.0, False, 0.0, np.zeros(3)) is None
-    assert flight_status(5.0, True, 0.0, np.zeros(3)) == "ground"
-    assert flight_status(5.0, True, 0.01, np.zeros(3)) is None
-    assert flight_status(120.0, True, 10.0, np.zeros(3)) == "timeout"
-    assert flight_status(119.0, True, 10.0, np.zeros(3)) is None
-    assert flight_status(0.0, False, 30.0, np.array([20.0, 0.0, 0.0])) is None
-    assert flight_status(0.0, False, 30.0, np.array([20.001, 0.0, 0.0])) == "timeout"
-    assert flight_status(0.0, False, 30.0, np.array([0.0, 0.0, -20.0])) is None
-    assert flight_status(0.0, False, 30.0, np.array([0.0, 0.0, -20.001])) == "timeout"
-    assert flight_status(5.0, True, 0.0, np.array([25.0, 0.0, 0.0])) == "ground"
-    assert flight_status(5.0, True, 0.0, np.array([0.0, 0.0, -25.0])) == "ground"
+    assert flight_status(0.0, 0.0) == "ground"
+    assert flight_status(5.0, 0.0) == "ground"
+    assert flight_status(20.0, 0.0) == "ground"
+    assert flight_status(20.0, 10.0) == "timeout"
+    assert flight_status(19.99, 10.0) is None
+    assert flight_status(0.0, 30.0) is None
+    assert preview_step(2236, 2236) == 8
 
 def test_preview_keeps_a_small_red_target():
     image = np.full((16, 16, 3), 0.9, dtype=np.float32)
