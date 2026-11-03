@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from rotorpy.guidance.camera_geometry import mount_from_pitch
+from rotorpy.guidance.command_limits import VehicleEnvelope
 from rotorpy.guidance.homing import HomingGuidance
 from rotorpy.guidance.origin_alignment import EstimatorOriginAlignment
 from rotorpy.guidance.scene import (
@@ -84,6 +85,69 @@ def target_motion_thresholds() -> dict:
         "clipped_inflation": PROPOSED_TARGET_CLIPPED_INFLATION,
         "low_confidence_inflation": PROPOSED_TARGET_LOW_CONFIDENCE_INFLATION,
         "confidence_floor": PROPOSED_TARGET_CONFIDENCE_FLOOR,
+    }
+
+
+# Proposed, not verified: `command_limits.VehicleEnvelope`'s vehicle limits (plan
+# Phase 7). None of these come from a firmware parameter dump or measured command-
+# response characterization (the PX4 SITL cannot be inspected or flown here, see
+# `Dockerfiles/px4_characterization.py`); they are conservative placeholders so the
+# new total-speed/continuity/visibility limiting has *some* bound to enforce, named
+# here so a later measured pass has one place to update. 15 m/s keeps the total-speed
+# objective below `speed_component_cap_m_s`'s per-axis legacy cap's worst-case norm
+# (19*sqrt(3) ~= 32.9 m/s) and below the Hummingbird's documented four-motor thrust
+# margin (`Dockerfiles/airframes/1100_gazebo-classic_hummingbird`: ~24 N vs 6.7 N
+# weight, generous but unverified headroom). 5 m/s^2 accel and 10 m/s^3 jerk bound how
+# fast the commanded velocity/acceleration may change tick-to-tick (command
+# continuity -- never an indefinitely held stale command, and never a step the
+# airframe could not plausibly track). 1.0 rad/s yaw rate and 8.0 m/s vertical rate
+# are similarly conservative placeholders -- generous enough that a typical shallow
+# pursuit descent/climb angle does not spuriously clamp the bearing (see
+# `tests/test_homing_gazebo_camera_model.py`'s own direction-precision assertions),
+# while a near-vertical aim point still demonstrably triggers it. The visibility margin reduces the speed
+# cap (never to zero -- `visibility_min_speed_scale` floors it) once the tracked
+# target is within `visibility_margin_frac` of the image's near edge, protecting the
+# observation instead of commanding a maneuver that could lose the target off-frame.
+PROPOSED_VEHICLE_MAX_SPEED_M_S = 15.0
+PROPOSED_VEHICLE_MAX_ACCEL_M_S2 = 5.0
+PROPOSED_VEHICLE_MAX_JERK_M_S3 = 10.0
+PROPOSED_VEHICLE_MAX_YAW_RATE_RAD_S = 1.0
+PROPOSED_VEHICLE_MAX_VERTICAL_SPEED_M_S = 8.0
+PROPOSED_VISIBILITY_MARGIN_FRAC = 0.2
+PROPOSED_VISIBILITY_MIN_SPEED_SCALE = 0.3
+
+# Proposed, not verified: the PN lead-pursuit design constant (plan Phase 7) --
+# `navigation.pn_lead_point`'s `lead_time_s`. Not a physical time-to-go; a small,
+# named scale so the navigation constant demonstrably changes the aim point (and
+# therefore the transmitted velocity command) whenever the target's own estimated
+# motion is nonzero, without the lead distance dominating the tracked relative
+# position at typical `nav_constant` values (2-5) and target speeds (up to
+# `PROPOSED_MAX_TARGET_SPEED_M_S`).
+PROPOSED_PN_LEAD_TIME_S = 0.2
+
+# Proposed, not verified, OFF by default (project history: accel feedforward caused
+# instability): whether the Gazebo tracker's mavlink `SET_POSITION_TARGET_LOCAL_NED`
+# setpoint actually sends `HomingCommand.acceleration_ned` to PX4 (clears its
+# AX/AY/AZ ignore bits) instead of masking it out. Flipping this requires the
+# plan's own prerequisite -- validating PX4's feedforward semantics and frame
+# conventions in a live flight -- which cannot happen in this offline environment;
+# this flag exists so that validation has a single, already-tested switch to flip,
+# not so it gets silently turned on as "the fix" (explicitly ruled out, see
+# `docs/superpowers/plans/2026-11-03-gazebo-homing-reliability.md` Phase 7).
+PROPOSED_ENABLE_ACCELERATION_FEEDFORWARD = False
+
+
+def vehicle_envelope() -> dict:
+    """Named vehicle-envelope limits, for
+    `command_limits.VehicleEnvelope(**vehicle_envelope())`."""
+    return {
+        "max_speed_m_s": PROPOSED_VEHICLE_MAX_SPEED_M_S,
+        "max_accel_m_s2": PROPOSED_VEHICLE_MAX_ACCEL_M_S2,
+        "max_jerk_m_s3": PROPOSED_VEHICLE_MAX_JERK_M_S3,
+        "max_yaw_rate_rad_s": PROPOSED_VEHICLE_MAX_YAW_RATE_RAD_S,
+        "max_vertical_speed_m_s": PROPOSED_VEHICLE_MAX_VERTICAL_SPEED_M_S,
+        "visibility_margin_frac": PROPOSED_VISIBILITY_MARGIN_FRAC,
+        "visibility_min_speed_scale": PROPOSED_VISIBILITY_MIN_SPEED_SCALE,
     }
 
 
@@ -278,4 +342,7 @@ def guidance_from_config(config: dict) -> HomingGuidance:
         min_course_speed_m_s=PROPOSED_MIN_COURSE_SPEED_M_S,
         **tracking_thresholds(),
         **target_motion_thresholds(),
+        vehicle_envelope=VehicleEnvelope(**vehicle_envelope()),
+        pn_lead_time_s=PROPOSED_PN_LEAD_TIME_S,
+        enable_acceleration_feedforward=PROPOSED_ENABLE_ACCELERATION_FEEDFORWARD,
     )

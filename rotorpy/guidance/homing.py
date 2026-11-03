@@ -1,14 +1,15 @@
 """Camera homing command: lock, proportional navigation, and flat output."""
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from rotorpy.guidance.camera_geometry import CameraMount, pixel_ray_ned, pixel_to_camera_ray
+from rotorpy.guidance.command_limits import VehicleEnvelope, limit_command
 from rotorpy.guidance.frames import ned_to_sim, sim_body_to_frd, sim_to_ned
 from rotorpy.guidance.gazebo_bridge import attitude_homing_to_ned_frd, heading_from_homing_attitude
-from rotorpy.guidance.navigation import pn_acceleration
+from rotorpy.guidance.navigation import pn_acceleration, pn_lead_point
 from rotorpy.guidance.pixels import (
     DEFAULT_CONFIG,
     DetectionStatus,
@@ -19,8 +20,8 @@ from rotorpy.guidance.pixels import (
     target_square,
 )
 from rotorpy.guidance.sightline import ground_relative_position, reference_relative_position
-from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity
-from rotorpy.guidance.target_estimator import TargetMotionEstimate, TargetMotionEstimator
+from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity, max_feasible_velocity
+from rotorpy.guidance.target_estimator import TargetMotionEstimate, TargetMotionEstimator, TargetMotionStatus
 from rotorpy.guidance.tracking import CameraSignal, TrackingState, TrackingStateMachine
 
 # Default below this horizontal speed the measured velocity has no usable heading, when
@@ -49,6 +50,18 @@ _TARGET_MAX_POSITION_SIGMA_M = 5.0
 _TARGET_CLIPPED_INFLATION = 3.0
 _TARGET_LOW_CONFIDENCE_INFLATION = 2.0
 _TARGET_CONFIDENCE_FLOOR = 0.2
+# Private literal defaults matching `homing_config`'s named `PROPOSED_*` vehicle-
+# envelope/PN-lead/feedforward thresholds (plan Phase 7; see `vehicle_envelope()`
+# there): same reasoning as the tracking/target-motion threshold groups above.
+_VEHICLE_MAX_SPEED_M_S = 15.0
+_VEHICLE_MAX_ACCEL_M_S2 = 5.0
+_VEHICLE_MAX_JERK_M_S3 = 10.0
+_VEHICLE_MAX_YAW_RATE_RAD_S = 1.0
+_VEHICLE_MAX_VERTICAL_SPEED_M_S = 8.0
+_VISIBILITY_MARGIN_FRAC = 0.2
+_VISIBILITY_MIN_SPEED_SCALE = 0.3
+_PN_LEAD_TIME_S = 0.2
+_ENABLE_ACCELERATION_FEEDFORWARD = False
 # Documented design (unchanged by this module): home from the forward camera until the
 # upward camera latches, then home from upward -- so upward outranks forward whenever
 # both are visible, not just the first time upward is ever seen.
@@ -73,6 +86,8 @@ class HomingCommand(object):
         tracking_state: Optional[TrackingState] = None,
         abort_reason: Optional[str] = None,
         target_motion: Optional[TargetMotionEstimate] = None,
+        requested_velocity_ned: Optional[np.ndarray] = None,
+        limiting_reasons: Optional[List[str]] = None,
     ) -> None:
         self.velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
         self.acceleration_ned = np.array(acceleration_ned, dtype=float, copy=True)
@@ -109,6 +124,22 @@ class HomingCommand(object):
         # its own documented fallback to the existing bearing-only/pure-pursuit
         # behavior whenever `target_motion.status` is not `OBSERVABLE`.
         self.target_motion = target_motion
+        # Gazebo (mounts) path only (plan Phase 7): the velocity guidance asked for
+        # before `command_limits.limit_command` bounded it to the vehicle envelope/
+        # continuity/visibility limits -- `velocity_ned` above is that limited (and,
+        # barring a tracker-level startup override, transmitted) value. `None` on the
+        # legacy no-mounts path, which has no envelope to limit against.
+        self.requested_velocity_ned = None if requested_velocity_ned is None else np.array(
+            requested_velocity_ned, dtype=float, copy=True
+        )
+        # Every named bound `limit_command` actually applied this tick, plus
+        # `"target_motion_unavailable:<reason>"` whenever steering fell back to the
+        # bearing-only aim point because `target_motion` was not `OBSERVABLE`. Always
+        # `[]` (never `None`) when passed at all; `requested_velocity_ned is None` is
+        # the sentinel callers (`telemetry.setpoint_fields_from_command`) check for
+        # "guidance had no envelope to limit against this tick" (legacy no-mounts
+        # path, or a mounts-path hold/terminal tick), not this field.
+        self.limiting_reasons = None if limiting_reasons is None else list(limiting_reasons)
 
 
 def body_frd_velocity(velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -> np.ndarray:
@@ -279,6 +310,9 @@ class HomingGuidance(object):
         clipped_inflation: float = _TARGET_CLIPPED_INFLATION,
         low_confidence_inflation: float = _TARGET_LOW_CONFIDENCE_INFLATION,
         confidence_floor: float = _TARGET_CONFIDENCE_FLOOR,
+        vehicle_envelope: Optional[VehicleEnvelope] = None,
+        pn_lead_time_s: float = _PN_LEAD_TIME_S,
+        enable_acceleration_feedforward: bool = _ENABLE_ACCELERATION_FEEDFORWARD,
     ) -> None:
         if initial_velocity_ned is None and initial_speed is None:
             raise ValueError("give an initial velocity or an initial speed")
@@ -301,12 +335,13 @@ class HomingGuidance(object):
         }
         # Timestamped constant-velocity target-motion estimator (plan Phase 6), Gazebo
         # (mounts) path only: it needs the true NED ray geometry (`pixel_ray_ned`) the
-        # legacy no-mounts path does not have. Purely additive this task -- nothing
-        # below reads `self._estimator`'s output for steering; it only reaches
-        # `HomingCommand.target_motion` (see `_command`). Parameter names mirror
-        # `TargetMotionEstimator.__init__` directly (same convention as the tracking
-        # thresholds above), so `homing_config.target_motion_thresholds()` unpacks
-        # straight into this constructor.
+        # legacy no-mounts path does not have. Task 6 wired it in purely additively;
+        # Task 7's `_steer` now also consults it (`predict_to` at the control time) for
+        # a lead-pursuit aim point when `status is OBSERVABLE`, falling back to the
+        # existing bearing-only aim point otherwise (see `_steer`). Parameter names
+        # mirror `TargetMotionEstimator.__init__` directly (same convention as the
+        # tracking thresholds above), so `homing_config.target_motion_thresholds()`
+        # unpacks straight into this constructor.
         self._estimator: Optional[TargetMotionEstimator] = None if self._mounts is None else TargetMotionEstimator(
             max_speed_m_s=max_speed_m_s,
             max_accel_m_s2=max_accel_m_s2,
@@ -317,6 +352,35 @@ class HomingGuidance(object):
             low_confidence_inflation=low_confidence_inflation,
             confidence_floor=confidence_floor,
         )
+        # Vehicle-envelope/continuity/visibility command limiting (plan Phase 7),
+        # Gazebo (mounts) path only: the legacy no-mounts path keeps its unlimited
+        # `desired_velocity`/`pn_acceleration` output unchanged (every existing legacy
+        # test asserts that output exactly). `self.enable_acceleration_feedforward` is
+        # public and read-only from here on: the tracker shell decides whether to
+        # actually send `HomingCommand.acceleration_ned` to PX4 from it (default
+        # False -- masked, unchanged from before this task; see `homing_config`'s
+        # `PROPOSED_ENABLE_ACCELERATION_FEEDFORWARD`). A caller passing no explicit
+        # `vehicle_envelope` gets this module's own private literal defaults (same
+        # convention as every other threshold group); `homing_config.guidance_from_config`
+        # passes `VehicleEnvelope(**vehicle_envelope())` instead.
+        self._envelope: Optional[VehicleEnvelope] = None
+        if self._mounts is not None:
+            self._envelope = vehicle_envelope if vehicle_envelope is not None else VehicleEnvelope(
+                max_speed_m_s=_VEHICLE_MAX_SPEED_M_S,
+                max_accel_m_s2=_VEHICLE_MAX_ACCEL_M_S2,
+                max_jerk_m_s3=_VEHICLE_MAX_JERK_M_S3,
+                max_yaw_rate_rad_s=_VEHICLE_MAX_YAW_RATE_RAD_S,
+                max_vertical_speed_m_s=_VEHICLE_MAX_VERTICAL_SPEED_M_S,
+                visibility_margin_frac=_VISIBILITY_MARGIN_FRAC,
+                visibility_min_speed_scale=_VISIBILITY_MIN_SPEED_SCALE,
+            )
+        self._pn_lead_time_s = float(pn_lead_time_s)
+        self.enable_acceleration_feedforward = bool(enable_acceleration_feedforward)
+        # Set only by `_steer`'s mounts branch; `None`/`[]` otherwise (legacy path, or
+        # a hold/terminal tick), matching `HomingCommand`'s own None-means-unset
+        # convention for `requested_velocity_ned`/`limiting_reasons`.
+        self._requested_velocity_ned: Optional[np.ndarray] = None
+        self._limiting_reasons: List[str] = []
         self._reference_height_m = float(target_reference_height_m)
         self._min_course_speed_m_s = float(min_course_speed_m_s)
         self._initial_speed = None if initial_speed is None else float(initial_speed)
@@ -423,13 +487,29 @@ class HomingGuidance(object):
         velocity_ned: np.ndarray,
         forward_image: Optional[np.ndarray],
         upward_image: Optional[np.ndarray],
+        control_t: Optional[float] = None,
     ) -> HomingCommand:
         """Advance the homing law.
 
         Both images None means no new frame. One None image is a camera tick
         whose missing picture has no target pixels.
+
+        `t` is the measurement time: every detection/dt/estimator-update computation
+        below uses it, and so must `height_m`/`attitude_sim_quat`/`velocity_ned` --
+        the vehicle state *at* `t` (the Gazebo tracker samples these from the T3
+        `VehicleState` history at the image's own capture time, not whatever PX4
+        happened to report most recently). `control_t` is the separate, later time
+        the resulting command actually takes effect (the processing instant); it
+        defaults to `t` (every pre-Phase-7 caller's single-timestamp convention,
+        including every direct `HomingGuidance` construction in this file's own
+        tests, is unchanged). Only `_estimator.predict_to` (the delay-compensated
+        target-motion estimate `_steer` aims at, and the one `_command` attaches to
+        `HomingCommand.target_motion`) uses `control_t`: the processing delay between
+        a frame's capture and the command it produces is exactly what `predict_to`
+        exists to compensate for.
         """
-        self._last_control_time = float(t)
+        control_t = float(t) if control_t is None else float(control_t)
+        self._last_control_time = control_t
         self._last_velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
         if self._initial_velocity_ned is None:
             self._adopt_course(velocity_ned, attitude_sim_quat)
@@ -583,6 +663,8 @@ class HomingGuidance(object):
         self._source = None
         self._tracker_center = None
         self._tracker_side = None
+        self._requested_velocity_ned = None
+        self._limiting_reasons = []
         if not self._locked:
             self._velocity_ned = np.array(self._initial_velocity_ned, dtype=float, copy=True)
         return self._command(attitude_sim_quat)
@@ -600,6 +682,8 @@ class HomingGuidance(object):
         self._source = None
         self._tracker_center = None
         self._tracker_side = None
+        self._requested_velocity_ned = None
+        self._limiting_reasons = []
         return self._command(attitude_sim_quat)
 
     def _steer(
@@ -620,15 +704,58 @@ class HomingGuidance(object):
         else:
             previous_sightline = self._last_sightline
             dt = float(t) - float(self._last_image_time)
-        self._acceleration_ned = pn_acceleration(
+        accel = pn_acceleration(
             self.nav_constant,
             velocity_ned,
             sightline,
             previous_sightline,
             dt,
         )
-        self._velocity_ned = desired_velocity(relative, self._component_cap)
-        self._yaw_rad = float(np.arctan2(sightline[1], sightline[0]))
+        new_yaw = float(np.arctan2(sightline[1], sightline[0]))
+        if self._envelope is None:
+            # Legacy no-mounts path: unchanged (every existing legacy test asserts
+            # this exact direction-based velocity/accel output).
+            self._acceleration_ned = accel
+            self._velocity_ned = desired_velocity(relative, self._component_cap)
+            self._yaw_rad = new_yaw
+        else:
+            # Gazebo (mounts) path (plan Phase 7): one coherent velocity/acceleration/
+            # yaw command, PN folded into the *velocity* (so it demonstrably changes
+            # the transmitted command even though `acceleration_ned` stays masked by
+            # default -- see `homing_config.PROPOSED_ENABLE_ACCELERATION_FEEDFORWARD`),
+            # then bounded by the vehicle envelope and continuity limits.
+            reasons: List[str] = []
+            aim_point = relative
+            target_motion_now = None
+            if self._estimator is not None:
+                target_motion_now = self._estimator.predict_to(
+                    self._last_control_time, velocity_ned, sightline_unit=sightline
+                )
+            if (
+                target_motion_now is not None
+                and target_motion_now.status is TargetMotionStatus.OBSERVABLE
+                and target_motion_now.relative_velocity_ned is not None
+            ):
+                aim_point = pn_lead_point(
+                    self.nav_constant, relative, target_motion_now.relative_velocity_ned, self._pn_lead_time_s
+                )
+            elif target_motion_now is not None:
+                reasons.append(
+                    "target_motion_unavailable:" + (target_motion_now.reason or target_motion_now.status.value)
+                )
+            requested_velocity = max_feasible_velocity(aim_point, self._envelope.max_speed_m_s)
+            limited = limit_command(
+                requested_velocity, accel, new_yaw,
+                self._velocity_ned, self._acceleration_ned, self._yaw_rad,
+                dt, self._envelope,
+                center_px=center, image_width_px=self.intrinsics.get("width"),
+                image_height_px=self.intrinsics.get("height"),
+            )
+            self._requested_velocity_ned = requested_velocity
+            self._velocity_ned = limited.velocity_ned
+            self._acceleration_ned = limited.acceleration_ned
+            self._yaw_rad = limited.yaw_rad
+            self._limiting_reasons = reasons + list(limited.reasons)
         self._tracking = True
         self._last_sightline = sightline / np.linalg.norm(sightline)
         self._last_image_time = float(t)
@@ -665,4 +792,6 @@ class HomingGuidance(object):
             self._tracker.state,
             self._tracker.abort_reason,
             target_motion,
+            self._requested_velocity_ned,
+            self._limiting_reasons,
         )

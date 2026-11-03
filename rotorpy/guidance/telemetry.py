@@ -137,6 +137,29 @@ def target_motion_fields_from_command(command: Any) -> Dict[str, Any]:
     })}
 
 
+def setpoint_fields_from_command(command: Any) -> Dict[str, Any]:
+    """`requested_setpoint`/`limited_setpoint`/`limiting_reasons` `TickRecord` fields
+    from a `HomingCommand` (plan Phase 7's vehicle-envelope/continuity limiting).
+
+    `{}` when the command carries no `requested_velocity_ned` (the legacy no-mounts
+    path, which has no envelope to limit against, or a mounts-path hold/terminal
+    tick): the tick's `TickRecord` then keeps its unpopulated `None`/`[]` defaults,
+    same convention as `target_motion_fields_from_command`. `limited_setpoint` is
+    `command.velocity_ned` itself -- `command_limits.limit_command`'s output, already
+    bounded to the vehicle envelope -- not a separate field; the caller (the Gazebo
+    tracker) still reports the actually-transmitted `transmitted_setpoint` itself,
+    since a startup-hold tick sends a different velocity than `command.velocity_ned`.
+    """
+    requested = getattr(command, "requested_velocity_ned", None)
+    if requested is None:
+        return {}
+    return {
+        "requested_setpoint": _jsonable(requested),
+        "limited_setpoint": _jsonable(command.velocity_ned),
+        "limiting_reasons": list(getattr(command, "limiting_reasons", None) or []),
+    }
+
+
 @dataclass
 class RunMetadata:
     """What a run was: configuration, firmware, effective parameters, rendering, timing."""

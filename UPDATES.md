@@ -1,5 +1,63 @@
 # Updates
 
+## 4.10.0 - Maximum-feasible-speed guidance and PX4 integration (plan Phase 7)
+- New `rotorpy/guidance/command_limits.py`: pure `VehicleEnvelope`/`limit_command`,
+  the single place a Gazebo (mounts) path command's velocity/acceleration/yaw is
+  bounded -- total speed (norm, not per-component), vertical rate, raw acceleration
+  magnitude, per-tick acceleration (continuity) and jerk steps, yaw rate, and a
+  visibility margin that scales both the speed and yaw-rate caps down as the tracked
+  target nears the image edge. Non-finite input falls back to the previous (or
+  zero/identity) command rather than propagating NaN/inf. Every bound actually
+  applied appends a named reason. Property-style tests (`tests/test_command_limits.py`)
+  cover randomized requests plus explicit NaN/inf cases.
+- `rotorpy/guidance/speed.py` gained `max_feasible_velocity`: a total-speed (norm)
+  objective, replacing the legacy per-component `desired_velocity` cap on the Gazebo
+  path only (the legacy no-mounts path keeps `desired_velocity` unchanged -- every
+  existing test still asserts its exact per-component output).
+- `rotorpy/guidance/navigation.py` gained `pn_lead_point`: proportional navigation
+  folded into the aim point itself (not only a separate acceleration field a mavlink
+  mask may ignore), so changing `nav_constant` demonstrably changes the transmitted
+  velocity whenever `target_estimator`'s `OBSERVABLE` relative velocity is nonzero.
+  `HomingGuidance._steer` uses this only when `target_motion.status is OBSERVABLE`;
+  otherwise it falls back to the pre-Phase-7 bearing-only aim point and records
+  `"target_motion_unavailable:<reason>"` in the new `HomingCommand.limiting_reasons`.
+- `HomingGuidance.update(t, ..., control_t=None)`: `t` is now the image's own
+  *capture* time (every detection/dt/estimator-update computation lines up with the
+  vehicle state already sampled at that instant); `control_t` (defaults to `t`,
+  every pre-Phase-7 caller unaffected) is the separate, later processing instant,
+  and only `TargetMotionEstimator.predict_to` advances to it. Fixes the carry-over
+  gap where the tracker fed the processing instant into both roles.
+  `Dockerfiles/camera_homing_tracker.py` now passes the capture time as `t` and
+  `rospy.get_time()` as `control_t`.
+- `HomingCommand.requested_velocity_ned`/`limiting_reasons` (Gazebo path only, `None`
+  on the legacy path) expose the pre-limit request alongside the limited one;
+  `telemetry.setpoint_fields_from_command` reports `requested_setpoint`/
+  `limited_setpoint`/`limiting_reasons`, now populated by the tracker's `_record_step`
+  alongside the existing `transmitted_setpoint`.
+- `homing_config.vehicle_envelope()`: named `PROPOSED_VEHICLE_MAX_SPEED_M_S`/
+  `_ACCEL_M_S2`/`_JERK_M_S3`/`_YAW_RATE_RAD_S`/`_VERTICAL_SPEED_M_S`,
+  `PROPOSED_VISIBILITY_MARGIN_FRAC`/`_MIN_SPEED_SCALE`, all explicitly documented as
+  proposed/unverified placeholders (no PX4 parameter dump or flight was performed).
+  `PROPOSED_PN_LEAD_TIME_S` (PN-lead design constant) and
+  `PROPOSED_ENABLE_ACCELERATION_FEEDFORWARD` (`False`) round this out.
+- `HomingGuidance.enable_acceleration_feedforward` (default `False`, off): a
+  documented, tested semantics flag the tracker's `_send` mavlink type-mask reads
+  (`Dockerfiles/camera_homing_tracker.py`'s new `_position_target_type_mask`) --
+  acceleration fields stay masked (ignored) by default, unchanged from every prior
+  flight; flipping the flag is not itself "the fix" and still requires the live PX4
+  feedforward-semantics validation this offline environment cannot perform.
+- New `Dockerfiles/px4_characterization.py`: a documented, importable (not run here)
+  PX4 parameter-dump (`dump_px4_parameters`) and velocity-step command-response
+  recorder (`run_velocity_step_characterization`), plus the pure analysis
+  (`analyze_step_response`/`analyze_velocity_tracking`) unit-tested on synthetic data
+  (`tests/test_px4_characterization.py`) so a future live-flight log only has to
+  supply the recording -- no measured limit anywhere in this entry is a real flight
+  result.
+- New tests: `tests/test_command_limits.py` (17), `tests/test_homing_vehicle_envelope.py`
+  (9), `tests/test_homing_config_vehicle_envelope.py` (3), `tests/test_px4_characterization.py`
+  (8), plus additions to `tests/test_homing_speed.py`, `tests/test_homing_navigation.py`,
+  and `tests/test_gazebo_homing_startup.py` (mask toggling).
+
 ## 4.9.0 - Target-motion estimation (plan Phase 6)
 - New `rotorpy/guidance/target_estimator.py`: a pure, unit-tested `TargetMotionEstimator`
   -- a timestamped constant-velocity Kalman filter over a ground target's own

@@ -198,6 +198,44 @@ def test_startup_commands_climb_then_hold_before_homing(tracker_module):
     assert sent[-1][14] == 0.8
 
 
+def test_send_masks_acceleration_by_default_but_not_when_feedforward_is_enabled(tracker_module):
+    """Plan Phase 7: acceleration fields stay masked (ignored) in the mavlink setpoint
+    unless `HomingGuidance.enable_acceleration_feedforward` (off by default) says
+    otherwise -- the type mask toggles, not "unmasking acceleration" unconditionally."""
+    assert tracker_module._position_target_type_mask(False) == tracker_module._POSITION_IGNORE
+    with_feedforward = tracker_module._position_target_type_mask(True)
+    assert with_feedforward != tracker_module._POSITION_IGNORE
+    accel_bits = tracker_module._ACCELERATION_IGNORE
+    assert with_feedforward & accel_bits == 0
+    # Position/yaw-rate stay ignored either way -- only acceleration toggles.
+    assert with_feedforward | accel_bits == tracker_module._POSITION_IGNORE
+
+    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
+    tracker._gravity_on = True
+    tracker._startup_done = True
+    tracker._startup_yaw = 0.0
+    command = SimpleNamespace(velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.1, 0.2, 0.3], yaw_rad=0.0)
+    sent = []
+    tracker._mav = SimpleNamespace(
+        target_system=1, target_component=1,
+        mav=SimpleNamespace(set_position_target_local_ned_send=lambda *args: sent.append(args)),
+    )
+
+    tracker.guidance = SimpleNamespace(enable_acceleration_feedforward=False)
+    tracker._send(command, 30.0)
+    assert sent[-1][4] == tracker_module._POSITION_IGNORE
+
+    tracker.guidance = SimpleNamespace(enable_acceleration_feedforward=True)
+    tracker._send(command, 30.0)
+    assert sent[-1][4] == with_feedforward
+
+    # No `guidance` attribute at all (matches every other `_send`-only test in this
+    # file, built via `__new__`): defaults to masked, same as before this task.
+    del tracker.guidance
+    tracker._send(command, 30.0)
+    assert sent[-1][4] == tracker_module._POSITION_IGNORE
+
+
 def test_mav_access_is_serialised_across_threads(tracker_module):
     # pymavlink is not thread-safe: the 50 Hz setpoint-publisher thread's `_send` and the
     # step thread's `_poll_mavlink` must never run inside the same connection at once.
@@ -508,7 +546,7 @@ def test_step_fuses_the_other_cameras_still_recent_cached_image(tracker_module, 
     calls = []
 
     class FakeGuidance(object):
-        def update(self, t, height_m, attitude, velocity_ned, forward_image, upward_image):
+        def update(self, t, height_m, attitude, velocity_ned, forward_image, upward_image, control_t=None):
             calls.append((forward_image is not None, upward_image is not None))
             return SimpleNamespace(
                 locked=False, tracking=False, source=None,
@@ -644,7 +682,7 @@ class _FakeGuidance(object):
     def reset_derivative_history(self):
         self.resets += 1
 
-    def update(self, t, height_m, attitude, velocity_ned, forward_image, upward_image):
+    def update(self, t, height_m, attitude, velocity_ned, forward_image, upward_image, control_t=None):
         return SimpleNamespace(
             locked=False, tracking=False, source=None,
             velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,

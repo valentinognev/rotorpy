@@ -51,6 +51,7 @@ from rotorpy.guidance.step_decision import command_and_stamp
 from rotorpy.guidance.telemetry import (
     detection_fields_from_command,
     frame_to_float,
+    setpoint_fields_from_command,
     start_run_telemetry,
     target_motion_fields_from_command,
 )
@@ -78,6 +79,29 @@ _POSITION_IGNORE = (
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
 )
+_ACCELERATION_IGNORE = (
+    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
+    | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
+    | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+)
+
+
+def _position_target_type_mask(enable_acceleration_feedforward):
+    """The `SET_POSITION_TARGET_LOCAL_NED` type mask: position/yaw-rate always
+    ignored, acceleration ignored unless `enable_acceleration_feedforward` -- the
+    documented, off-by-default semantics flag (plan Phase 7;
+    `homing_config.PROPOSED_ENABLE_ACCELERATION_FEEDFORWARD`, `HomingGuidance.
+    enable_acceleration_feedforward`). Default `False` keeps today's mask (the
+    AX/AY/AZ ignore bits stay set, same as every pre-Phase-7 flight): acceleration
+    fields stay masked out unless this is explicitly, separately validated and
+    flipped on -- never "the fix" by itself (project history: accel feedforward was
+    unstable; see the plan's own Phase 7 ruling).
+    """
+    if enable_acceleration_feedforward:
+        return _POSITION_IGNORE & ~_ACCELERATION_IGNORE
+    return _POSITION_IGNORE
+
+
 # Comms links whose loss latches the setpoint stream fatal. The image link is excluded on
 # purpose: camera dropouts are recoverable and handled by command expiry.
 _FATAL_WATCHDOG_LINKS = ("heartbeat", "telemetry")
@@ -314,9 +338,21 @@ class CameraHomingTracker(object):
         observation_wall_s = max(receipts) if receipts else wall_now
 
         def compute_command():
+            # `t` is the image's own *capture* time (when the frame -- and the
+            # `sample` above, already drawn from the T3 `VehicleState` history at
+            # this same instant -- actually describe the world), not the processing
+            # instant: every detection/dt/estimator-update computation inside
+            # `guidance.update` must line up with the vehicle state it was given, not
+            # with whenever this tick happens to run. `control_t` is the separate,
+            # later processing instant the resulting command actually takes effect;
+            # only `TargetMotionEstimator.predict_to` (reached through `_estimator`)
+            # uses it, to compensate for exactly the gap between those two times.
+            # Falls back to `rospy.get_time()` only before any frame has ever
+            # arrived (`capture_sim_s is None`), matching the pre-Phase-7 behavior.
+            measurement_t = capture_sim_s if capture_sim_s is not None else rospy.get_time()
             return self.guidance.update(
-                rospy.get_time(), sample.height_above_ground_m, homing_attitude, sample.velocity_ned,
-                forward_image, upward_image,
+                measurement_t, sample.height_above_ground_m, homing_attitude, sample.velocity_ned,
+                forward_image, upward_image, control_t=rospy.get_time(),
             )
 
         command, stamp_wall_s = command_and_stamp(
@@ -446,6 +482,7 @@ class CameraHomingTracker(object):
                 ),
                 **detection_fields_from_command(command),
                 **target_motion_fields_from_command(command),
+                **setpoint_fields_from_command(command),
             )
         except Exception as exc:
             print("telemetry step failed: {}".format(exc), file=sys.stderr, flush=True)
@@ -504,6 +541,10 @@ class CameraHomingTracker(object):
             velocity = (0.0, 0.0, -_STARTUP_CLIMB_SPEED)
         yaw = command.yaw_rad if startup_done or startup_yaw is None else startup_yaw
         accel = command.acceleration_ned
+        enable_feedforward = bool(
+            getattr(getattr(self, "guidance", None), "enable_acceleration_feedforward", False)
+        )
+        type_mask = _position_target_type_mask(enable_feedforward)
         # pymavlink is not thread-safe: serialise against the step thread's
         # `_poll_mavlink`/`_engage`, which also touch `self._mav`.
         with _lock_for(self, "_mav_lock"):
@@ -512,7 +553,7 @@ class CameraHomingTracker(object):
                 self._mav.target_system,
                 self._mav.target_component,
                 mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-                _POSITION_IGNORE,
+                type_mask,
                 0, 0, 0,
                 float(velocity[0]), float(velocity[1]), float(velocity[2]),
                 float(accel[0]), float(accel[1]), float(accel[2]),
