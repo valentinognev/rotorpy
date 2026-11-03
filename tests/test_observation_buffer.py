@@ -193,3 +193,44 @@ def test_select_fresh_or_recent_drops_an_observation_older_than_max_age():
     # just because it is the only thing in the slot.
     obs = _observation(1.0)
     assert select_fresh_or_recent(obs, is_fresh=False, now_wall_s=3.0, max_age_s=1.0) is None
+
+
+def test_camera_slot_accounting_holds_under_concurrent_offer_and_take():
+    # Every offered frame is exactly one of: taken fresh, dropped (overwritten unread), or
+    # still pending at the end. Unsynchronised offer/take lose or double-count frames.
+    import sys
+    import threading
+
+    from rotorpy.guidance.observation_buffer import CameraSlot
+
+    slot = CameraSlot()
+    image = np.zeros((1, 1, 3), dtype=np.uint8)
+    offers_per_thread, offer_threads = 3000, 2
+    taken = [0]
+    done = threading.Event()
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    def offerer():
+        for k in range(offers_per_thread):
+            slot.offer(float(k), float(k), image, "rgb8")
+
+    def taker():
+        while not done.is_set():
+            _, was_fresh = slot.take_fresh()
+            taken[0] += int(was_fresh)
+
+    offerers = [threading.Thread(target=offerer) for _ in range(offer_threads)]
+    reader = threading.Thread(target=taker)
+    try:
+        reader.start()
+        for thread in offerers:
+            thread.start()
+        for thread in offerers:
+            thread.join()
+        done.set()
+        reader.join()
+    finally:
+        sys.setswitchinterval(old_interval)
+    _, pending = slot.take_fresh()
+    assert taken[0] + slot.dropped + int(pending) == offers_per_thread * offer_threads

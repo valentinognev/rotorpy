@@ -427,7 +427,7 @@ def test_main_marks_the_setpoint_stream_fatal_on_a_step_exception(tracker_module
         write_page=lambda: events.append("write") or "flight.html",
         shutdown=lambda: events.append("shutdown"),
         note_failure=lambda exc: events.append(("note_failure", str(exc))),
-        mark_fatal=lambda: events.append("mark_fatal"),
+        mark_fatal=lambda reason=None: events.extend(["mark_fatal", reason]),
     )
     rospy = tracker_module.rospy
     monkeypatch.setattr(sys, "argv", ["tracker", "--config", "config.jsonc"])
@@ -442,6 +442,7 @@ def test_main_marks_the_setpoint_stream_fatal_on_a_step_exception(tracker_module
     tracker_module.main()
     assert "mark_fatal" in events
     assert events.index("mark_fatal") < events.index("write")
+    assert events[events.index("mark_fatal") + 1] == "step_exception: boom"
 
 
 def test_step_fuses_the_other_cameras_still_recent_cached_image(tracker_module, monkeypatch):
@@ -584,3 +585,145 @@ def test_startup_heading_comes_from_the_vehicle_not_the_target(tracker_module, m
     )
     tracker.step()
     assert np.isclose(np.cos(tracker._startup_yaw - heading), 1.0)
+
+
+# --- fix round 2: discontinuity ownership, image dropout not fatal -----------------------
+
+
+class _FakeGuidance(object):
+    def __init__(self):
+        self.resets = 0
+
+    def reset_derivative_history(self):
+        self.resets += 1
+
+    def update(self, t, height_m, attitude, velocity_ned, forward_image, upward_image):
+        return SimpleNamespace(
+            locked=False, tracking=False, source=None,
+            velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,
+        )
+
+
+def _ingest_estimate(tracker, wall_s):
+    tracker._vehicle_state.ingest_attitude(sim_s=wall_s, wall_s=wall_s, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=wall_s, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+
+
+def _offer_frame(tracker, receipt_s):
+    raw = np.zeros((2, 2, 3), dtype=np.uint8).tobytes()
+    tracker._observations.offer(
+        "forward", capture_s=receipt_s, receipt_s=receipt_s, raw_bytes=raw, width=2, height=2,
+        encoding="rgb8", step=2 * 3,
+    )
+    tracker._watchdogs.touch("image", receipt_s)
+
+
+def test_setpoint_publisher_cannot_swallow_the_discontinuity_before_step_sees_it(tracker_module, monkeypatch):
+    # The 50 Hz publisher thread calls `_publish_setpoint` -> `sample_at(None, ...)`; before
+    # this fix that call consumed the sticky discontinuity, so `step()` never reset
+    # guidance's derivative history.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker.guidance = _FakeGuidance()
+    tracker._send = lambda command, height: None
+    now = time.monotonic()
+    for name in ("heartbeat", "telemetry", "image"):
+        tracker._watchdogs.touch(name, now)
+    _ingest_estimate(tracker, 10.0)
+    tracker._vehicle_state.ingest_attitude(sim_s=0.0, wall_s=10.01, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._publish_setpoint(_FakeGuidance().update(0, 0, 0, 0, 0, 0))
+    tracker.step()
+    assert tracker.guidance.resets == 1
+    tracker.step()
+    assert tracker.guidance.resets == 1
+
+
+def _dropout_tracker(tracker_module, monkeypatch, published, clock):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker.guidance = _FakeGuidance()
+    tracker._setpoints = tracker_module.SetpointStream(
+        publish=published.append, expiry_s=0.5, now=lambda: clock[0]
+    )
+    return tracker
+
+
+def _tick_at(tracker_module, monkeypatch, tracker, clock, t, link_touches):
+    clock[0] = t
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: t)
+    for name in link_touches:
+        tracker._watchdogs.touch(name, t)
+
+
+def test_camera_dropout_is_not_fatal_and_normal_commands_resume_on_recovery(tracker_module, monkeypatch):
+    published, clock = [], [0.0]
+    tracker = _dropout_tracker(tracker_module, monkeypatch, published, clock)
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 1.0, ("heartbeat", "telemetry"))
+    _ingest_estimate(tracker, 1.0)
+    _offer_frame(tracker, 1.0)
+    tracker.step()
+    assert tracker._setpoints.tick(now_s=1.1) is not None
+
+    # The camera goes quiet well past the image watchdog timeout; telemetry/heartbeat live.
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 3.0, ("heartbeat", "telemetry"))
+    _ingest_estimate(tracker, 3.0)
+    tracker.step()
+    assert tracker._setpoints.stats.failed is False
+    assert tracker._setpoints.stats.fatal_reason is None
+    assert tracker._setpoints.tick(now_s=3.0) is None  # expired, not fatal
+    assert tracker._stale_links == ["image"]  # still visible
+
+    # A fresh frame arrives: the stream resumes normal commands.
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 3.2, ("heartbeat", "telemetry"))
+    _ingest_estimate(tracker, 3.2)
+    _offer_frame(tracker, 3.2)
+    tracker.step()
+    assert tracker._setpoints.stats.failed is False
+    assert tracker._setpoints.tick(now_s=3.25) is not None
+    assert tracker._stale_links == []
+
+
+def test_telemetry_loss_is_fatal_and_records_why(tracker_module, monkeypatch):
+    published, clock = [], [0.0]
+    tracker = _dropout_tracker(tracker_module, monkeypatch, published, clock)
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 1.0, ("heartbeat", "telemetry", "image"))
+    _ingest_estimate(tracker, 1.0)
+    _offer_frame(tracker, 1.0)
+    tracker.step()
+    # Telemetry goes silent while heartbeat and image stay alive.
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 2.0, ("heartbeat", "image"))
+    tracker.step()
+    assert tracker._setpoints.stats.failed is True
+    assert tracker._setpoints.stats.fatal_reason == "watchdog_lost:telemetry"
+    # Latched: even a fresh frame and recovered telemetry do not bring normal commands back.
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 2.1, ("heartbeat", "telemetry"))
+    _ingest_estimate(tracker, 2.1)
+    _offer_frame(tracker, 2.1)
+    tracker.step()
+    assert tracker._setpoints.tick(now_s=2.15) is None
+    assert tracker._setpoints.stats_snapshot()["fatal_reason"] == "watchdog_lost:telemetry"
+
+
+def test_never_seen_link_does_not_latch_fatal_at_startup(tracker_module, monkeypatch):
+    # Before the first PX4 attitude/local-position message arrives telemetry is "stale"
+    # (never touched); that is startup, not a lost link, and must not latch forever.
+    published, clock = [], [0.0]
+    tracker = _dropout_tracker(tracker_module, monkeypatch, published, clock)
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 1.0, ("heartbeat",))
+    tracker.step()
+    assert tracker._setpoints.stats.failed is False
+
+
+def test_recording_carries_the_stale_links_and_fatal_reason_in_setpoint_stats(tracker_module, monkeypatch):
+    published, clock = [], [0.0]
+    tracker = _dropout_tracker(tracker_module, monkeypatch, published, clock)
+    seen = []
+    tracker.telemetry = SimpleNamespace(step=lambda **kwargs: seen.append(kwargs))
+    tracker.recorder = None
+    _tick_at(tracker_module, monkeypatch, tracker, clock, 1.0, ("heartbeat", "telemetry"))
+    _ingest_estimate(tracker, 1.0)
+    tracker.step()
+    assert seen[-1]["setpoint_stats"]["stale_links"] == ["image"]
+    assert seen[-1]["setpoint_stats"]["fatal_reason"] is None

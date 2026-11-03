@@ -47,3 +47,15 @@ class CommsWatchdogs(object):
     def any_stale(self, now_s: float) -> Dict[str, bool]:
         """The subset of links that are currently stale, mapped to `True`."""
         return {name: True for name, watchdog in self._watchdogs.items() if watchdog.stale(now_s)}
+
+    def lost(self, now_s: float) -> Dict[str, bool]:
+        """The links that were alive at least once and have since gone stale.
+
+        Unlike `any_stale` this excludes a never-touched link (startup: nothing has
+        arrived yet), so it is the right trigger for a latching failure.
+        """
+        return {
+            name: True
+            for name, watchdog in self._watchdogs.items()
+            if watchdog.age(now_s) is not None and watchdog.stale(now_s)
+        }

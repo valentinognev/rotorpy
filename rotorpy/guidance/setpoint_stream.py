@@ -52,6 +52,8 @@ class SetpointStats:
     max_observation_age_s: Optional[float] = None
     expired_count: int = 0
     failed: bool = False
+    # Why the (one-way) fatal latch tripped; the first reason wins. `None` while not failed.
+    fatal_reason: Optional[str] = None
 
 
 class SetpointStream(object):
@@ -90,11 +92,19 @@ class SetpointStream(object):
         with self._lock:
             return dict(vars(self.stats))
 
-    def mark_fatal(self) -> None:
-        """A fatal failure stops the normal command even with a fresh observation."""
+    def mark_fatal(self, reason: Optional[str] = None) -> None:
+        """A fatal failure stops the normal command even with a fresh observation.
+
+        One-way by design (no un-set path): reserve it for failures where resuming on a
+        returning signal is not trustworthy. Recoverable staleness (for example a camera
+        dropout) is handled by command expiry instead. The first `reason` is kept in
+        `stats.fatal_reason` so telemetry shows why the latch tripped.
+        """
         with self._lock:
             self._fatal = True
             self.stats.failed = True
+            if self.stats.fatal_reason is None:
+                self.stats.fatal_reason = "unspecified" if reason is None else str(reason)
 
     def tick(self, now_s: Optional[float] = None) -> Optional[Any]:
         """Publish and return the right thing for this tick: command, failure response, or None."""

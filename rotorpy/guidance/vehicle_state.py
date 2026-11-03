@@ -18,6 +18,7 @@ Gazebo ground truth never enters this module: it is PX4 telemetry only.
 """
 
 import math
+import threading
 from dataclasses import dataclass
 from typing import Deque, Optional
 
@@ -143,11 +144,20 @@ class VehicleSample:
     height_above_ground_m: Optional[float]
     position_age_s: Optional[float]
     velocity_age_s: Optional[float]
-    discontinuity: Optional[str]
 
 
 class VehicleState(object):
-    """PX4 attitude and local-position telemetry, timestamp-aware, in the world frame."""
+    """PX4 attitude and local-position telemetry, timestamp-aware, in the world frame.
+
+    Thread-safe: the MAVLink-drain/step thread ingests and reads, while the independent
+    setpoint-publisher thread reads (`sample_at`). One lock serialises every mutation and
+    every snapshot, so a reader never sees a half-written position/velocity pair, a deque
+    mutated mid-interpolation, or an attitude history that `clear()` is emptying.
+
+    The clock-discontinuity flag has exactly one consumer: `take_discontinuity()`, called by
+    the step thread. `sample_at` never touches it, so a concurrent publisher-thread read
+    cannot swallow a discontinuity the step thread has yet to act on.
+    """
 
     def __init__(
         self,
@@ -164,59 +174,70 @@ class VehicleState(object):
         self._velocity_world_ned: Optional[np.ndarray] = None
         self._position_wall_s: Optional[float] = None
         self.last_discontinuity: Optional[str] = None
-        # Sticky until a `sample_at` call consumes it: several MAVLink messages can be
-        # drained (several `ingest_attitude` calls) in the same tick before the single
-        # `sample_at` call that reports it, and a later ingest with no discontinuity of
-        # its own must not silently erase an earlier one in the same drain.
+        # Sticky until `take_discontinuity()` consumes it: several MAVLink messages can be
+        # drained (several `ingest_attitude` calls) in the same tick before the step
+        # thread reports it, and a later ingest with no discontinuity of its own must not
+        # silently erase an earlier one in the same drain.
         self._pending_discontinuity: Optional[str] = None
+        self._lock = threading.Lock()
 
     def ingest_attitude(self, sim_s: float, wall_s: float, quat_estimator_xyzw) -> None:
         """Record one PX4 `ATTITUDE_QUATERNION`-style sample (estimator-frame, FRD body)."""
-        self.last_discontinuity = self._clock.update(sim_s, wall_s)
-        if self.last_discontinuity is not None:
-            self._pending_discontinuity = self.last_discontinuity
-            self._attitude_history.clear()
         world_quat = self._alignment.attitude_to_world(quat_estimator_xyzw)
-        self._attitude_history.record(sim_s, world_quat)
-        self._attitude_wall_s = float(wall_s)
+        with self._lock:
+            self.last_discontinuity = self._clock.update(sim_s, wall_s)
+            if self.last_discontinuity is not None:
+                self._pending_discontinuity = self.last_discontinuity
+                self._attitude_history.clear()
+            self._attitude_history.record(sim_s, world_quat)
+            self._attitude_wall_s = float(wall_s)
 
     def ingest_local_position(self, wall_s: float, position_estimator_ned, velocity_estimator_ned) -> None:
         """Record one PX4 `LOCAL_POSITION_NED`-style sample (estimator-local frame)."""
-        self._position_world_ned = self._alignment.estimator_to_world(position_estimator_ned)
-        self._velocity_world_ned = self._alignment.estimator_vector_to_world(velocity_estimator_ned)
-        self._position_wall_s = float(wall_s)
+        position = self._alignment.estimator_to_world(position_estimator_ned)
+        velocity = self._alignment.estimator_vector_to_world(velocity_estimator_ned)
+        with self._lock:
+            self._position_world_ned = position
+            self._velocity_world_ned = velocity
+            self._position_wall_s = float(wall_s)
+
+    def take_discontinuity(self) -> Optional[str]:
+        """Consume and return the pending clock discontinuity (`None` if there is none).
+
+        The one consumer of the flag, called by the step thread exactly once per tick to
+        reset guidance's own derivative history; a returned value is reported once.
+        """
+        with self._lock:
+            pending = self._pending_discontinuity
+            self._pending_discontinuity = None
+            return pending
 
     def sample_at(self, capture_sim_s: Optional[float], now_wall_s: float) -> VehicleSample:
         """The vehicle state for an image captured at `capture_sim_s` (or `None` for "now",
         i.e. no fresh image this tick: report the most recent attitude as-is).
 
-        Consumes (and clears) any pending clock discontinuity: the caller is expected to
-        act on `sample.discontinuity` (for example resetting guidance's own derivative
-        history) exactly once per report.
+        Side-effect free and safe to call from any thread; it does not consume the clock
+        discontinuity flag (see `take_discontinuity`).
         """
-        if capture_sim_s is not None:
-            quat, in_range = self._attitude_history.interpolate(capture_sim_s)
-        else:
-            quat = self._attitude_history.latest()
-            in_range = quat is not None
         now_wall_s = float(now_wall_s)
-        attitude_age = None if self._attitude_wall_s is None else max(0.0, now_wall_s - self._attitude_wall_s)
-        position_age = None if self._position_wall_s is None else max(0.0, now_wall_s - self._position_wall_s)
-        height = (
-            None
-            if self._position_world_ned is None
-            else self._alignment.height_above_ground_world(self._position_world_ned)
-        )
-        discontinuity = self._pending_discontinuity
-        self._pending_discontinuity = None
+        with self._lock:
+            if capture_sim_s is not None:
+                quat, in_range = self._attitude_history.interpolate(capture_sim_s)
+            else:
+                quat = self._attitude_history.latest()
+                in_range = quat is not None
+            attitude_age = None if self._attitude_wall_s is None else max(0.0, now_wall_s - self._attitude_wall_s)
+            position_age = None if self._position_wall_s is None else max(0.0, now_wall_s - self._position_wall_s)
+            position = None if self._position_world_ned is None else np.array(self._position_world_ned, copy=True)
+            velocity = None if self._velocity_world_ned is None else np.array(self._velocity_world_ned, copy=True)
+        height = None if position is None else self._alignment.height_above_ground_world(position)
         return VehicleSample(
             attitude_quat_world=quat,
             attitude_in_range=in_range,
             attitude_age_s=attitude_age,
-            position_ned=self._position_world_ned,
-            velocity_ned=self._velocity_world_ned,
+            position_ned=position,
+            velocity_ned=velocity,
             height_above_ground_m=height,
             position_age_s=position_age,
             velocity_age_s=position_age,
-            discontinuity=discontinuity,
         )

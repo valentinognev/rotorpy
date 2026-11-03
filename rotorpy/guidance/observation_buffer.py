@@ -9,6 +9,7 @@ was never read before being overwritten increments a drop counter so lost
 work is visible instead of silently accumulating latency.
 """
 
+import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -124,29 +125,36 @@ class CameraSlot(object):
     it was read. `dropped` counts observations that were overwritten before
     ever being taken as fresh, i.e. obsolete work that was discarded instead
     of queued.
+
+    Thread-safe: `offer` runs on a ROS subscriber thread and `take_fresh` on the step
+    thread; one lock makes each call atomic so no frame is lost or double-counted.
     """
 
     def __init__(self) -> None:
         self._observation: Optional[CameraObservation] = None
         self._fresh = False
+        self._lock = threading.Lock()
         self.dropped = 0
 
     def offer(self, capture_s: Optional[float], receipt_s: float, image: np.ndarray, encoding: str) -> None:
-        if self._fresh:
-            self.dropped += 1
-        self._observation = CameraObservation(
+        observation = CameraObservation(
             capture_s=None if capture_s is None else float(capture_s),
             receipt_s=float(receipt_s),
             image=image,
             encoding=encoding,
         )
-        self._fresh = True
+        with self._lock:
+            if self._fresh:
+                self.dropped += 1
+            self._observation = observation
+            self._fresh = True
 
     def take_fresh(self) -> Tuple[Optional[CameraObservation], bool]:
         """The latest observation, and whether it is being read fresh for the first time."""
-        was_fresh = self._fresh
-        self._fresh = False
-        return self._observation, was_fresh
+        with self._lock:
+            was_fresh = self._fresh
+            self._fresh = False
+            return self._observation, was_fresh
 
 
 class ObservationBuffer(object):

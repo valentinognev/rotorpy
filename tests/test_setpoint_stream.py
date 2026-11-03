@@ -63,7 +63,18 @@ def test_mark_fatal_stops_the_normal_command_even_with_a_fresh_observation():
     assert stream.stats.failed is True
 
 
+def test_mark_fatal_records_the_first_reason_in_stats_and_snapshot():
+    # The latch has no un-set path, so the reason it tripped must be visible afterwards.
+    stream = SetpointStream(publish=lambda c: None, expiry_s=10.0)
+    assert stream.stats_snapshot()["fatal_reason"] is None
+    stream.mark_fatal("watchdog_lost:telemetry")
+    stream.mark_fatal("step_exception: boom")
+    assert stream.stats.fatal_reason == "watchdog_lost:telemetry"
+    assert stream.stats_snapshot()["fatal_reason"] == "watchdog_lost:telemetry"
+
+
 def test_stats_track_publish_intervals():
+
     sent = []
     stream = SetpointStream(publish=sent.append, expiry_s=10.0)
     stream.set_command("v1", observation_wall_s=0.0)

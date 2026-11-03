@@ -55,3 +55,15 @@ def test_comms_watchdogs_unknown_link_raises_key_error():
         assert False, "expected KeyError"
     except KeyError:
         pass
+
+
+def test_lost_reports_only_links_that_were_seen_and_then_went_quiet():
+    # `any_stale` also reports a never-touched link (nothing to be fresh about yet); `lost`
+    # is for "was alive, now silent", the condition a latching failure should key on.
+    watchdogs = CommsWatchdogs({"heartbeat": 1.0, "telemetry": 0.5, "image": 1.0})
+    watchdogs.touch("heartbeat", now_s=0.0)
+    watchdogs.touch("telemetry", now_s=0.0)
+    assert watchdogs.any_stale(now_s=0.2) == {"image": True}
+    assert watchdogs.lost(now_s=0.2) == {}
+    assert watchdogs.lost(now_s=0.7) == {"telemetry": True}
+    assert watchdogs.lost(now_s=2.0) == {"heartbeat": True, "telemetry": True}

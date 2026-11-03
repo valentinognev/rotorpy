@@ -72,6 +72,9 @@ _POSITION_IGNORE = (
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
 )
+# Comms links whose loss latches the setpoint stream fatal. The image link is excluded on
+# purpose: camera dropouts are recoverable and handled by command expiry.
+_FATAL_WATCHDOG_LINKS = ("heartbeat", "telemetry")
 _MAVLINK_POLL_TYPES = ("HEARTBEAT", "STATUSTEXT", "ATTITUDE_QUATERNION", "LOCAL_POSITION_NED")
 
 
@@ -252,12 +255,16 @@ class CameraHomingTracker(object):
         wall_now = time.monotonic()
         self._poll_mavlink()
         self._offboard = self._flight_state()
-        # A comms link that is stale (heartbeat, telemetry or image) means this tracker
-        # cannot trust what it would otherwise command: stop the normal setpoint stream
-        # the same way a fatal failure would, rather than silently continuing to hold
-        # whatever was last commanded forever.
-        if self._watchdogs.any_stale(wall_now):
-            self._setpoints.mark_fatal()
+        # Every stale link is reported in telemetry (`stale_links`), but only a *lost*
+        # telemetry/heartbeat link (alive once, now silent) is fatal: the stream stops and
+        # stays stopped (decision, proposed default: a PX4 link blip is fatal-forever; the
+        # reason is recorded in the stats). The image watchdog is deliberately not fatal --
+        # a camera dropout self-heals through command expiry and resumes on the next
+        # fresh frame. A never-seen link is startup, not loss.
+        self._stale_links = sorted(self._watchdogs.any_stale(wall_now))
+        lost_fatal = sorted(name for name in self._watchdogs.lost(wall_now) if name in _FATAL_WATCHDOG_LINKS)
+        if lost_fatal:
+            self._setpoints.mark_fatal("watchdog_lost:" + ",".join(lost_fatal))
         forward_obs, forward_fresh = self._observations.take_fresh("forward")
         upward_obs, upward_fresh = self._observations.take_fresh("upward")
         fresh = forward_fresh or upward_fresh
@@ -267,7 +274,9 @@ class CameraHomingTracker(object):
         elif upward_fresh and upward_obs is not None:
             capture_sim_s = upward_obs.capture_s
         sample = self._vehicle_state.sample_at(capture_sim_s, wall_now)
-        if sample.discontinuity is not None:
+        # Only this step thread consumes the discontinuity (the publisher thread's own
+        # `sample_at` calls cannot swallow it).
+        if self._vehicle_state.take_discontinuity() is not None:
             # The sim clock reset/jumped/paused: the previous sightline/timestamp the
             # guidance law holds is no longer meaningfully adjacent in time to the next
             # one it will see.
@@ -417,7 +426,9 @@ class CameraHomingTracker(object):
                 state="HOMING" if self._startup_done else "STARTUP",
                 px4_mode=None if self._hb_mode is None else str(self._hb_mode),
                 camera=command.source,
-                setpoint_stats=self._setpoints.stats_snapshot(),
+                setpoint_stats=dict(
+                    self._setpoints.stats_snapshot(), stale_links=list(getattr(self, "_stale_links", ()))
+                ),
             )
         except Exception as exc:
             print("telemetry step failed: {}".format(exc), file=sys.stderr, flush=True)
@@ -565,10 +576,10 @@ class CameraHomingTracker(object):
     def shutdown(self):
         self._recording.close(timeout=5.0)
 
-    def mark_fatal(self):
-        """A fatal `step()` failure stops the normal setpoint command, same as an expired
-        or watchdog-stale one, instead of streaming whatever was last held forever."""
-        self._setpoints.mark_fatal()
+    def mark_fatal(self, reason=None):
+        """A fatal `step()` failure stops the normal setpoint command (one-way latch)
+        instead of streaming whatever was last held forever."""
+        self._setpoints.mark_fatal(reason)
 
 
 def _stamp_seconds(msg):
@@ -601,7 +612,7 @@ def main():
                 note(exc)
             mark_fatal = getattr(tracker, "mark_fatal", None)
             if mark_fatal is not None:
-                mark_fatal()
+                mark_fatal("step_exception: {}".format(exc))
             rate.sleep()
             continue
         if status is not None:

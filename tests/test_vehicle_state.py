@@ -1,5 +1,9 @@
 """Clock model, attitude history interpolation and PX4-telemetry-driven vehicle state."""
 
+import sys
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -204,10 +208,10 @@ def test_vehicle_state_clock_discontinuity_clears_attitude_history():
     sample = state.sample_at(capture_sim_s=10.0, now_wall_s=10.05)
     # The sim_s=10.0 sample from before the discontinuity is gone.
     assert sample.attitude_in_range is False
-    assert sample.discontinuity == "backward_jump"
+    assert state.take_discontinuity() == "backward_jump"
 
 
-def test_sample_discontinuity_is_sticky_until_consumed_by_sample_at():
+def test_discontinuity_is_sticky_until_taken():
     # Several MAVLink messages are drained (several `ingest_attitude` calls) before the
     # tracker's single `sample_at` call for that tick: a discontinuity flagged by an
     # earlier ingest in the same drain must not be overwritten back to `None` by a later
@@ -219,9 +223,90 @@ def test_sample_discontinuity_is_sticky_until_consumed_by_sample_at():
     # A second, unrelated ingest in the same drain reports no discontinuity of its own...
     state.ingest_attitude(sim_s=1.01, wall_s=10.06, quat_estimator_xyzw=_yaw_quat(np.deg2rad(11.0)))
     assert state.last_discontinuity is None
-    # ...but the pending discontinuity from the first ingest must still reach `sample_at`.
-    sample = state.sample_at(capture_sim_s=1.01, now_wall_s=10.06)
-    assert sample.discontinuity == "backward_jump"
-    # Consumed: the next `sample_at` call reports no (new) discontinuity.
-    sample_again = state.sample_at(capture_sim_s=1.01, now_wall_s=10.06)
-    assert sample_again.discontinuity is None
+    # ...but the pending discontinuity from the first ingest must still reach its consumer.
+    assert state.take_discontinuity() == "backward_jump"
+    # Consumed: the next `take_discontinuity` call reports no (new) discontinuity.
+    assert state.take_discontinuity() is None
+
+
+# --- discontinuity consumption + thread safety (fix round 2) --------------------------
+
+
+def _discontinuous_state():
+    state = VehicleState(_alignment(), clock_backward_jump_s=0.05, clock_pause_wall_s=0.5)
+    state.ingest_attitude(sim_s=10.0, wall_s=10.0, quat_estimator_xyzw=_yaw_quat(0.0))
+    state.ingest_attitude(sim_s=1.0, wall_s=10.05, quat_estimator_xyzw=_yaw_quat(0.0))
+    return state
+
+
+def test_sample_at_is_side_effect_free_for_the_discontinuity_flag():
+    # The publisher thread calls `sample_at` too; it must never consume the flag the
+    # step thread has yet to observe.
+    state = _discontinuous_state()
+    for _ in range(3):
+        state.sample_at(capture_sim_s=None, now_wall_s=10.06)
+    assert state.take_discontinuity() == "backward_jump"
+    assert state.take_discontinuity() is None
+
+
+def test_concurrent_sample_at_cannot_swallow_the_discontinuity():
+    state = _discontinuous_state()
+    stop = threading.Event()
+    started = threading.Event()
+
+    def publisher():
+        started.set()
+        while not stop.is_set():
+            state.sample_at(capture_sim_s=None, now_wall_s=10.06)
+
+    thread = threading.Thread(target=publisher)
+    thread.start()
+    started.wait()
+    time.sleep(0.05)
+    try:
+        assert state.take_discontinuity() == "backward_jump"
+    finally:
+        stop.set()
+        thread.join()
+
+
+def test_vehicle_state_reads_are_consistent_under_concurrent_ingest():
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    state = VehicleState(_alignment(), clock_backward_jump_s=0.05, clock_pause_wall_s=0.5)
+    errors = []
+    done = threading.Event()
+
+    def writer():
+        try:
+            for k in range(1500):
+                # A periodic backward jump clears the history while the reader interpolates.
+                state.ingest_attitude(sim_s=float(k % 40) * 0.01, wall_s=k * 0.001,
+                                      quat_estimator_xyzw=_yaw_quat(0.1))
+                state.ingest_local_position(
+                    wall_s=k * 0.001, position_estimator_ned=[k, k, k], velocity_estimator_ned=[k, k, k]
+                )
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+        finally:
+            done.set()
+
+    def reader(capture):
+        try:
+            while not done.is_set():
+                sample = state.sample_at(capture_sim_s=capture, now_wall_s=5.0)
+                if sample.position_ned is not None:
+                    # Position and velocity are written together: a torn read mixes ticks.
+                    assert sample.position_ned[0] + 0.0 == sample.velocity_ned[0] + 0.0
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer)] + [threading.Thread(target=reader, args=(c,)) for c in (0.05, None)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        sys.setswitchinterval(old_interval)
+    assert errors == []
