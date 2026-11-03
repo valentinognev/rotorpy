@@ -744,8 +744,26 @@ class HomingGuidance(object):
                     "target_motion_unavailable:" + (target_motion_now.reason or target_motion_now.status.value)
                 )
             requested_velocity = max_feasible_velocity(aim_point, self._envelope.max_speed_m_s)
+            # Fix round 1 (coherent single command path): the acceleration REQUEST
+            # must describe the same motion as the velocity request above, not an
+            # independently-derived PN sightline-rotation-rate quantity (`accel`,
+            # still computed above for the legacy path) that can disagree in sign and
+            # magnitude with the actual commanded velocity trend -- reviewer-verified
+            # via the moving-target estimator (OBSERVABLE) case. It is instead the
+            # finite-difference slew this tick's velocity request would imply,
+            # relative to the previously TRANSMITTED (already-limited) velocity; it
+            # still goes through `limit_command`'s own jerk/accel-magnitude continuity
+            # below like any other request, so the returned `acceleration_ned` stays a
+            # bounded, continuous command, just one that is actually consistent with
+            # `velocity_ned`'s own tick-to-tick change (see
+            # `tests/test_homing_vehicle_envelope.py`'s
+            # `test_acceleration_ned_is_consistent_with_the_transmitted_velocity_command`).
+            if dt > 0.0:
+                requested_acceleration = (requested_velocity - self._velocity_ned) / dt
+            else:
+                requested_acceleration = np.zeros(3)
             limited = limit_command(
-                requested_velocity, accel, new_yaw,
+                requested_velocity, requested_acceleration, new_yaw,
                 self._velocity_ned, self._acceleration_ned, self._yaw_rad,
                 dt, self._envelope,
                 center_px=center, image_width_px=self.intrinsics.get("width"),

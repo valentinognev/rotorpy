@@ -57,6 +57,15 @@
   (9), `tests/test_homing_config_vehicle_envelope.py` (3), `tests/test_px4_characterization.py`
   (8), plus additions to `tests/test_homing_speed.py`, `tests/test_homing_navigation.py`,
   and `tests/test_gazebo_homing_startup.py` (mask toggling).
+- Fix round 1 (review findings): `command_limits.limit_command`'s visibility-margin
+  speed/yaw-rate reduction is now a soft cap approached through the continuity/accel
+  step bound (never an instantaneous clamp like the absolute vehicle-envelope hard
+  caps), fixing an up-to-~40x one-tick velocity jump when the tracked pixel jitters
+  toward the image edge; `HomingGuidance._steer`'s mounts-path `acceleration_ned` is
+  now the finite-difference slew of the transmitted velocity request (coherent with
+  `velocity_ned`) instead of an independently-derived PN sightline-rotation-rate
+  quantity that could disagree in sign/magnitude. See `task-7-report.md`'s "Fix round
+  1" section for RED/GREEN evidence.
 
 ## 4.9.0 - Target-motion estimation (plan Phase 6)
 - New `rotorpy/guidance/target_estimator.py`: a pure, unit-tested `TargetMotionEstimator`

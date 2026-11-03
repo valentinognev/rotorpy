@@ -5,12 +5,25 @@
 yaw are bounded before leaving `HomingGuidance`: total speed (norm, not per-component --
 a maximum-feasible-speed objective inside the vehicle envelope), vertical rate, raw
 acceleration magnitude, commanded-acceleration (continuity) and commanded-jerk steps
-per tick, yaw rate, and a visibility margin that scales the speed cap down as the
-tracked target nears the image edge (speed/turn authority is reduced to protect the
-observation, never to produce a terminal hover or distance-based stop). Every bound
-that actually did something appends a named reason, so a caller's telemetry can record
-why a command differs from what guidance originally asked for (T1 telemetry schema's
-`requested_setpoint`/`limited_setpoint`/`limiting_reasons`).
+per tick, yaw rate, and a visibility margin that scales the speed/yaw-rate cap down as
+the tracked target nears the image edge (speed/turn authority is reduced to protect
+the observation, never to produce a terminal hover or distance-based stop). Every
+bound that actually did something appends a named reason, so a caller's telemetry can
+record why a command differs from what guidance originally asked for (T1 telemetry
+schema's `requested_setpoint`/`limited_setpoint`/`limiting_reasons`).
+
+Two different kinds of cap are deliberately treated differently (fix round 1): the
+vehicle-envelope hard caps (the absolute, non-visibility-scaled total-speed/vertical-
+rate/acceleration-magnitude limits, plus rejecting non-finite input) are a true safety
+net and may be applied instantaneously, because they are constant from tick to tick --
+clamping to them after continuity can only ever understep a *bounded* amount (at most
+one tick's own accel/jerk step). The visibility-margin speed/yaw-rate reduction is
+different: it can tighten or loosen *between* ticks as the tracked pixel moves (for
+example jitters toward the image edge), so clamping to it directly, after continuity,
+can make the output jump by far more than one tick's accel/jerk step the instant the
+cap tightens. It is therefore applied as a SOFT target the continuity step bound
+approaches (speed may only decrease at the allowed deceleration rate when visibility
+tightens), never as an instantaneous clamp -- see the ordering inside `limit_command`.
 
 Non-finite input (NaN/inf anywhere in the request, or a non-finite `dt`) is rejected
 outright rather than silently propagated: the whole call falls back to the previous
@@ -136,21 +149,42 @@ def limit_command(
     # a hard turn cannot itself be the thing that loses the target off-frame.
     scale, visibility_reason = visibility_speed_scale(center_px, image_width_px, image_height_px, envelope)
 
-    # Continuity/jerk/yaw-rate bound how far the command may move from the previous
-    # (already-hard-capped) one THIS tick; the absolute envelope/vertical/accel-
-    # magnitude caps are applied last, as the final safety net, so the returned
-    # command always satisfies them even if that means it understeps the continuity
-    # bound (for example right after a visibility-margin cap shrinks the speed cap
-    # below what continuity alone would have allowed).
+    # Fix round 1 (ordering): establish the SPEED TARGET -- what this tick would
+    # ideally command, if it could move instantly -- before continuity, not after.
+    # The absolute envelope cap (constant tick to tick) is applied first; the
+    # visibility-margin cap (which can tighten or loosen between ticks) is applied
+    # second, as a further reduction of that same target. Continuity then bounds how
+    # far the *previous* command may move toward this target THIS tick, so a
+    # visibility cap that suddenly tightens can only reduce the output at the
+    # allowed deceleration rate, never instantaneously -- only the absolute envelope
+    # portion of the cap is ever applied as an instantaneous clamp (it cannot itself
+    # cause an unbounded tick-to-tick jump, since it never changes between ticks).
+    absolute_max_speed = float(envelope.max_speed_m_s)
+    target_velocity = velocity
+    target_speed = float(np.linalg.norm(target_velocity))
+    if target_speed > absolute_max_speed:
+        ratio = absolute_max_speed / target_speed if target_speed > 0.0 else 1.0
+        target_velocity = target_velocity * ratio
+        target_speed = absolute_max_speed
+        reasons.append("speed_envelope")
+    visibility_max_speed = absolute_max_speed * scale
+    if target_speed > visibility_max_speed:
+        ratio = visibility_max_speed / target_speed if target_speed > 0.0 else 1.0
+        target_velocity = target_velocity * ratio
+
     have_continuity = dt is not None and float(dt) > 0.0
     if have_continuity and previous_velocity_ned is not None:
         previous_velocity = np.array(previous_velocity_ned, dtype=float)
-        step = velocity - previous_velocity
+        step = target_velocity - previous_velocity
         step_mag = float(np.linalg.norm(step))
         max_step = float(envelope.max_accel_m_s2) * float(dt)
         if step_mag > max_step:
             velocity = previous_velocity + (step * (max_step / step_mag) if step_mag > 0.0 else step)
             reasons.append("accel_continuity")
+        else:
+            velocity = target_velocity
+    else:
+        velocity = target_velocity
 
     if have_continuity and previous_acceleration_ned is not None:
         previous_acceleration = np.array(previous_acceleration_ned, dtype=float)
@@ -175,12 +209,21 @@ def limit_command(
     if visibility_reason is not None and visibility_reason not in reasons:
         reasons.append(visibility_reason)
 
-    max_speed = float(envelope.max_speed_m_s) * scale
+    # Final safety net: the ABSOLUTE (never visibility-scaled) speed envelope. This is
+    # a true vehicle-envelope hard cap -- constant tick to tick -- so applying it here,
+    # after continuity, can only ever understep continuity by a bounded amount (the
+    # visibility-margin reduction above was already approached gradually, through
+    # continuity, instead of relying on this clamp).
     speed = float(np.linalg.norm(velocity))
-    if speed > max_speed:
-        velocity = velocity * (max_speed / speed) if speed > 0.0 else velocity
-        reasons.append("speed_envelope")
+    if speed > absolute_max_speed:
+        velocity = velocity * (absolute_max_speed / speed) if speed > 0.0 else velocity
+        if "speed_envelope" not in reasons:
+            reasons.append("speed_envelope")
 
+    # NED convention: `velocity[2]` is positive DOWN (descending) and negative UP
+    # (climbing); `max_vertical_speed_m_s` bounds the magnitude symmetrically in both
+    # directions, not just one -- the clamp can change the sign of `velocity[2]` only
+    # if the request itself did (it never flips a valid-sign request).
     max_vertical = float(envelope.max_vertical_speed_m_s)
     if abs(velocity[2]) > max_vertical:
         velocity[2] = float(np.clip(velocity[2], -max_vertical, max_vertical))

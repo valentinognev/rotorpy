@@ -100,7 +100,17 @@ def test_replay_flags_a_different_guidance_as_a_mismatch(tmp_path):
 
     def other_guidance(config):
         changed = dict(config)
-        changed["nav_constant"] = float(config["nav_constant"]) + 3.0
+        # Fix round 1: `nav_constant` alone no longer reliably changes this short
+        # scripted scenario's output (Finding 2's fix makes `acceleration_ned`
+        # coherent with the transmitted velocity instead of an independently PN-
+        # derived quantity that always varied with `nav_constant`; `nav_constant`
+        # itself only changes the *velocity* command once the target-motion
+        # estimator reaches `OBSERVABLE`, which this short scenario never reaches --
+        # see `tests/test_homing_vehicle_envelope.py`'s own dedicated PN-lead test
+        # for that case instead). `initial_speed_m_s` changes the pre-lock course
+        # velocity directly, independent of target-motion observability, so it still
+        # reliably demonstrates replay's mismatch detection here.
+        changed["initial_speed_m_s"] = float(config["initial_speed_m_s"]) + 5.0
         return guidance_from_config(changed)
 
     result = replay_run(log.path, guidance_factory=other_guidance)

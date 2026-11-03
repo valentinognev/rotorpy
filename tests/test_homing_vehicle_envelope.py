@@ -201,6 +201,78 @@ def test_pn_lead_integration_changes_the_transmitted_velocity_with_nav_constant(
     assert not np.allclose(low.requested_velocity_ned, high.requested_velocity_ned)
 
 
+def test_acceleration_ned_is_consistent_with_the_transmitted_velocity_command(config):
+    """Reviewer finding (fix round 1): `acceleration_ned` must describe the SAME
+    motion as the transmitted `velocity_ned` (no double counting), not an
+    independently-derived PN sightline-rotation-rate quantity that can disagree in
+    sign/magnitude with the actual commanded velocity trend. Reproduces the
+    reviewer-verified scenario: a genuinely moving target once the Task 6 estimator
+    reaches OBSERVABLE (same priming pattern as the PN-lead test above), asserting
+    `acceleration_ned` tracks `d(velocity_ned)/dt` (magnitude within tolerance, and
+    matching sign on every axis with non-negligible motion) across two consecutive
+    ticks, and that the navigation constant still changes the transmitted command
+    (unaffected by this fix).
+    """
+    relative_initial = np.array([40.0, 10.0, 15.0])
+    true_velocity = np.array([2.0, -1.0, 0.0])
+    dt = 0.1
+
+    guidance = guidance_from_config(config)
+    cx, cy = _image_center(guidance)
+    relative = relative_initial.copy()
+    t = 0.0
+    for _ in range(60):
+        relative = relative + true_velocity * dt
+        guidance._estimator.update(
+            t=t, vehicle_velocity_ned=np.zeros(3), ray_origin_ned=np.zeros(3),
+            ray_direction_ned=relative / np.linalg.norm(relative), height_m=15.0, reference_height_m=0.0,
+            fx=guidance.intrinsics["fx"], fy=guidance.intrinsics["fy"], uncertainty_px=1.0,
+        )
+        t += dt
+    _prime_for_direct_steer(guidance, np.zeros(3), t)
+    sightline = relative / np.linalg.norm(relative)
+    first = guidance._steer(t, IDENTITY, np.zeros(3), "forward", np.array([cx, cy]), 10.0, sightline, relative)
+    assert first.target_motion.status is TargetMotionStatus.OBSERVABLE
+
+    relative = relative + true_velocity * dt
+    t += dt
+    _prime_for_direct_steer(guidance, np.zeros(3), t)
+    sightline = relative / np.linalg.norm(relative)
+    second = guidance._steer(t, IDENTITY, np.zeros(3), "forward", np.array([cx, cy]), 10.0, sightline, relative)
+
+    finite_difference = (second.velocity_ned - first.velocity_ned) / dt
+    assert np.allclose(second.acceleration_ned, finite_difference, atol=0.5)
+    significant = np.abs(finite_difference) > 0.05
+    if np.any(significant):
+        assert np.all(np.sign(second.acceleration_ned[significant]) == np.sign(finite_difference[significant]))
+
+    # Unaffected by this fix: changing the navigation constant still changes the
+    # transmitted command (plan Phase 7's own acceptance test, re-asserted here).
+    guidance_low = guidance_from_config(config)
+    guidance_low.nav_constant = 2.0
+    guidance_high = guidance_from_config(config)
+    guidance_high.nav_constant = 5.0
+    for g in (guidance_low, guidance_high):
+        relative_g = relative_initial.copy()
+        tg = 0.0
+        for _ in range(60):
+            relative_g = relative_g + true_velocity * dt
+            g._estimator.update(
+                t=tg, vehicle_velocity_ned=np.zeros(3), ray_origin_ned=np.zeros(3),
+                ray_direction_ned=relative_g / np.linalg.norm(relative_g), height_m=15.0, reference_height_m=0.0,
+                fx=g.intrinsics["fx"], fy=g.intrinsics["fy"], uncertainty_px=1.0,
+            )
+            tg += dt
+        _prime_for_direct_steer(g, np.zeros(3), tg)
+        sightline_g = relative_g / np.linalg.norm(relative_g)
+        g._last_command = g._steer(
+            tg, IDENTITY, np.zeros(3), "forward", np.array([cx, cy]), 10.0, sightline_g, relative_g
+        )
+    assert not np.allclose(
+        guidance_low._last_command.requested_velocity_ned, guidance_high._last_command.requested_velocity_ned
+    )
+
+
 def _solid_blob(width, height, column, row, half=6):
     image = np.zeros((height, width, 3), dtype=np.float32)
     r, c = int(round(row)), int(round(column))

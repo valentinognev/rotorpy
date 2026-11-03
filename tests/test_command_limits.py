@@ -158,16 +158,51 @@ def test_visibility_margin_scales_speed_down_near_the_image_edge():
 
 
 def test_visibility_margin_feeds_into_limit_command_speed_cap():
+    """On a first tick (no previous command to be continuous with -- see the fix
+    round 1 ordering note on `limit_command` itself), the visibility-reduced speed
+    cap is applied directly, same as the absolute envelope. Fix round 1: once a
+    *previous* command exists, this same visibility reduction is instead approached
+    gradually through continuity -- see
+    `test_visibility_cap_tightening_between_ticks_respects_the_step_bound`, which
+    reproduces exactly this request/previous/dt combination and asserts the opposite
+    (bounded, not instantaneous) outcome.
+    """
     velocity = np.array([ENVELOPE.max_speed_m_s, 0.0, 0.0])
     result = limit_command(
         velocity, np.zeros(3), 0.0,
-        previous_velocity_ned=velocity, previous_acceleration_ned=np.zeros(3), previous_yaw_rad=0.0,
-        dt=0.05, envelope=ENVELOPE,
+        previous_velocity_ned=None, previous_acceleration_ned=None, previous_yaw_rad=None,
+        dt=0.0, envelope=ENVELOPE,
         center_px=(2.0, 120.0), image_width_px=320, image_height_px=240,
     )
     assert np.linalg.norm(result.velocity_ned) < ENVELOPE.max_speed_m_s
     assert "visibility_margin" in result.reasons
-    assert "speed_envelope" in result.reasons
+    assert "accel_continuity" not in result.reasons
+
+
+def test_visibility_cap_tightening_between_ticks_respects_the_step_bound():
+    """Reviewer finding (fix round 1): the visibility-derived speed cap is a SOFT
+    cap -- it may only be approached through the continuity/accel step bound, never
+    applied as an instantaneous clamp. Reproduces the reported scenario verbatim:
+    previous velocity already at the (centered) 15 m/s speed cap, same-direction
+    request, and the tracked pixel jumps from the frame centre to near the image
+    edge in one 0.05 s tick. The visibility-scaled cap drops from 15 m/s to ~5.2 m/s
+    (a ~9.8 m/s gap), but the output velocity must still only change by at most
+    `max_accel_m_s2 * dt` (0.25 m/s here), not jump to meet the tightened cap in one
+    tick. Only an absolute vehicle-envelope hard cap (never the visibility margin)
+    may be instantaneous.
+    """
+    width, height = 320, 240
+    previous = np.array([ENVELOPE.max_speed_m_s, 0.0, 0.0])
+    dt = 0.05
+    result = limit_command(
+        previous, np.zeros(3), 0.0,
+        previous_velocity_ned=previous, previous_acceleration_ned=np.zeros(3), previous_yaw_rad=0.0,
+        dt=dt, envelope=ENVELOPE,
+        center_px=(2.0, height / 2.0), image_width_px=width, image_height_px=height,
+    )
+    step = np.linalg.norm(result.velocity_ned - previous)
+    assert step <= ENVELOPE.max_accel_m_s2 * dt + 1e-6
+    assert "visibility_margin" in result.reasons
 
 
 def test_visibility_margin_also_scales_down_the_yaw_rate_cap_not_only_speed():
@@ -188,19 +223,26 @@ def test_visibility_margin_also_scales_down_the_yaw_rate_cap_not_only_speed():
 
 
 def test_property_random_requests_stay_finite_and_within_envelope_and_continuity():
+    """Fix round 1: this property test previously never varied `center_px`, so it
+    never exercised a visibility cap tightening or loosening between consecutive
+    ticks (the exact scenario the ordering bug needed) -- every tick now also gets a
+    random tracked-pixel position (including sometimes no pixel at all)."""
     rng = _rng()
     previous_velocity = np.zeros(3)
     previous_acceleration = np.zeros(3)
     previous_yaw = 0.0
     dt = 0.05
+    width, height = 320.0, 240.0
     for _ in range(200):
         requested_velocity = rng.uniform(-200.0, 200.0, size=3)
         requested_acceleration = rng.uniform(-200.0, 200.0, size=3)
         requested_yaw = rng.uniform(-100.0, 100.0)
+        center_px = None if rng.uniform() < 0.1 else (rng.uniform(0.0, width), rng.uniform(0.0, height))
         result = limit_command(
             requested_velocity, requested_acceleration, requested_yaw,
             previous_velocity_ned=previous_velocity, previous_acceleration_ned=previous_acceleration,
             previous_yaw_rad=previous_yaw, dt=dt, envelope=ENVELOPE,
+            center_px=center_px, image_width_px=width, image_height_px=height,
         )
         assert np.all(np.isfinite(result.velocity_ned))
         assert np.all(np.isfinite(result.acceleration_ned))
