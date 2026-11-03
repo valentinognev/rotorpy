@@ -110,6 +110,33 @@ def detection_fields_from_command(command: Any) -> Dict[str, Any]:
     return {"candidates": candidates, "selected": selected, "confidence": confidence}
 
 
+def target_motion_fields_from_command(command: Any) -> Dict[str, Any]:
+    """`target_motion` `TickRecord` field from a `HomingCommand`'s
+    `target_estimator.TargetMotionEstimate` (`command.target_motion`).
+
+    `{}` when the command carries none (the legacy no-mounts path, which never builds
+    an estimator, or any caller that never set `target_motion`): the tick's
+    `TickRecord` then keeps its unpopulated `None` default instead of fabricating
+    placeholder motion data. `status != "observable"` means guidance has already
+    fallen back to its existing bearing-only/pure-pursuit steering for this tick --
+    the `reason` field records why.
+    """
+    estimate = getattr(command, "target_motion", None)
+    if estimate is None:
+        return {}
+    return {"target_motion": _jsonable({
+        "status": estimate.status,
+        "reason": estimate.reason,
+        "relative_position_ned": estimate.relative_position_ned,
+        "relative_velocity_ned": estimate.relative_velocity_ned,
+        "target_velocity_ned": estimate.target_velocity_ned,
+        "closing_speed_m_s": estimate.closing_speed_m_s,
+        "position_sigma_m": estimate.position_sigma_m,
+        "velocity_sigma_m_s": estimate.velocity_sigma_m_s,
+        "age_s": estimate.age_s,
+    })}
+
+
 @dataclass
 class RunMetadata:
     """What a run was: configuration, firmware, effective parameters, rendering, timing."""

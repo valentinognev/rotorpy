@@ -50,6 +50,43 @@ PROPOSED_MAX_PREDICTION_GAP_S = 2.0
 PROPOSED_MAX_TRACK_UNCERTAINTY_PX = 150.0
 
 
+# Proposed, not verified: `target_estimator.TargetMotionEstimator`'s bounded ground-
+# target-motion envelope and filter thresholds (plan Phase 6). The envelope is ground
+# motion only (a standing/moving ground target, not an aerial one): 5 m/s is a brisk
+# walk/jog, 2 m/s^2 a generous acceleration for a person or small ground vehicle. An
+# estimate whose implied speed exceeds this is flagged UNCERTAIN rather than trusted,
+# the same way age or position uncertainty are. The outlier chi-squared threshold is
+# the standard 2-degrees-of-freedom 99% value. `max_age_s`/`max_position_sigma_m`
+# bound how long a gap or how poor a fix may be before the estimate is no longer
+# treated as exact. `clipped_inflation`/`low_confidence_inflation`/`confidence_floor`
+# further inflate the per-tick measurement covariance for a clipped or low-confidence
+# detection (see `pixels.TargetObservation`), on top of the geometric (near-horizon)
+# inflation the estimator already derives from the ray Jacobian.
+PROPOSED_MAX_TARGET_SPEED_M_S = 5.0
+PROPOSED_MAX_TARGET_ACCEL_M_S2 = 2.0
+PROPOSED_TARGET_OUTLIER_CHI2_THRESHOLD = 9.21
+PROPOSED_MAX_TARGET_AGE_S = 1.0
+PROPOSED_MAX_TARGET_POSITION_SIGMA_M = 5.0
+PROPOSED_TARGET_CLIPPED_INFLATION = 3.0
+PROPOSED_TARGET_LOW_CONFIDENCE_INFLATION = 2.0
+PROPOSED_TARGET_CONFIDENCE_FLOOR = 0.2
+
+
+def target_motion_thresholds() -> dict:
+    """Named target-motion-estimator thresholds, for
+    `target_estimator.TargetMotionEstimator(**target_motion_thresholds())`."""
+    return {
+        "max_speed_m_s": PROPOSED_MAX_TARGET_SPEED_M_S,
+        "max_accel_m_s2": PROPOSED_MAX_TARGET_ACCEL_M_S2,
+        "outlier_chi2_threshold": PROPOSED_TARGET_OUTLIER_CHI2_THRESHOLD,
+        "max_age_s": PROPOSED_MAX_TARGET_AGE_S,
+        "max_position_sigma_m": PROPOSED_MAX_TARGET_POSITION_SIGMA_M,
+        "clipped_inflation": PROPOSED_TARGET_CLIPPED_INFLATION,
+        "low_confidence_inflation": PROPOSED_TARGET_LOW_CONFIDENCE_INFLATION,
+        "confidence_floor": PROPOSED_TARGET_CONFIDENCE_FLOOR,
+    }
+
+
 def tracking_thresholds() -> dict:
     """Named tracking-state-machine thresholds, for
     `HomingGuidance(..., **tracking_thresholds())`."""
@@ -240,4 +277,5 @@ def guidance_from_config(config: dict) -> HomingGuidance:
         target_reference_height_m=gazebo_target_reference(config).reference_height_m,
         min_course_speed_m_s=PROPOSED_MIN_COURSE_SPEED_M_S,
         **tracking_thresholds(),
+        **target_motion_thresholds(),
     )

@@ -1,5 +1,62 @@
 # Updates
 
+## 4.9.0 - Target-motion estimation (plan Phase 6)
+- New `rotorpy/guidance/target_estimator.py`: a pure, unit-tested `TargetMotionEstimator`
+  -- a timestamped constant-velocity Kalman filter over a ground target's own
+  north/east velocity, with explicit covariance and Mahalanobis outlier rejection.
+  State is `[relative_n, relative_e, target_vn, target_ve]`; the known vehicle
+  velocity at each tick enters the predict step as an exact control input (not
+  noise), so a stationary target's relative-position drift from the drone's own
+  turning/accelerating is fully attributed to the drone and leaves the estimated
+  target velocity at zero (`tests/test_target_estimator.py::test_stationary_target_does_not_acquire_false_motion_during_a_drone_turn`).
+  The down component of the relative position is never filtered -- it is already
+  deterministic from the vehicle's own height each tick (Task-2 ground-plane/
+  target-reference geometry) -- so only the horizontal state is a Kalman estimate.
+- Pixel uncertainty (`pixels.TargetObservation.uncertainty_px`) becomes a ground-
+  plane measurement covariance via a numeric ray-perturbation Jacobian (perturb the
+  camera ray by the pixel-derived angular sigma along two tangent axes, recompute
+  `sightline.reference_relative_position`): this naturally inflates uncertainty near
+  the horizon (small angle -> large ground displacement) and flags a ray whose
+  perturbation leaves the plane entirely as ill-conditioned/`UNOBSERVABLE`, rather
+  than reporting an exact position. `clipped`/low-`confidence` detections further
+  inflate that covariance. A Mahalanobis gate (chi-squared, 2 dof) rejects an
+  inconsistent jump instead of absorbing it into the filter. All numeric inputs
+  (time, vehicle velocity, ray, pixel uncertainty) are checked finite and rejected
+  explicitly rather than silently propagating NaNs (tracking.py's known gap, not
+  repeated here).
+- `predict_to(t_control, vehicle_velocity_ned, sightline_unit)` advances the stored
+  filter (without mutating it) to a later control time -- processing-delay
+  compensation -- and reports `relative_velocity_ned`/`closing_speed_m_s` (same
+  sign convention as `navigation.pn_acceleration`'s stationary-target closing speed,
+  generalized to a moving target). `TargetMotionEstimate.status` is `OBSERVABLE`
+  only when fresh, well-conditioned, and within the configured bounded-motion
+  envelope; otherwise `UNCERTAIN`/`UNOBSERVABLE` with a `reason` string -- callers
+  must never treat a non-`OBSERVABLE` estimate as exact.
+- `homing_config.py` gained the proposed, unverified ground-target-motion envelope
+  and filter thresholds (`PROPOSED_MAX_TARGET_SPEED_M_S`/`PROPOSED_MAX_TARGET_ACCEL_M_S2`/
+  `PROPOSED_TARGET_OUTLIER_CHI2_THRESHOLD`/`PROPOSED_MAX_TARGET_AGE_S`/
+  `PROPOSED_MAX_TARGET_POSITION_SIGMA_M`/`PROPOSED_TARGET_CLIPPED_INFLATION`/
+  `PROPOSED_TARGET_LOW_CONFIDENCE_INFLATION`/`PROPOSED_TARGET_CONFIDENCE_FLOOR`) and
+  `target_motion_thresholds()`, unpacked straight into both
+  `TargetMotionEstimator(...)` and `HomingGuidance(...)` (same parameter names, same
+  convention as the Task-5 tracking thresholds).
+- `HomingGuidance` wiring is Gazebo (mounts) path only (no NED ray geometry exists on
+  the legacy no-mounts path): one `TargetMotionEstimator` is fed the chosen camera's
+  tracked ray only on a genuine reference-plane hit (never the bearing-only fallback,
+  "estimate range only where the observation geometry supports it"), and every tick's
+  `HomingCommand.target_motion` carries the estimate `predict_to`'d to that tick's
+  control time. Purely additive: no existing field (`velocity_ned`/`acceleration_ned`/
+  `yaw_rad`/...) reads the estimate, so steering output is unchanged regardless of
+  estimate status (Task 7 owns actually consuming it in the speed/PN law, with its own
+  documented fallback to the existing bearing-only/pure-pursuit behavior whenever
+  `target_motion.status` is not `OBSERVABLE`). `reset_derivative_history()` (clock
+  discontinuity) also resets the estimator, alongside the existing PN history and
+  per-camera associator tracks.
+- `telemetry.py` gained `target_motion_fields_from_command`, populating the
+  previously-unpopulated `TickRecord.target_motion` from `command.target_motion`
+  (mirrors Task-4's `detection_fields_from_command`); wired into
+  `camera_homing_tracker.py`'s `_record_step`.
+
 ## 4.8.0 - Recoverable tracking state machine (plan Phase 5)
 - New `rotorpy/guidance/tracking.py`: a pure, camera-agnostic `TrackingStateMachine`
   (`STARTUP -> ACQUIRE -> TRACK -> TEMPORARY_LOSS -> REACQUIRE`, terminal

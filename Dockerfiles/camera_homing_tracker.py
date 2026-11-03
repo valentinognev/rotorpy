@@ -48,7 +48,12 @@ from rotorpy.guidance.outcome import classify_run
 from rotorpy.guidance.recording_worker import PROPOSED_RECORDING_QUEUE_DEPTH, RecordingWorker
 from rotorpy.guidance.setpoint_stream import PROPOSED_FAILURE_COMMAND, PROPOSED_SETPOINT_EXPIRY_S, SetpointStream
 from rotorpy.guidance.step_decision import command_and_stamp
-from rotorpy.guidance.telemetry import detection_fields_from_command, frame_to_float, start_run_telemetry
+from rotorpy.guidance.telemetry import (
+    detection_fields_from_command,
+    frame_to_float,
+    start_run_telemetry,
+    target_motion_fields_from_command,
+)
 from rotorpy.guidance.tracking import TrackingState
 from rotorpy.guidance.vehicle_state import VehicleState
 from rotorpy.guidance.watchdog import CommsWatchdogs
@@ -440,6 +445,7 @@ class CameraHomingTracker(object):
                     self._setpoints.stats_snapshot(), stale_links=list(getattr(self, "_stale_links", ()))
                 ),
                 **detection_fields_from_command(command),
+                **target_motion_fields_from_command(command),
             )
         except Exception as exc:
             print("telemetry step failed: {}".format(exc), file=sys.stderr, flush=True)

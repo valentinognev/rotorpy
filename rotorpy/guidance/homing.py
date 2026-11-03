@@ -20,6 +20,7 @@ from rotorpy.guidance.pixels import (
 )
 from rotorpy.guidance.sightline import ground_relative_position, reference_relative_position
 from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity
+from rotorpy.guidance.target_estimator import TargetMotionEstimate, TargetMotionEstimator
 from rotorpy.guidance.tracking import CameraSignal, TrackingState, TrackingStateMachine
 
 # Default below this horizontal speed the measured velocity has no usable heading, when
@@ -37,6 +38,17 @@ _REACQUIRE_FRAMES = 1
 _CAMERA_SWITCH_MARGIN = 0.1
 _MAX_PREDICTION_GAP_S = 2.0
 _MAX_TRACK_UNCERTAINTY_PX = 150.0
+# Private literal defaults matching `homing_config`'s named `PROPOSED_*` target-motion
+# thresholds (see `target_motion_thresholds()` there); same reasoning as the tracking
+# thresholds above.
+_TARGET_MAX_SPEED_M_S = 5.0
+_TARGET_MAX_ACCEL_M_S2 = 2.0
+_TARGET_OUTLIER_CHI2_THRESHOLD = 9.21
+_TARGET_MAX_AGE_S = 1.0
+_TARGET_MAX_POSITION_SIGMA_M = 5.0
+_TARGET_CLIPPED_INFLATION = 3.0
+_TARGET_LOW_CONFIDENCE_INFLATION = 2.0
+_TARGET_CONFIDENCE_FLOOR = 0.2
 # Documented design (unchanged by this module): home from the forward camera until the
 # upward camera latches, then home from upward -- so upward outranks forward whenever
 # both are visible, not just the first time upward is ever seen.
@@ -60,6 +72,7 @@ class HomingCommand(object):
         detections: Optional[Dict[str, TargetObservation]] = None,
         tracking_state: Optional[TrackingState] = None,
         abort_reason: Optional[str] = None,
+        target_motion: Optional[TargetMotionEstimate] = None,
     ) -> None:
         self.velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
         self.acceleration_ned = np.array(acceleration_ned, dtype=float, copy=True)
@@ -87,6 +100,15 @@ class HomingCommand(object):
         self.tracking_state = tracking_state
         # Why `tracking_state` is `ABORT`, or `None` otherwise.
         self.abort_reason = abort_reason
+        # `target_estimator.TargetMotionEstimate` predicted to this tick's control
+        # time (Gazebo/mounts path only; `None` on the legacy no-mounts path, which
+        # does not build an estimator). Purely additive and purely advisory: no
+        # existing field above (velocity_ned/acceleration_ned/yaw_rad/...) is computed
+        # from this, so an uncertain or unobservable estimate never silently degrades
+        # steering -- Task 7 owns actually consuming it in the speed/PN law, behind
+        # its own documented fallback to the existing bearing-only/pure-pursuit
+        # behavior whenever `target_motion.status` is not `OBSERVABLE`.
+        self.target_motion = target_motion
 
 
 def body_frd_velocity(velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -> np.ndarray:
@@ -249,6 +271,14 @@ class HomingGuidance(object):
         camera_switch_margin: float = _CAMERA_SWITCH_MARGIN,
         max_prediction_gap_s: float = _MAX_PREDICTION_GAP_S,
         max_track_uncertainty_px: float = _MAX_TRACK_UNCERTAINTY_PX,
+        max_speed_m_s: float = _TARGET_MAX_SPEED_M_S,
+        max_accel_m_s2: float = _TARGET_MAX_ACCEL_M_S2,
+        outlier_chi2_threshold: float = _TARGET_OUTLIER_CHI2_THRESHOLD,
+        max_age_s: float = _TARGET_MAX_AGE_S,
+        max_position_sigma_m: float = _TARGET_MAX_POSITION_SIGMA_M,
+        clipped_inflation: float = _TARGET_CLIPPED_INFLATION,
+        low_confidence_inflation: float = _TARGET_LOW_CONFIDENCE_INFLATION,
+        confidence_floor: float = _TARGET_CONFIDENCE_FLOOR,
     ) -> None:
         if initial_velocity_ned is None and initial_speed is None:
             raise ValueError("give an initial velocity or an initial speed")
@@ -269,6 +299,24 @@ class HomingGuidance(object):
         self._associators = None if self._mounts is None else {
             "forward": TargetAssociator(detector_config), "upward": TargetAssociator(detector_config)
         }
+        # Timestamped constant-velocity target-motion estimator (plan Phase 6), Gazebo
+        # (mounts) path only: it needs the true NED ray geometry (`pixel_ray_ned`) the
+        # legacy no-mounts path does not have. Purely additive this task -- nothing
+        # below reads `self._estimator`'s output for steering; it only reaches
+        # `HomingCommand.target_motion` (see `_command`). Parameter names mirror
+        # `TargetMotionEstimator.__init__` directly (same convention as the tracking
+        # thresholds above), so `homing_config.target_motion_thresholds()` unpacks
+        # straight into this constructor.
+        self._estimator: Optional[TargetMotionEstimator] = None if self._mounts is None else TargetMotionEstimator(
+            max_speed_m_s=max_speed_m_s,
+            max_accel_m_s2=max_accel_m_s2,
+            outlier_chi2_threshold=outlier_chi2_threshold,
+            max_age_s=max_age_s,
+            max_position_sigma_m=max_position_sigma_m,
+            clipped_inflation=clipped_inflation,
+            low_confidence_inflation=low_confidence_inflation,
+            confidence_floor=confidence_floor,
+        )
         self._reference_height_m = float(target_reference_height_m)
         self._min_course_speed_m_s = float(min_course_speed_m_s)
         self._initial_speed = None if initial_speed is None else float(initial_speed)
@@ -300,6 +348,12 @@ class HomingGuidance(object):
         self._last_image_time: Optional[float] = None
         self._last_sightline: Optional[np.ndarray] = None
         self._detections: Optional[Dict[str, TargetObservation]] = None
+        # This tick's control time/vehicle velocity, recorded on every `update()` call
+        # (even when it returns early with no new frame): `_command` uses them to
+        # `predict_to` the target-motion estimate to the current tick regardless of
+        # which branch built the command.
+        self._last_control_time: Optional[float] = None
+        self._last_velocity_ned: Optional[np.ndarray] = None
 
     def _set_course(self, velocity_ned: np.ndarray) -> None:
         self._initial_velocity_ned = velocity_ned
@@ -323,7 +377,13 @@ class HomingGuidance(object):
         height_m: float,
         attitude_sim_quat: np.ndarray,
     ):
-        """Unit sightline and body-to-target vector, or (None, None) without a usable bearing.
+        """Unit sightline, body-to-target vector, and the NED ray (origin, direction)
+        behind that vector -- or (None, None, None, None) without a usable bearing.
+
+        The ray is only returned alongside a genuine reference-plane hit (mounts path):
+        it is what `_estimator.update` needs to turn pixel uncertainty into a ground-
+        plane position covariance, and a bearing-only fallback or the legacy no-mounts
+        path has no such plane-relative geometry to filter.
 
         A reference-plane hit (`reference_relative_position`) is unreachable once height
         drops to or below `target_reference_height_m` (final-approach altitudes), not only
@@ -337,7 +397,7 @@ class HomingGuidance(object):
         if self._mounts is None:
             extrinsics = self.forward_extrinsics if source == "forward" else self.upward_extrinsics
             sightline = _sightline_ned(center, attitude_sim_quat, self.intrinsics, extrinsics)
-            return sightline, ground_relative_position(height_m, sightline)
+            return sightline, ground_relative_position(height_m, sightline), None, None
         rotation = Rotation.from_quat(attitude_homing_to_ned_frd(attitude_sim_quat)).as_matrix()
         offset, direction = pixel_ray_ned(
             float(center[0]), float(center[1]), self.intrinsics, self._mounts[source], rotation
@@ -345,14 +405,15 @@ class HomingGuidance(object):
         direction = np.asarray(direction, dtype=float)
         norm = float(np.linalg.norm(direction))
         if norm == 0.0 or direction[2] <= 0.0:
-            return None, None
+            return None, None, None, None
         relative = reference_relative_position(height_m, offset, direction, self._reference_height_m)
         if relative is None:
             # Fall back to the pure camera-ray bearing (no camera-translation correction):
-            # an approximation, but keeps steering instead of freezing the command.
+            # an approximation, but keeps steering instead of freezing the command. No
+            # usable ground-plane geometry for the estimator either, so no ray.
             bearing = direction / norm
-            return bearing, bearing
-        return relative / np.linalg.norm(relative), relative
+            return bearing, bearing, None, None
+        return relative / np.linalg.norm(relative), relative, offset, direction / norm
 
     def update(
         self,
@@ -368,6 +429,8 @@ class HomingGuidance(object):
         Both images None means no new frame. One None image is a camera tick
         whose missing picture has no target pixels.
         """
+        self._last_control_time = float(t)
+        self._last_velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
         if self._initial_velocity_ned is None:
             self._adopt_course(velocity_ned, attitude_sim_quat)
         if forward_image is None and upward_image is None:
@@ -402,9 +465,21 @@ class HomingGuidance(object):
         center, side = self._tracked_square(image, obs)
         if center is None:
             return self._hold(attitude_sim_quat)
-        sightline, relative = self._sightline_and_relative(source, center, height_m, attitude_sim_quat)
+        sightline, relative, ray_origin, ray_direction = self._sightline_and_relative(
+            source, center, height_m, attitude_sim_quat
+        )
         if relative is None:
             return self._hold(attitude_sim_quat)
+        if self._estimator is not None and ray_origin is not None and obs is not None:
+            # Only on a genuine reference-plane hit (ray_origin is not None): the
+            # bearing-only fallback and the legacy no-mounts path give the estimator no
+            # ground-plane geometry to turn pixel uncertainty into a position fix
+            # ("estimate range only where the observation geometry supports it").
+            self._estimator.update(
+                t, velocity_ned, ray_origin, ray_direction, height_m, self._reference_height_m,
+                self.intrinsics["fx"], self.intrinsics["fy"], obs.uncertainty_px,
+                clipped=obs.clipped, confidence=obs.confidence, sightline_unit=sightline,
+            )
         return self._steer(
             t, attitude_sim_quat, velocity_ned, source, center, side, sightline, relative,
             discontinuous=self._tracker.discontinuous,
@@ -466,7 +541,7 @@ class HomingGuidance(object):
 
     def reset_derivative_history(self) -> None:
         """Clear the proportional-navigation derivative history (previous sightline/time)
-        and any per-camera detection track.
+        and any per-camera detection track or target-motion estimator state.
 
         Call this after a `VehicleState` clock discontinuity (sim-time reset, backward
         jump, or detected pause) is reported: the previous sightline/timestamp pair was
@@ -474,13 +549,17 @@ class HomingGuidance(object):
         computation would fabricate a spurious angular rate from two readings that are no
         longer actually adjacent in (sim) time. The same discontinuity also makes any
         standing per-camera detection track (Gazebo/mounts path) a stale prediction of
-        where the target now is; it is dropped rather than gating the next frame on it.
+        where the target now is, and the target-motion estimator's own filter time/state
+        meaningless (its `dt`s would span the discontinuity); both are dropped rather
+        than built on across it.
         """
         self._last_sightline = None
         self._last_image_time = None
         if self._associators is not None:
             for associator in self._associators.values():
                 associator.reset()
+        if self._estimator is not None:
+            self._estimator.reset()
         self._tracker.force_discontinuity()
 
     def complete(self, reason: Optional[str] = None) -> None:
@@ -565,6 +644,11 @@ class HomingGuidance(object):
         else:
             rotation = Rotation.from_quat(attitude_homing_to_ned_frd(attitude_sim_quat))
             body_velocity = rotation.inv().apply(velocity)
+        target_motion = None
+        if self._estimator is not None and self._last_control_time is not None:
+            target_motion = self._estimator.predict_to(
+                self._last_control_time, self._last_velocity_ned, sightline_unit=self._last_sightline
+            )
         return HomingCommand(
             velocity,
             np.array(self._acceleration_ned, dtype=float, copy=True),
@@ -580,4 +664,5 @@ class HomingGuidance(object):
             self._detections,
             self._tracker.state,
             self._tracker.abort_reason,
+            target_motion,
         )
