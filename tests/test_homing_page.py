@@ -165,3 +165,78 @@ def test_page_writes_html(tmp_path):
     text = path.read_text()
     assert _payload(text)["times"] == [0.0, 0.05]
     assert "Results" not in str(path)
+
+
+def _geometry(moving=False):
+    from rotorpy.guidance.runner import ReplayGeometry
+
+    ground = np.array([[1.5, 3.5, 0.0], [1.5, 3.5, 0.0]])
+    if moving:
+        ground = np.array([[1.5, 3.5, 0.0], [9.5, 3.5, 0.0]])
+    return ReplayGeometry(
+        target_radius_m=0.75,
+        target_height_m=3.0,
+        target_ground_sim=ground[0],
+        target_path_time=np.array([0.0, 0.05]),
+        target_path_sim=ground,
+        cameras={
+            "forward": {
+                "position_flu_m": [0.36, 0.0, 0.05], "pitch_deg": 10.0,
+                "fov_x_deg": 90.0, "fov_y_deg": 90.0, "width_px": 32, "height_px": 32,
+            },
+            "upward": {
+                "position_flu_m": [0.0, 0.0, 0.0], "pitch_deg": -70.0,
+                "fov_x_deg": 90.0, "fov_y_deg": 90.0, "width_px": 32, "height_px": 32,
+            },
+        },
+    )
+
+
+def _record_with_geometry(moving=False):
+    record = _record()
+    record.geometry = _geometry(moving)
+    return record
+
+
+def test_legacy_record_has_no_geometry_payload_or_panel():
+    page = homing_page(_record())
+    assert "geometry" not in _payload(page)
+    assert 'id="geometry"' not in page
+    assert "[2, 3, 4, 5, 6, 7, 8, 9, 10, 11]" in page
+
+
+def test_replay_reports_the_actual_target_and_camera_geometry():
+    page = homing_page(_record_with_geometry())
+    payload = _payload(page)
+    target = payload["geometry"]["target"]
+    assert target["radius_m"] == 0.75 and target["height_m"] == 3.0
+    assert target["ground_sim"] == pytest.approx([1.5, 3.5, 0.0])
+    assert target["moving"] is False
+    forward = payload["geometry"]["cameras"]["forward"]
+    assert forward["position_flu_m"] == pytest.approx([0.36, 0.0, 0.05])
+    assert forward["pitch_deg"] == 10.0 and forward["fov_x_deg"] == 90.0
+    assert payload["geometry"]["cameras"]["upward"]["pitch_deg"] == -70.0
+    assert 'id="geometry"' in page
+    assert "radius 0.75 m" in page and "height 3.0 m" in page
+    assert "pitch 10.0" in page and "pitch -70.0" in page
+
+
+def test_target_is_drawn_as_the_actual_cylinder_not_a_box():
+    snap = _payload(homing_page(_record_with_geometry()))["snapshots"][0]
+    xs = [x for x in snap["target"]["x"] if x is not None]
+    ys = [y for y in snap["target"]["y"] if y is not None]
+    zs = [z for z in snap["target"]["z"] if z is not None]
+    radii = np.hypot(np.array(xs) - 1.5, np.array(ys) - 3.5)
+    assert radii.max() == pytest.approx(0.75, abs=1e-9)
+    assert (radii > 0.7).sum() > 20  # round: many points on the rim, not 4 box corners
+    assert min(zs) == pytest.approx(0.0) and max(zs) == pytest.approx(3.0)
+
+
+def test_moving_target_is_shown_where_it_was_at_each_snapshot_time():
+    payload = _payload(homing_page(_record_with_geometry(moving=True)))
+    assert payload["geometry"]["target"]["moving"] is True
+    first, last = payload["snapshots"][0]["target"], payload["snapshots"][1]["target"]
+    center_first = np.mean([x for x in first["x"] if x is not None])
+    center_last = np.mean([x for x in last["x"] if x is not None])
+    assert center_last - center_first == pytest.approx(8.0, abs=0.1)
+    assert "snap.target" in homing_page(_record_with_geometry(moving=True))

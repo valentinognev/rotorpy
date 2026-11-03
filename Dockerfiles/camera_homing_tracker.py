@@ -12,7 +12,16 @@ vehicle_state,setpoint_stream,recording_worker,watchdog}.py`).
 Gazebo's own model state is read only for recording and outcome scoring
 (`_pose_truth`); the control loop -- homing law, startup hold and arming --
 uses PX4's reported attitude and local position exclusively, the same as a
-real vehicle would. `PX4's `ATTITUDE_QUATERNION`/`LOCAL_POSITION_NED` time
+real vehicle would. `rotorpy/guidance/scoring.py` is the truth-side module that
+combines vehicle and target truth; no guidance/estimator module imports it (see
+`tests/test_homing_truth_boundary.py`).
+
+Startup is the `startup.StartupGate` state machine (bounded service waits, arming
+attempts, motor start, climb and stabilisation); a timeout is a STARTUP_FAILURE
+outcome. Errors are explicit: `run_failure.RecoverableError` is counted against a
+bounded budget, everything else is fatal -- the setpoint stream is latched and
+`run_lifecycle.RunLifecycle` writes exactly one outcome (also on failed startup and on
+shutdown), flushing and closing the recorder on every termination path. `PX4's `ATTITUDE_QUATERNION`/`LOCAL_POSITION_NED` time
 stamps are PX4's own boot clock, not Gazebo's simulated clock that the camera
 header stamps use; lacking a live flight to calibrate that offset, this
 shell timestamps ingested telemetry with `rospy.get_time()` at arrival as an
@@ -21,6 +30,7 @@ approximation (documented here, not claimed as verified).
 
 import atexit
 import argparse
+import os
 import sys
 import threading
 import time
@@ -42,11 +52,46 @@ from rotorpy.guidance.gazebo_bridge import (
 )
 from rotorpy.guidance.gazebo_record import GazeboHomingRecorder, gazebo_page_path
 from rotorpy.guidance.homing import HomingCommand
-from rotorpy.guidance.homing_config import alignment_from_config, guidance_from_config, load_homing_config, watchdog_timeouts
+from rotorpy.guidance.homing_config import (
+    PROPOSED_REACH_RADIUS_M,
+    PROPOSED_SERVICE_WAIT_TIMEOUT_S,
+    PROPOSED_STARTUP_MODE,
+    alignment_from_config,
+    guidance_from_config,
+    load_homing_config,
+    startup_thresholds,
+    watchdog_timeouts,
+)
 from rotorpy.guidance.observation_buffer import ObservationBuffer, PROPOSED_CAMERA_FUSION_MAX_AGE_S, select_fresh_or_recent
-from rotorpy.guidance.outcome import classify_run
+from rotorpy.guidance.outcome import RunOutcome, classify_run
 from rotorpy.guidance.recording_worker import PROPOSED_RECORDING_QUEUE_DEPTH, RecordingWorker
+from rotorpy.guidance.run_failure import (
+    EstimatorFailure,
+    FatalError,
+    OffboardFailure,
+    RecoverableBudget,
+    RecoverableError,
+    ServiceUnavailable,
+    SimulatorFailure,
+    StartupFailure,
+    failure_for_kind,
+    failure_reason,
+    is_recoverable,
+    outcome_flags,
+)
+from rotorpy.guidance.run_lifecycle import RunLifecycle
+from rotorpy.guidance.scoring import TargetShape, TruthScorer
 from rotorpy.guidance.setpoint_stream import PROPOSED_FAILURE_COMMAND, PROPOSED_SETPOINT_EXPIRY_S, SetpointStream
+from rotorpy.guidance.startup import (
+    StartupCommand,
+    StartupConfig,
+    StartupGate,
+    StartupInputs,
+    StartupMode,
+    StartupPhase,
+    bounded_service_wait,
+    parse_startup_mode,
+)
 from rotorpy.guidance.step_decision import command_and_stamp
 from rotorpy.guidance.telemetry import (
     detection_fields_from_command,
@@ -62,11 +107,25 @@ from rotorpy.guidance.watchdog import CommsWatchdogs
 _OFFBOARD_MAIN = 6
 _BODY_LINKS = ("base_link", "/imu_link", "rotor_0", "rotor_1", "rotor_2", "rotor_3", "gps0::link")
 _ROTOR_JOINTS = ("rotor_0_joint", "rotor_1_joint", "rotor_2_joint", "rotor_3_joint")
-_STARTUP_CLIMB_SPEED = 3.0
 # Gazebo slows rotor joints by 10; their armed idle speed is 10 rad/s.
 _MOTOR_READY_SPEED = 15.0
-_MOTOR_START_TIMEOUT = 15.0
-_STARTUP_HOLD_TIMEOUT = 20.0
+_TARGET_MODEL = "homing_target"
+# Proposed, not verified: bound on waiting for the first PX4 heartbeat.
+_PROPOSED_HEARTBEAT_WAIT_S = 30.0
+_GAZEBO_SERVICES = (
+    "/gazebo/get_link_properties",
+    "/gazebo/set_link_properties",
+    "/gazebo/get_joint_properties",
+    "/gazebo/unpause_physics",
+    "/gazebo/get_model_state",
+)
+# Run outcomes that mean the infrastructure, not the homing law, ended the run.
+_INFRASTRUCTURE_OUTCOMES = (
+    RunOutcome.STARTUP_FAILURE,
+    RunOutcome.SIMULATOR_FAILURE,
+    RunOutcome.OFFBOARD_FAILURE,
+    RunOutcome.ESTIMATOR_FAILURE,
+)
 # Proposed, not verified: how often the independent setpoint publisher ticks, decoupled
 # from the camera/perception rate configured as "camera_rate_hz".
 _PROPOSED_SETPOINT_RATE_HZ = 50.0
@@ -116,6 +175,16 @@ def _placeholder_command():
     )
 
 
+def _lazy(obj, attr_name, factory):
+    """The value stored at `attr_name` on `obj`, built by `factory()` on first use (for
+    trackers constructed via `__new__` in tests, which skip `__init__`)."""
+    value = getattr(obj, attr_name, None)
+    if value is None:
+        value = factory()
+        setattr(obj, attr_name, value)
+    return value
+
+
 def _lock_for(obj, attr_name):
     """The `threading.Lock` stored at `attr_name` on `obj`, creating it on first use.
 
@@ -131,8 +200,12 @@ def _lock_for(obj, attr_name):
 
 
 class CameraHomingTracker(object):
-    def __init__(self, config, model_name, page_path=None):
+    def __init__(self, config, model_name, page_path=None, startup_mode=PROPOSED_STARTUP_MODE):
         self.model_name = model_name
+        # Explicit, validated before anything else is touched: a typo must not silently
+        # pick a mode. "airborne_spawn" is the legacy simulation mode (gravity off until the
+        # rotors spin); "takeoff" is the preferred path (see `startup.py`).
+        self.startup_mode = parse_startup_mode(startup_mode)
         # Taken from the vehicle's own heading at the first PX4 attitude sample, never
         # from the target.
         self._startup_yaw = None
@@ -141,15 +214,25 @@ class CameraHomingTracker(object):
         self.page_path = page_path
         # Truth for scoring the outcome and recording the flight path only. It never
         # reaches guidance, the vehicle-state estimate, or the startup/arming logic.
-        self._target_ground_ned = np.array(config["target_ground_ned"], dtype=float)
+        self._target_height_m = float(config["gazebo_target_height_m"])
+        self._scorer = TruthScorer(
+            TargetShape(float(config["gazebo_target_radius_m"]), self._target_height_m),
+            timeout_s=float(config["timeout_s"]),
+            reach_radius_m=PROPOSED_REACH_RADIUS_M,
+            ground_down_m=-float(config["ground_z_m"]),
+            static_target_ground_ned=config["target_ground_ned"],
+        )
         self.telemetry = None
         if page_path is not None:
             self.telemetry = start_run_telemetry(Path(page_path).parent / "gazebo_runs", config)
         self._page_printed = False
         self.recorder = None if page_path is None else GazeboHomingRecorder(config)
         self._recording = RecordingWorker(self._record_sink, maxsize=PROPOSED_RECORDING_QUEUE_DEPTH)
+        self._lifecycle = RunLifecycle(self._write_outcome_record, closers=self._closers())
+        self._budget = RecoverableBudget()
+        self._startup_error = None
         self._observations = ObservationBuffer(cameras=("forward", "upward"))
-        self._vehicle_state = VehicleState(alignment_from_config(config))
+        self._vehicle_state = VehicleState(alignment_from_config(config, self.startup_mode))
         self._watchdogs = CommsWatchdogs(watchdog_timeouts())
         self._setpoints = SetpointStream(
             publish=self._publish_setpoint,
@@ -165,39 +248,60 @@ class CameraHomingTracker(object):
         # thread (`_poll_mavlink`, `_engage`) and the independent setpoint-publisher
         # thread (`_send`).
         self._mav_lock = threading.Lock()
-        # Protects `_startup_done`/`_gravity_on`/`_startup_yaw`, written by the step
-        # thread and read by the setpoint-publisher thread's `_send`.
+        # Protects `_startup_done`/`_gravity_on`/`_startup_yaw`/`_last_transmitted`,
+        # written by the step thread and/or the setpoint-publisher thread.
         self._flags_lock = threading.Lock()
         self._command = None
         self._sent = 0
+        self._pending_status = None
+        self._outcome_queued = False
+        self._guidance_stamp = None
+        self._last_transmitted = None
         self._offboard = False
         self._last_status = None
         self._hb_armed = False
         self._hb_mode = None
         self._gravity_on = True
-        self._motor_start_time = None
         self._startup_done = False
-        self._hold_start_time = None
-        self._settled_since = None
-        rospy.wait_for_service("/gazebo/get_link_properties")
-        rospy.wait_for_service("/gazebo/set_link_properties")
-        rospy.wait_for_service("/gazebo/get_joint_properties")
+        self._gate = StartupGate(
+            StartupConfig(mode=self.startup_mode, hold_height_m=self._startup_height, **startup_thresholds()),
+            now_s=time.monotonic(),
+        )
+        # Startup problems (a missing service, no heartbeat) must still end the run with an
+        # outcome, so they are held and reported by the first `step()` instead of raised
+        # out of the constructor where nothing could record them.
+        try:
+            self._connect()
+        except Exception as exc:
+            self._startup_error = exc if isinstance(exc, StartupFailure) else StartupFailure(
+                "init_failed:{}: {}".format(type(exc).__name__, exc)
+            )
+            self._setpoints.mark_fatal("startup_failure: {}".format(self._startup_error.reason))
+
+    def _connect(self):
+        """The bounded part of startup that needs ROS/Gazebo/PX4 to be up."""
+        bounded_service_wait(
+            _GAZEBO_SERVICES,
+            lambda name, remaining: rospy.wait_for_service(name, timeout=remaining),
+            PROPOSED_SERVICE_WAIT_TIMEOUT_S,
+            time.monotonic,
+        )
         self._get_link = rospy.ServiceProxy("/gazebo/get_link_properties", GetLinkProperties)
         self._set_link = rospy.ServiceProxy("/gazebo/set_link_properties", SetLinkProperties)
         self._get_joint = rospy.ServiceProxy("/gazebo/get_joint_properties", GetJointProperties)
-        # The estimator is not ready at spawn. Hold the 30 m start until offboard is flying.
-        self._set_gravity(False)
-        rospy.wait_for_service("/gazebo/unpause_physics")
+        if self.startup_mode is StartupMode.AIRBORNE_SPAWN:
+            # The estimator is not ready at spawn. Hold the 30 m start until offboard is flying.
+            self._set_gravity(False)
         rospy.ServiceProxy("/gazebo/unpause_physics", Empty)()
         rospy.Subscriber("/homing/forward/image_raw", Image, self._on_forward, queue_size=1)
         rospy.Subscriber("/homing/upward/image_raw", Image, self._on_upward, queue_size=1)
-        rospy.wait_for_service("/gazebo/get_model_state")
         self._model_state = rospy.ServiceProxy("/gazebo/get_model_state", GetModelState)
         self._mav = mavutil.mavlink_connection("udpin:127.0.0.1:14540", source_system=255)
         print("waiting for PX4 heartbeat on 14540", flush=True)
-        self._mav.wait_heartbeat()
+        if self._mav.wait_heartbeat(timeout=_PROPOSED_HEARTBEAT_WAIT_S) is None:
+            raise StartupFailure("heartbeat_timeout")
         self._watchdogs.touch("heartbeat", time.monotonic())
-        print("PX4 system {}".format(self._mav.target_system), flush=True)
+        print("PX4 system {} (startup mode {})".format(self._mav.target_system, self.startup_mode.value), flush=True)
         # Independent of the camera-rate step() loop: a stale command must stop being sent
         # even if perception or the main loop stalls.
         rospy.Timer(rospy.Duration(1.0 / _PROPOSED_SETPOINT_RATE_HZ), self._on_setpoint_timer)
@@ -265,13 +369,29 @@ class CameraHomingTracker(object):
         """Gazebo ground truth: recording and outcome scoring only, never guidance."""
         state = self._model_state(self.model_name, "")
         if not state.success:
-            raise RuntimeError(state.status_message)
+            raise ServiceUnavailable(state.status_message)
         pose = state.pose
         twist = state.twist
         position = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=float)
         quat = np.array([pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
         velocity = np.array([twist.linear.x, twist.linear.y, twist.linear.z])
         return position, attitude_gazebo_to_homing(quat), velocity_gazebo_to_ned(velocity)
+
+    def _target_truth(self):
+        """Truth: the target's ground-contact point (NED) now, or None when it cannot be
+        read (the scorer then uses the configured static point). Scoring only."""
+        model_state = getattr(self, "_model_state", None)
+        if model_state is None:
+            return None
+        try:
+            state = model_state(_TARGET_MODEL, "")
+        except Exception:
+            return None
+        if not state.success:
+            return None
+        centre = enu_to_ned(np.array([state.pose.position.x, state.pose.position.y, state.pose.position.z], dtype=float))
+        # The model pose is the cylinder's centre; the ground contact is half its height below.
+        return centre + np.array([0.0, 0.0, self._target_height_m / 2.0])
 
     def _flight_state(self):
         return (
@@ -282,19 +402,61 @@ class CameraHomingTracker(object):
         )
 
     def step(self):
+        """One control tick. Returns the run-ending status or None; raises on failure.
+
+        `RecoverableError`s that escape are bounded by `handle_step_error`; a
+        `FatalError` (or any unexpected exception) ends the run.
+        """
+        error = getattr(self, "_startup_error", None)
+        if error is not None:
+            raise error
+        self._tick_recoverable = False
+        status = self._step()
+        if not self._tick_recoverable:
+            _lazy(self, "_budget", RecoverableBudget).ok()
+        return status
+
+    def _note_recoverable(self, exc):
+        """Count a recoverable error this tick absorbed; raises the fatal escalation once the
+        bounded budget is spent."""
+        self._tick_recoverable = True
+        escalation = _lazy(self, "_budget", RecoverableBudget).note(exc)
+        print("recoverable error: {}".format(exc), file=sys.stderr, flush=True)
+        if escalation is not None:
+            raise escalation
+
+    def _gate_for(self, wall_now):
+        gate = getattr(self, "_gate", None)
+        if gate is None:
+            gate = StartupGate(
+                StartupConfig(
+                    mode=getattr(self, "startup_mode", parse_startup_mode(PROPOSED_STARTUP_MODE)),
+                    hold_height_m=self._startup_height, **startup_thresholds(),
+                ),
+                now_s=wall_now,
+            )
+            self._gate = gate
+        return gate
+
+    def _step(self):
         wall_now = time.monotonic()
         self._poll_mavlink()
         self._offboard = self._flight_state()
-        # Every stale link is reported in telemetry (`stale_links`), but only a *lost*
-        # telemetry/heartbeat link (alive once, now silent) is fatal: the stream stops and
-        # stays stopped (decision, proposed default: a PX4 link blip is fatal-forever; the
-        # reason is recorded in the stats). The image watchdog is deliberately not fatal --
-        # a camera dropout self-heals through command expiry and resumes on the next
-        # fresh frame. A never-seen link is startup, not loss.
+        # Every stale link is reported in telemetry (`stale_links`). Once homing has begun, a
+        # *lost* telemetry or heartbeat link (alive once, now silent) is fatal and latches the
+        # stream (decision, proposed default: a PX4 link blip ends the run; the reason is
+        # recorded in the stats) -- and the run ends with an outcome, it is not left
+        # streaming nothing. Before homing the loss is not latched: the startup gate drops
+        # back to waiting for a fresh estimate / confirmed offboard, and its own bounds turn
+        # a link that never returns into a STARTUP_FAILURE. The image watchdog is
+        # deliberately never fatal: a camera dropout self-heals through command expiry and
+        # resumes on the next fresh frame. A never-seen link is startup, not loss.
         self._stale_links = sorted(self._watchdogs.any_stale(wall_now))
         lost_fatal = sorted(name for name in self._watchdogs.lost(wall_now) if name in _FATAL_WATCHDOG_LINKS)
-        if lost_fatal:
-            self._setpoints.mark_fatal("watchdog_lost:" + ",".join(lost_fatal))
+        if lost_fatal and self._startup_done:
+            reason = "watchdog_lost:" + ",".join(lost_fatal)
+            self._setpoints.mark_fatal(reason)
+            raise (OffboardFailure if "heartbeat" in lost_fatal else EstimatorFailure)(reason)
         forward_obs, forward_fresh = self._observations.take_fresh("forward")
         upward_obs, upward_fresh = self._observations.take_fresh("upward")
         fresh = forward_fresh or upward_fresh
@@ -321,7 +483,7 @@ class CameraHomingTracker(object):
                 self._startup_yaw = heading_from_homing_attitude(homing_attitude)
         updated = fresh or self._command is None
         have_estimate = (
-            sample.height_above_ground_m is not None
+            sample
             and homing_attitude is not None
             and sample.velocity_ned is not None
             and not self._watchdogs.stale("telemetry", wall_now)
@@ -361,29 +523,20 @@ class CameraHomingTracker(object):
             observation_wall_s=observation_wall_s,
         )
         self._command = command
+        self._sent = getattr(self, "_sent", 0) + 1
         # `stamp_wall_s` is `None` on the hold-last-command branch: do NOT restamp the
         # setpoint stream there, or its expiry never fires and a dead camera/dead PX4
         # estimate never stops the stream (the held time must keep aging).
         if stamp_wall_s is not None:
-            self._setpoints.set_command(command, stamp_wall_s)
-        self._sent += 1
-        # PX4 rejects the first arm while the estimator is still starting.
-        # Keep streaming setpoints and ask again until the heartbeat is armed in offboard.
-        if not self._offboard and self._sent >= 20 and self._sent % 5 == 0:
-            self._engage()
-        if self._offboard and not self._gravity_on:
-            if self._motor_start_time is None:
-                self._motor_start_time = rospy.get_time()
-            if self._motors_ready():
-                self._set_gravity(True)
-                self._hold_start_time = rospy.get_time()
-            elif rospy.get_time() - self._motor_start_time > _MOTOR_START_TIMEOUT:
-                raise RuntimeError("PX4 motors did not reach startup speed; gravity remains disabled")
-        elif not self._offboard:
-            self._motor_start_time = None
-            self._settled_since = None
-        if self._offboard and self._gravity_on and not self._startup_done and have_estimate:
-            self._update_startup_hold(rospy.get_time(), sample.height_above_ground_m, sample.velocity_ned[2])
+            self._guidance_stamp = stamp_wall_s
+        just_started = self._advance_startup(wall_now, have_estimate, sample, homing_attitude)
+        if self._startup_done:
+            if stamp_wall_s is not None:
+                self._setpoints.set_command(command, stamp_wall_s)
+            elif just_started and getattr(self, "_guidance_stamp", None) is not None:
+                # Homing just opened: hand over the guidance command at its *own* age, so
+                # a command computed long ago expires instead of looking fresh.
+                self._setpoints.set_command(command, self._guidance_stamp)
         status = None
         if command is not None and getattr(command, "tracking_state", None) is TrackingState.ABORT:
             # The explicit, one-way failure response: do NOT keep issuing normal
@@ -394,18 +547,22 @@ class CameraHomingTracker(object):
             self._setpoints.mark_fatal("target_lost:" + abort_reason)
             status = "target_lost"
         if command is not None:
-            need_truth = self.recorder is not None or self.telemetry is not None
-            if need_truth:
-                position_truth, attitude_truth, velocity_truth = self._pose_truth()
-                if self.recorder is not None and self._startup_done:
-                    forward_picture = forward_obs.image if (fresh and forward_obs is not None) else None
-                    upward_picture = upward_obs.image if (fresh and upward_obs is not None) else None
-                    observed_status = self.recorder.observe(
-                        rospy.get_time(), position_truth, attitude_truth, forward_picture, upward_picture, command
-                    )
-                    status = status or observed_status
+            truth = self._read_truth() if self._startup_done else None
+            if truth is not None:
+                # Termination comes from the truth scorer alone: it needs neither the
+                # recorder nor any camera frame.
+                status = status or self._score_truth(truth)
+            status = status or getattr(self, "_pending_status", None)
+            if truth is not None and self.recorder is not None:
+                forward_picture = forward_obs.image if (fresh and forward_obs is not None) else None
+                upward_picture = upward_obs.image if (fresh and upward_obs is not None) else None
+                self.recorder.observe(
+                    rospy.get_time(), truth["position_enu"], truth["attitude"], forward_picture, upward_picture,
+                    command, target_ground_ned=truth["target_ground_ned"],
+                )
+            if self.telemetry is not None:
                 self._recording.submit((
-                    "step", wall_now, sample, homing_attitude, command, updated,
+                    "step", self._sent, wall_now, sample, homing_attitude, command, updated,
                     forward_obs.image if (updated and forward_obs is not None) else None,
                     upward_obs.image if (updated and upward_obs is not None) else None,
                     {
@@ -417,8 +574,8 @@ class CameraHomingTracker(object):
                         "upward": None if upward_obs is None else upward_obs.receipt_s,
                     },
                 ))
-                if status is not None:
-                    self._recording.submit(("outcome", status, position_truth))
+            if status is not None:
+                self._submit_outcome(status)
             print(
                 "locked={} tracking={} source={} v=[{:.1f} {:.1f} {:.1f}]".format(
                     command.locked,
@@ -432,17 +589,175 @@ class CameraHomingTracker(object):
             )
         return status
 
-    # --- recording: off the control path, a slow sink cannot stall setpoints -------
+    # --- startup ---------------------------------------------------------------------
+
+    def _advance_startup(self, wall_now, have_estimate, sample, homing_attitude):
+        """Run the startup gate for this tick and act on it. Returns True on the tick homing opens.
+
+        Streams the startup setpoint (restamped every step) while the gate returns one --
+        that depends on the PX4 estimate only, never on a camera image -- and makes gate
+        failures fatal. The homing command is not transmitted while the gate is open.
+        """
+        gate = self._gate_for(wall_now)
+        if self._startup_done and gate.phase is not StartupPhase.HOMING:
+            # A tracker resumed straight into homing (no gate history): nothing to gate.
+            return False
+        motors_ready = None
+        if gate.phase is StartupPhase.MOTOR_START:
+            try:
+                motors_ready = bool(self._motors_ready())
+            except RecoverableError as exc:
+                self._note_recoverable(exc)
+                motors_ready = False
+        decision = gate.update(StartupInputs(
+            now_s=wall_now,
+            estimate_fresh=bool(have_estimate),
+            attitude_valid=homing_attitude is not None,
+            height_m=sample.height_above_ground_m,
+            velocity_ned=sample.velocity_ned,
+            armed=bool(self._offboard),
+            offboard=bool(self._offboard),
+            motors_ready=motors_ready,
+        ))
+        if decision.failure is not None:
+            raise failure_for_kind(decision.failure_kind, decision.failure)
+        if decision.gravity_enabled is not None and decision.gravity_enabled != self._gravity_on:
+            self._set_gravity(decision.gravity_enabled)
+        if decision.request_arm:
+            self._engage()
+        if decision.homing_active:
+            if self._startup_done:
+                return False
+            with _lock_for(self, "_flags_lock"):
+                self._startup_done = True
+            print("startup gate open; beginning camera homing", flush=True)
+            return True
+        if decision.setpoint_velocity_ned is not None and self._startup_yaw is not None:
+            self._setpoints.set_command(
+                StartupCommand(velocity_ned=decision.setpoint_velocity_ned, yaw_rad=self._startup_yaw), wall_now
+            )
+        return False
+
+    # --- truth side: scoring and termination -------------------------------------------
+
+    def _read_truth(self):
+        """Gazebo truth for scoring/recording, or None when unreadable this tick (a
+        recoverable, bounded failure). Never feeds guidance."""
+        try:
+            position_enu, attitude, velocity = self._pose_truth()
+        except RecoverableError as exc:
+            self._note_recoverable(exc)
+            return None
+        return {
+            "t": rospy.get_time(),
+            "position_enu": position_enu,
+            "attitude": attitude,
+            "velocity": velocity,
+            "target_ground_ned": self._target_truth(),
+        }
+
+    def _score_truth(self, truth):
+        """Feed the truth scorer; returns its termination status (`ground`/`timeout`/`target`)."""
+        scorer = self._scorer
+        if truth["target_ground_ned"] is not None:
+            scorer.add_target_sample(truth["t"], truth["target_ground_ned"])
+        return scorer.add_vehicle_sample(truth["t"], enu_to_ned(np.asarray(truth["position_enu"], dtype=float)))
+
+    def on_collision(self, kind):
+        """Hook for a simulator collision event (`"target"` or `"ground"`).
+
+        Not subscribed to a live Gazebo contact topic here (no simulator available): the
+        scorer's segment tests already catch contact between samples; this is the second,
+        independent source once such a topic is configured.
+        """
+        status = self._scorer.note_collision(rospy.get_time(), kind)
+        if status is not None:
+            # The next `step()` reports it (and queues the one outcome) like any other end.
+            self._pending_status = status
+        return status
+
+    # --- outcomes ---------------------------------------------------------------------
+
+    def _submit_outcome(self, status):
+        """Queue the run's one outcome (after the pending tick records, so the log is ordered)."""
+        if getattr(self, "_outcome_queued", False):
+            return
+        self._outcome_queued = True
+        scorer = self._scorer
+        outcome = scorer.outcome(target_lost=status == "target_lost")
+        if outcome is None:
+            outcome = {
+                "ground": RunOutcome.GROUND_MISS, "timeout": RunOutcome.TIMEOUT,
+                "target": RunOutcome.TARGET_REACHED, "target_lost": RunOutcome.TARGET_LOST,
+            }.get(status, RunOutcome.SIMULATOR_FAILURE)
+        result = scorer.result()
+        self._recording.submit(("outcome", outcome, status, {
+            "miss_m": scorer.miss_m(),
+            "target_contact": result.target_contact,
+            "ground_contact": result.ground_contact,
+            "min_distance_time_s": result.min_distance_time_s,
+            "scored_samples": result.matched_samples,
+            "unmatched_samples": result.unmatched_samples,
+        }))
+
+    def _lifecycle_for(self):
+        lifecycle = getattr(self, "_lifecycle", None)
+        if lifecycle is None:
+            lifecycle = RunLifecycle(self._write_outcome_record, closers=self._closers())
+            self._lifecycle = lifecycle
+        return lifecycle
+
+    def _write_outcome_record(self, outcome, reason, fields):
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is None:
+            return False
+        return bool(telemetry.finish(outcome, reason=reason, **fields))
+
+    def _closers(self):
+        return [("telemetry", self._close_telemetry)]
+
+    def _close_telemetry(self):
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is not None:
+            # Frames held for a pre-event window are written too: a failed run is exactly
+            # when they are wanted.
+            telemetry.close(flush_frames=True)
+
+    def exit_code(self):
+        """0 when homing ran to a flight outcome, 1 when infrastructure ended the run."""
+        outcome = self._lifecycle_for().outcome
+        return 1 if outcome is None or outcome in _INFRASTRUCTURE_OUTCOMES else 0
+
+    def handle_step_error(self, exc):
+        """What to do with an exception `step()` raised. True: recoverable, keep stepping.
+        False: the run is over -- the stream is latched and exactly one outcome is queued."""
+        if is_recoverable(exc):
+            escalation = _lazy(self, "_budget", RecoverableBudget).note(exc)
+            if escalation is None:
+                return True
+            exc = escalation
+        self.note_failure(exc)
+        reason = failure_reason(exc)
+        self._setpoints.mark_fatal(
+            "{}_failure: {}".format(exc.kind, reason) if isinstance(exc, FatalError) else "step_exception: {}".format(exc)
+        )
+        if not getattr(self, "_outcome_queued", False):
+            self._outcome_queued = True
+            outcome = classify_run(**outcome_flags(exc))
+            self._recording.submit(("outcome", outcome, reason, {"error": type(exc).__name__}))
+        return False
+
+    # --- recording: off the control path, a slow sink cannot stall setpoints -------------
 
     def _record_sink(self, item):
         kind = item[0]
         if kind == "step":
             self._record_step(*item[1:])
         elif kind == "outcome":
-            self._record_outcome(item[1], item[2])
+            self._lifecycle_for().finish(item[1], item[2], **item[3])
 
     def _record_step(
-        self, wall_now, sample, homing_attitude, command, updated, forward_image, upward_image,
+        self, seq, wall_now, sample, homing_attitude, command, updated, forward_image, upward_image,
         image_capture_s, image_receipt_s,
     ):
         """Hand one tick to telemetry. Recording errors never reach the control loop."""
@@ -451,9 +766,16 @@ class CameraHomingTracker(object):
             return
         try:
             now = rospy.get_time()
-            sent = np.array(command.velocity_ned, dtype=float)
+            gate = getattr(self, "_gate", None)
+            if self._startup_done:
+                state = "HOMING"
+            else:
+                state = "STARTUP" if gate is None else gate.phase.value
+            stats = dict(self._setpoints.stats_snapshot(), stale_links=list(getattr(self, "_stale_links", ())))
+            with _lock_for(self, "_flags_lock"):
+                transmitted = getattr(self, "_last_transmitted", None)
             telemetry.step(
-                seq=self._sent,
+                seq=seq,
                 t_s=now,
                 height_m=None if sample.height_above_ground_m is None else float(sample.height_above_ground_m),
                 # The homing-law attitude convention: what `guidance.update` actually
@@ -473,35 +795,18 @@ class CameraHomingTracker(object):
                 processing_end_s=rospy.get_time(),
                 position_ned=sample.position_ned,
                 measured_velocity_ned=sample.velocity_ned,
-                transmitted_setpoint=sent if self._startup_done else None,
-                state="HOMING" if self._startup_done else "STARTUP",
+                transmitted_setpoint=transmitted,
+                state=state,
                 px4_mode=None if self._hb_mode is None else str(self._hb_mode),
                 camera=command.source,
-                setpoint_stats=dict(
-                    self._setpoints.stats_snapshot(), stale_links=list(getattr(self, "_stale_links", ()))
-                ),
+                failure_reason=stats.get("fatal_reason"),
+                setpoint_stats=stats,
                 **detection_fields_from_command(command),
                 **target_motion_fields_from_command(command),
                 **setpoint_fields_from_command(command),
             )
         except Exception as exc:
             print("telemetry step failed: {}".format(exc), file=sys.stderr, flush=True)
-
-    def _record_outcome(self, status, position_truth):
-        telemetry = getattr(self, "telemetry", None)
-        if telemetry is None:
-            return
-        try:
-            miss = float(
-                np.linalg.norm(enu_to_ned(np.asarray(position_truth, dtype=float)) - self._target_ground_ned)
-            )
-            outcome = classify_run(
-                miss_m=miss, ground_contact=status == "ground", timed_out=status == "timeout",
-                target_lost=status == "target_lost",
-            )
-            telemetry.finish(outcome, reason=status, miss_m=miss)
-        except Exception as exc:
-            print("telemetry outcome failed: {}".format(exc), file=sys.stderr, flush=True)
 
     def note_failure(self, exc):
         telemetry = getattr(self, "telemetry", None)
@@ -518,28 +823,13 @@ class CameraHomingTracker(object):
         self._setpoints.tick()
 
     def _publish_setpoint(self, command):
-        """Fetch the current PX4 height estimate and send one offboard velocity setpoint."""
-        height = self._vehicle_state.sample_at(None, time.monotonic()).height_above_ground_m
-        if height is None:
-            # No PX4 estimate yet: hold level (zero vertical rate) rather than guess.
-            height = self._startup_height
-        self._send(command, height)
+        """Send one offboard velocity setpoint. Called by the setpoint stream's own thread;
+        the command is whatever the stream holds (startup setpoint or homing command)."""
+        self._send(command)
 
-    def _send(self, command, height):
-        # Read the cross-thread flags together, under the same lock `step()` writes them
-        # with, so `_send` (running on the setpoint-publisher thread) never sees a
-        # partially-updated combination of them.
-        with _lock_for(self, "_flags_lock"):
-            startup_done = self._startup_done
-            gravity_on = self._gravity_on
-            startup_yaw = self._startup_yaw
-        if startup_done:
-            velocity = command.velocity_ned
-        elif gravity_on:
-            velocity = (0.0, 0.0, float(np.clip(height - self._startup_height, -2.0, 2.0)))
-        else:
-            velocity = (0.0, 0.0, -_STARTUP_CLIMB_SPEED)
-        yaw = command.yaw_rad if startup_done or startup_yaw is None else startup_yaw
+    def _send(self, command):
+        velocity = command.velocity_ned
+        yaw = command.yaw_rad
         accel = command.acceleration_ned
         enable_feedforward = bool(
             getattr(getattr(self, "guidance", None), "enable_acceleration_feedforward", False)
@@ -559,28 +849,16 @@ class CameraHomingTracker(object):
                 float(accel[0]), float(accel[1]), float(accel[2]),
                 float(yaw), 0.0,
             )
-
-    def _update_startup_hold(self, now, height, velocity_down):
-        if abs(height - self._startup_height) <= 1.0 and abs(velocity_down) <= 0.5:
-            if self._settled_since is None:
-                self._settled_since = now
-            elif now - self._settled_since >= 1.0:
-                with _lock_for(self, "_flags_lock"):
-                    self._startup_done = True
-                print("startup hover settled; beginning camera homing", flush=True)
-                return
-        else:
-            self._settled_since = None
-        if self._hold_start_time is not None and now - self._hold_start_time > _STARTUP_HOLD_TIMEOUT:
-            raise RuntimeError("PX4 did not stabilize at the startup height; holding position")
+        with _lock_for(self, "_flags_lock"):
+            self._last_transmitted = [float(velocity[0]), float(velocity[1]), float(velocity[2])]
 
     def _motors_ready(self):
         for name in _ROTOR_JOINTS:
             joint = self._get_joint("{}::{}".format(self.model_name, name))
             if not joint.success:
-                raise RuntimeError(joint.status_message)
+                raise ServiceUnavailable(joint.status_message)
             if not joint.rate:
-                raise RuntimeError("Gazebo returned no velocity for {}".format(name))
+                raise ServiceUnavailable("Gazebo returned no velocity for {}".format(name))
             if not np.isfinite(joint.rate[0]) or abs(joint.rate[0]) < _MOTOR_READY_SPEED:
                 return False
         return True
@@ -633,7 +911,16 @@ class CameraHomingTracker(object):
         return path
 
     def shutdown(self):
+        """Drain the recording queue, then settle the outcome and close every sink. Safe to
+        call from every termination path (orderly, failure, rospy shutdown, atexit): a run
+        torn down with no outcome gets one infrastructure outcome rather than silence."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
         self._recording.close(timeout=5.0)
+        lifecycle = self._lifecycle_for()
+        lifecycle.ensure_outcome("shutdown_before_outcome")
+        lifecycle.close()
 
     def mark_fatal(self, reason=None):
         """A fatal `step()` failure stops the normal setpoint command (one-way latch)
@@ -652,36 +939,52 @@ def main():
     parser = argparse.ArgumentParser(description="Camera-homing tracker for the Gazebo Hummingbird.")
     parser.add_argument("--config", required=True)
     parser.add_argument("--model", default="hummingbird_0")
+    parser.add_argument(
+        "--startup-mode",
+        choices=[mode.value for mode in StartupMode],
+        default=os.environ.get("HOMING_STARTUP_MODE", PROPOSED_STARTUP_MODE),
+        help="takeoff: spawn on the ground, arm and climb (preferred). airborne_spawn: legacy "
+        "simulation mode, spawned at the start height with gravity disabled until the rotors spin.",
+    )
     args = parser.parse_args()
     config = load_homing_config(args.config)
     rospy.init_node("camera_homing_tracker", anonymous=True)
-    tracker = CameraHomingTracker(config, args.model, gazebo_page_path(args.config))
+    tracker = CameraHomingTracker(config, args.model, gazebo_page_path(args.config), startup_mode=args.startup_mode)
     rospy.on_shutdown(tracker.write_page)
     rospy.on_shutdown(tracker.shutdown)
     atexit.register(tracker.write_page)
     atexit.register(tracker.shutdown)
     rate = rospy.Rate(float(config["camera_rate_hz"]))
-    while not rospy.is_shutdown():
-        try:
-            status = tracker.step()
-        except Exception as exc:
-            print("tracker step failed: {}".format(exc), flush=True)
-            note = getattr(tracker, "note_failure", None)
-            if note is not None:
-                note(exc)
-            mark_fatal = getattr(tracker, "mark_fatal", None)
-            if mark_fatal is not None:
-                mark_fatal("step_exception: {}".format(exc))
+    status = None
+    try:
+        while not rospy.is_shutdown():
+            try:
+                status = tracker.step()
+            except Exception as exc:
+                print("tracker step failed: {}".format(exc), flush=True)
+                # Recoverable errors are counted against a bounded budget and the loop goes
+                # on. Anything else is fatal: the handler latches the setpoint stream and
+                # queues the run's one outcome, and the run ends here (no catch-and-continue).
+                if tracker.handle_step_error(exc):
+                    rate.sleep()
+                    continue
+                status = "failed"
+                break
+            if status is not None:
+                break
             rate.sleep()
-            continue
+    finally:
+        # Every exit path -- orderly, failed, interrupted -- saves the page and then drains
+        # the recording queue, writes the outcome and closes the recorder.
+        path = tracker.write_page()
         if status is not None:
             print("flight finished: {}".format(status), flush=True)
-            if tracker.write_page() is None:
+            if path is None:
                 print("flight finished without camera frames; no recording was written", file=sys.stderr, flush=True)
-            break
-        rate.sleep()
-    tracker.shutdown()
+        tracker.shutdown()
+    exit_code = getattr(tracker, "exit_code", None)
+    return 0 if exit_code is None else exit_code()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

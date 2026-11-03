@@ -71,6 +71,20 @@ if [ "${NUM_VEHICLES}" -lt 1 ] || [ "${NUM_VEHICLES}" -gt 255 ]; then
 	exit 1
 fi
 
+# Homing startup mode (an explicit simulation-mode flag, never implied):
+#   airborne_spawn  legacy: spawn at the start height with gravity disabled until the
+#                   rotors spin (the configuration scene_consistency validates).
+#   takeoff         preferred, documented path: spawn on the ground, arm, climb to the
+#                   start height. Flown only as an offline state machine so far.
+HOMING_STARTUP_MODE="${HOMING_STARTUP_MODE:-airborne_spawn}"
+case "${HOMING_STARTUP_MODE}" in
+	takeoff|airborne_spawn) ;;
+	*)
+		echo "HOMING_STARTUP_MODE must be takeoff|airborne_spawn, got ${HOMING_STARTUP_MODE}" >&2
+		exit 1
+		;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_path="${SCRIPT_DIR}/../../.."
 target=px4_sitl_default
@@ -191,9 +205,16 @@ for gz_attempt in 1 2 3; do
 		if [ "${spawn_ok}" = "1" ]; then
 			YAW="$(python3 -c 'import math; print(math.atan2(100.0, 50.0))')"
 			render_model 0
-			echo "Spawning hummingbird_0 at 0 0 30 yaw ${YAW}"
-			if ! spawn_sdf --spawn-file="/tmp/hummingbird_0.sdf" --model-name="hummingbird_0" -x 0 -y 0 -z 30 -Y "${YAW}"; then
-				spawn_ok=0
+			if [ "${HOMING_STARTUP_MODE}" = "airborne_spawn" ]; then
+				echo "Spawning hummingbird_0 at 0 0 30 yaw ${YAW}"
+				if ! spawn_sdf --spawn-file="/tmp/hummingbird_0.sdf" --model-name="hummingbird_0" -x 0 -y 0 -z 30 -Y "${YAW}"; then
+					spawn_ok=0
+				fi
+			else
+				echo "Spawning hummingbird_0 on the ground at 0 0 0.2 yaw ${YAW} (takeoff mode)"
+				if ! spawn_sdf --spawn-file="/tmp/hummingbird_0.sdf" --model-name="hummingbird_0" -x 0 -y 0 -z 0.2 -Y "${YAW}"; then
+					spawn_ok=0
+				fi
 			fi
 		fi
 	else
@@ -223,7 +244,8 @@ if [ "${HOMING:-0}" = "1" ]; then
 	start_px4 0
 	python3 /opt/rotorpy/Dockerfiles/camera_homing_tracker.py \
 		--config /opt/rotorpy/examples/camera_homing.jsonc \
-		--model hummingbird_0 &
+		--model hummingbird_0 \
+		--startup-mode "${HOMING_STARTUP_MODE}" &
 	tracker_pid=$!
 else
 	n=0

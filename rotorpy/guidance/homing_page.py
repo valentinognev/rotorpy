@@ -9,6 +9,7 @@ picture named by that frame's source.
 """
 
 import base64
+import html
 import io
 import json
 from pathlib import Path
@@ -26,14 +27,17 @@ _FRD_FROM_FLU = np.diag([1.0, -1.0, -1.0])
 _AXIS_COLORS = ("#d62728", "#2ca02c", "#1f77b4")
 
 
-def _scenario_extents(position: np.ndarray, world, margin: float = 15.0) -> list:
+def _scenario_extents(position: np.ndarray, world, margin: float = 15.0, extra_points=None) -> list:
     """Cube around the flown path and the target box, in simulator meters."""
     block = world.world["blocks"][0]["extents"]
     corners = np.array([
         [block[0], block[2], block[4]],
         [block[1], block[3], block[5]],
     ])
-    points = np.vstack([np.asarray(position, dtype=float), corners])
+    stacked = [np.asarray(position, dtype=float), corners]
+    if extra_points is not None:
+        stacked.append(np.asarray(extra_points, dtype=float))
+    points = np.vstack(stacked)
     low = points.min(axis=0) - margin
     high = points.max(axis=0) + margin
     span = float(np.max(high - low))
@@ -56,6 +60,71 @@ def _box_segments(extents) -> np.ndarray:
     ])
     edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
     return np.array([[corners[a], corners[b]] for a, b in edges])
+
+
+_CYLINDER_SIDES = 24
+
+
+def _cylinder_xyz(ground_sim, radius: float, height: float) -> dict:
+    """Wireframe of a vertical cylinder standing on `ground_sim` (simulator frame, z up)."""
+    x0, y0, z0 = (float(value) for value in ground_sim)
+    angles = np.linspace(0.0, 2.0 * np.pi, _CYLINDER_SIDES + 1)
+    xs, ys, zs = [], [], []
+    for z in (z0, z0 + height):
+        xs.extend(list(x0 + radius * np.cos(angles)) + [None])
+        ys.extend(list(y0 + radius * np.sin(angles)) + [None])
+        zs.extend([z] * len(angles) + [None])
+    for angle in angles[:-1:_CYLINDER_SIDES // 4]:
+        xs.extend([x0 + radius * np.cos(angle)] * 2 + [None])
+        ys.extend([y0 + radius * np.sin(angle)] * 2 + [None])
+        zs.extend([z0, z0 + height, None])
+    return {
+        "x": [None if v is None else float(v) for v in xs],
+        "y": [None if v is None else float(v) for v in ys],
+        "z": [None if v is None else float(v) for v in zs],
+    }
+
+
+def _target_ground_at(geometry, time_s: float) -> np.ndarray:
+    """Target ground contact at `time_s`: interpolated along the recorded path, else static."""
+    if geometry.target_path_sim is None or geometry.target_path_time is None:
+        return np.asarray(geometry.target_ground_sim, dtype=float)
+    path = np.asarray(geometry.target_path_sim, dtype=float)
+    times = np.asarray(geometry.target_path_time, dtype=float)
+    return np.array([np.interp(time_s, times, path[:, axis]) for axis in range(3)])
+
+
+def _target_moves(geometry) -> bool:
+    if geometry.target_path_sim is None:
+        return False
+    path = np.asarray(geometry.target_path_sim, dtype=float)
+    return bool(np.ptp(path, axis=0).max() > 1e-6)
+
+
+def _geometry_payload(geometry) -> dict:
+    return {
+        "target": {
+            "radius_m": float(geometry.target_radius_m),
+            "height_m": float(geometry.target_height_m),
+            "ground_sim": [float(value) for value in geometry.target_ground_sim],
+            "moving": _target_moves(geometry),
+        },
+        "cameras": geometry.cameras or {},
+    }
+
+
+def _geometry_text(payload: dict) -> str:
+    target = payload["target"]
+    lines = ["Target: cylinder radius {:.2f} m, height {:.1f} m, {}".format(
+        target["radius_m"], target["height_m"], "moving" if target["moving"] else "static")]
+    for name, camera in payload["cameras"].items():
+        lines.append(
+            "{} camera: mount FLU {} m, pitch {:.1f} deg, FOV {:.0f} x {:.0f} deg, {} x {} px".format(
+                name.capitalize(), [round(v, 3) for v in camera["position_flu_m"]], camera["pitch_deg"],
+                camera["fov_x_deg"], camera["fov_y_deg"], camera["width_px"], camera["height_px"],
+            )
+        )
+    return "<br>".join(html.escape(line) for line in lines)
 
 
 def _segments_xyz(segments: np.ndarray) -> dict:
@@ -170,7 +239,11 @@ def _preview_square(source, center, side, step):
 def _snapshots(record):
     rotations = Rotation.from_quat(record.quaternion).as_matrix()
     state_index = np.searchsorted(record.time, record.image_time, side="left")
-    low_high = _scenario_extents(record.position, record.world)
+    geometry = getattr(record, "geometry", None)
+    extra = None
+    if geometry is not None and geometry.target_path_sim is not None:
+        extra = np.asarray(geometry.target_path_sim, dtype=float)
+    low_high = _scenario_extents(record.position, record.world, extra_points=extra)
     span = float(low_high[3] - low_high[0])
     frustum_scale = 0.1 * span
     axis_length = 0.5 * frustum_scale
@@ -207,6 +280,11 @@ def _snapshots(record):
                 record.preview_step,
             ),
         })
+        if geometry is not None:
+            snapshots[-1]["target"] = _cylinder_xyz(
+                _target_ground_at(geometry, float(record.time[row])),
+                geometry.target_radius_m, geometry.target_height_m,
+            )
     return snapshots, axis_length, low_high
 
 
@@ -238,7 +316,12 @@ def _figure(record, snapshots, low_high):
         hoverinfo="skip",
         showlegend=False,
     ))
-    fig.add_trace(_line(_segments_xyz(_box_segments(block["extents"])), box_color, "target", width=6))
+    geometry = getattr(record, "geometry", None)
+    if geometry is not None:
+        target_xyz = first["target"]
+    else:
+        target_xyz = _segments_xyz(_box_segments(block["extents"]))
+    fig.add_trace(_line(target_xyz, box_color, "target", width=6))
     fig.add_trace(go.Scatter3d(
         x=[first["marker"][0]], y=[first["marker"][1]], z=[first["marker"][2]],
         mode="markers",
@@ -283,6 +366,9 @@ def homing_page(record) -> str:
         "axis_length": float(axis_length),
         "snapshots": snapshots,
     }
+    geometry = getattr(record, "geometry", None)
+    if geometry is not None:
+        payload["geometry"] = _geometry_payload(geometry)
     return _html(graph, payload)
 
 
@@ -314,7 +400,11 @@ def _html(graph: str, payload: dict) -> str:
 <header>
   <span id="homing-time">""" + opened + """</span>
   <input id="homing-slider" type="range" min="0" max=\"""" + str(last) + """\" value="0" step="1">
-</header>
+</header>""" + (
+        '<aside id="geometry" style="padding: 6px 16px; font-size: 13px; background: #fafafa; border-bottom: 1px solid #ddd;">'
+        + _geometry_text(payload["geometry"]) + "</aside>"
+        if "geometry" in payload else ""
+    ) + """
 <main>
   <div id="scene-wrap">""" + graph + """</div>
   <div id="cameras">
@@ -378,6 +468,9 @@ function show(index) {
         snap.front.z, snap.back.z, snap.front_props.z, snap.back_props.z,
         snap.frustum.z, snap.upward_frustum.z]
   }, [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+  if (snap.target) {
+    Plotly.restyle("homing-scene", {x: [snap.target.x], y: [snap.target.y], z: [snap.target.z]}, [1]);
+  }
 }
 slider.addEventListener("input", () => show(Number(slider.value)));
 function fit() {

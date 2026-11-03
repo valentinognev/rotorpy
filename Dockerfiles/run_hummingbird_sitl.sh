@@ -134,6 +134,8 @@ if [ "${HOMING:-0}" = "1" ]; then
 		--volume="${ROOT}/gazeboModels/homing/target_cylinder.sdf:${PX4_ROOT}/Tools/simulation/gazebo-classic/target_cylinder.sdf:ro"
 	)
 	EXTRA_ENV+=(--env="HOMING=1" --env="PYTHONPATH=/opt/rotorpy")
+	# takeoff | airborne_spawn; validated by sitl_hummingbird_run.sh inside the container.
+	EXTRA_ENV+=(--env="HOMING_STARTUP_MODE=${HOMING_STARTUP_MODE:-airborne_spawn}")
 fi
 
 # A docker TTY makes gzserver abort on this host: "Header is empty" then

@@ -172,6 +172,62 @@ def watchdog_timeouts() -> dict:
     }
 
 
+# Proposed, not verified (plan Phase 8): the startup gate's bounded waits, retries and
+# stability tolerances. No live flight has measured PX4 arming/offboard/climb times, so
+# every number is a conservative placeholder; each bound turns a hang into a
+# STARTUP_FAILURE outcome instead of waiting forever.
+#
+# Startup mode: "airborne_spawn" is the *legacy simulation mode* the scene and launcher
+# were built around (spawn 30 m up with gravity disabled until the rotors spin); it stays
+# the proposed default only because the normal-takeoff path has not been flown here.
+# "takeoff" (spawn on the ground, arm, climb to the start height) is the preferred
+# documented path and is covered offline as a state machine
+# (`startup.StartupGate`); flip this default only after the Phase 9 live validation.
+PROPOSED_STARTUP_MODE = "airborne_spawn"
+# Proposed, not verified: how far above the ground the takeoff-mode spawn places the
+# vehicle (the same 0.2 m the launcher uses for its non-homing vehicles).
+PROPOSED_TAKEOFF_SPAWN_HEIGHT_M = 0.2
+PROPOSED_SERVICE_WAIT_TIMEOUT_S = 30.0
+PROPOSED_ESTIMATE_TIMEOUT_S = 60.0
+PROPOSED_PRE_ENGAGE_STREAM_S = 1.0
+PROPOSED_ARM_RETRY_PERIOD_S = 1.0
+PROPOSED_MAX_ARM_ATTEMPTS = 20
+PROPOSED_ENGAGE_CONFIRM_TIMEOUT_S = 3.0
+PROPOSED_MOTOR_START_TIMEOUT_S = 15.0
+PROPOSED_CLIMB_TIMEOUT_S = 60.0
+PROPOSED_STABILIZE_TIMEOUT_S = 20.0
+PROPOSED_TOTAL_STARTUP_TIMEOUT_S = 180.0
+PROPOSED_SETTLE_HOLD_S = 1.0
+PROPOSED_HEIGHT_TOLERANCE_M = 1.0
+PROPOSED_VERTICAL_SPEED_TOLERANCE_M_S = 0.5
+PROPOSED_HORIZONTAL_SPEED_TOLERANCE_M_S = 0.5
+PROPOSED_STARTUP_CLIMB_SPEED_M_S = 3.0
+PROPOSED_OFFBOARD_LOSS_GRACE_S = 1.0
+PROPOSED_RECOVERABLE_ERROR_MAX_CONSECUTIVE = 20
+PROPOSED_RECOVERABLE_ERROR_MAX_TOTAL = 200
+
+
+def startup_thresholds() -> dict:
+    """Named startup-gate bounds, for `startup.StartupConfig(**startup_thresholds(), hold_height_m=...)`."""
+    return {
+        "estimate_timeout_s": PROPOSED_ESTIMATE_TIMEOUT_S,
+        "pre_engage_stream_s": PROPOSED_PRE_ENGAGE_STREAM_S,
+        "arm_retry_period_s": PROPOSED_ARM_RETRY_PERIOD_S,
+        "max_arm_attempts": PROPOSED_MAX_ARM_ATTEMPTS,
+        "engage_confirm_timeout_s": PROPOSED_ENGAGE_CONFIRM_TIMEOUT_S,
+        "motor_start_timeout_s": PROPOSED_MOTOR_START_TIMEOUT_S,
+        "climb_timeout_s": PROPOSED_CLIMB_TIMEOUT_S,
+        "stabilize_timeout_s": PROPOSED_STABILIZE_TIMEOUT_S,
+        "total_timeout_s": PROPOSED_TOTAL_STARTUP_TIMEOUT_S,
+        "settle_hold_s": PROPOSED_SETTLE_HOLD_S,
+        "height_tolerance_m": PROPOSED_HEIGHT_TOLERANCE_M,
+        "vertical_speed_tolerance_m_s": PROPOSED_VERTICAL_SPEED_TOLERANCE_M_S,
+        "horizontal_speed_tolerance_m_s": PROPOSED_HORIZONTAL_SPEED_TOLERANCE_M_S,
+        "climb_speed_m_s": PROPOSED_STARTUP_CLIMB_SPEED_M_S,
+        "offboard_loss_grace_s": PROPOSED_OFFBOARD_LOSS_GRACE_S,
+    }
+
+
 def strip_jsonc(text: str) -> str:
     """Drop // comments that sit outside strings."""
     out = []
@@ -310,10 +366,18 @@ def gazebo_scene_from_config(config: dict):
     return world, forward, upward
 
 
-def alignment_from_config(config: dict) -> EstimatorOriginAlignment:
-    """Where the estimator's local frame sits in the world, as configured."""
+def alignment_from_config(config: dict, startup_mode=None) -> EstimatorOriginAlignment:
+    """Where the estimator's local frame sits in the world, as configured.
+
+    The configured origin is the airborne-spawn pose (PX4 places its origin where the
+    vehicle spawns). In `"takeoff"` mode the vehicle spawns on the ground, so the origin is
+    the same north/east at `PROPOSED_TAKEOFF_SPAWN_HEIGHT_M` above the ground instead.
+    """
+    origin = [float(value) for value in config["estimator_origin_world_ned"]]
+    if startup_mode is not None and str(getattr(startup_mode, "value", startup_mode)) == "takeoff":
+        origin[2] = float(-config["ground_z_m"]) - PROPOSED_TAKEOFF_SPAWN_HEIGHT_M
     return EstimatorOriginAlignment(
-        origin_world_ned=config["estimator_origin_world_ned"],
+        origin_world_ned=origin,
         yaw_offset_rad=np.deg2rad(float(config["estimator_yaw_offset_deg"])),
         ground_down_world_m=-float(config["ground_z_m"]),
     )

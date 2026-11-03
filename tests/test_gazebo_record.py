@@ -75,3 +75,38 @@ def test_recorder_reports_ground_or_timeout(stamp, height, expected):
     recorder.observe(10.0, [0.0, 0.0, 30.0], [0, 0, 0, 1], None, None, _command())
     status = recorder.observe(stamp, [0.0, 0.0, height], [0, 0, 0, 1], None, None, _command())
     assert status == expected
+
+
+def test_recorder_builds_replay_geometry_from_the_authoritative_config():
+    config = _config()
+    recorder = GazeboHomingRecorder(config)
+    for t in (0.0, 0.1):
+        recorder.observe(
+            t, np.array([0.0, 0.0, 30.0]), np.array([0.0, 0.0, 0.0, 1.0]),
+            np.zeros((4, 4, 3)), np.zeros((4, 4, 3)), _command(),
+            target_ground_ned=np.array([100.0, 50.0, 0.0]) + np.array([0.0, 2.0 * t, 0.0]),
+        )
+    record = recorder.record()
+    geometry = record.geometry
+    assert geometry.target_radius_m == config["gazebo_target_radius_m"]
+    assert geometry.target_height_m == config["gazebo_target_height_m"]
+    # NED (100, 50, 0) -> simulator north, east, up.
+    assert geometry.target_ground_sim == pytest.approx([100.0, 50.0, 0.0])
+    assert geometry.target_path_sim[-1] == pytest.approx([100.0, 50.2, 0.0])
+    forward = geometry.cameras["forward"]
+    assert forward["position_flu_m"] == list(config["forward_camera_position_flu_m"])
+    assert forward["pitch_deg"] == config["forward_pitch_deg"]
+    assert forward["fov_x_deg"] == config["fov_x_deg"]
+    assert geometry.cameras["upward"]["pitch_deg"] == config["upward_pitch_deg"]
+
+
+def test_recorder_without_target_samples_uses_the_configured_static_target():
+    config = _config()
+    recorder = GazeboHomingRecorder(config)
+    recorder.observe(
+        0.0, np.array([0.0, 0.0, 30.0]), np.array([0.0, 0.0, 0.0, 1.0]),
+        np.zeros((4, 4, 3)), np.zeros((4, 4, 3)), _command(),
+    )
+    geometry = recorder.record().geometry
+    assert geometry.target_ground_sim == pytest.approx([100.0, 50.0, 0.0])
+    assert geometry.target_path_sim is None

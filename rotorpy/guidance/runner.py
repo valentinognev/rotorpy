@@ -7,7 +7,7 @@ downsampled copies of both cameras for the example animation.
 import copy
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -37,6 +37,23 @@ _PREVIEW_SIDE = 280
 
 
 @dataclass
+class ReplayGeometry:
+    """The scene a replay shows, taken from the authoritative config (simulator frame).
+
+    `target_path_*` is the target's ground contact over time when it was sampled (a moving
+    target); `None` means the configured static target. `cameras` maps `forward`/`upward`
+    to their mount position (FLU, metres), pitch and field of view.
+    """
+
+    target_radius_m: float
+    target_height_m: float
+    target_ground_sim: np.ndarray
+    target_path_time: Optional[np.ndarray] = None
+    target_path_sim: Optional[np.ndarray] = None
+    cameras: Optional[Dict[str, dict]] = None
+
+
+@dataclass
 class HomingRecord:
     """One homing flight, with camera frames small enough to animate."""
 
@@ -54,6 +71,7 @@ class HomingRecord:
     forward_camera: PinholeCamera
     upward_camera: PinholeCamera
     preview_step: int
+    geometry: Optional[ReplayGeometry] = None
 
 
 def preview_step(height: int, width: int, side: int = _PREVIEW_SIDE) -> int:

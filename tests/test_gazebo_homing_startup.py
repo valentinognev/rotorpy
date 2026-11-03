@@ -1,6 +1,7 @@
 """Verify the Gazebo startup hold and PX4 heartbeat handling without ROS."""
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import time
@@ -64,7 +65,9 @@ def test_gravity_hold_covers_all_model_links(tracker_module):
 def test_physics_unpauses_only_after_gravity_is_disabled(tracker_module, monkeypatch):
     events = []
     rospy = tracker_module.rospy
-    monkeypatch.setattr(rospy, "wait_for_service", lambda name: events.append(("wait", name)), raising=False)
+    monkeypatch.setattr(
+        rospy, "wait_for_service", lambda name, timeout=None: events.append(("wait", name)), raising=False
+    )
     monkeypatch.setattr(rospy, "Subscriber", lambda *args, **kwargs: None, raising=False)
     monkeypatch.setattr(rospy, "Timer", lambda *args, **kwargs: None, raising=False)
     monkeypatch.setattr(rospy, "Duration", lambda seconds: seconds, raising=False)
@@ -77,7 +80,7 @@ def test_physics_unpauses_only_after_gravity_is_disabled(tracker_module, monkeyp
         tracker_module.CameraHomingTracker, "_set_gravity",
         lambda self, enabled: events.append(("gravity", enabled)),
     )
-    mav = SimpleNamespace(target_system=1, wait_heartbeat=lambda: None)
+    mav = SimpleNamespace(target_system=1, wait_heartbeat=lambda timeout=None: object())
     monkeypatch.setattr(tracker_module.mavutil, "mavlink_connection", lambda *args, **kwargs: mav)
     config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
     tracker = tracker_module.CameraHomingTracker(config, "hummingbird_0")
@@ -170,32 +173,24 @@ def test_startup_waits_for_all_rotors_and_reports_invalid_feedback(tracker_modul
         tracker._motors_ready()
 
 
-def test_startup_commands_climb_then_hold_before_homing(tracker_module):
+def test_send_transmits_exactly_the_command_it_is_given(tracker_module):
+    # The startup/homing policy lives in `StartupGate` and `step()`; `_send` is only the wire.
     tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
-    tracker._gravity_on = False
-    tracker._startup_done = False
-    tracker._startup_yaw = 0.3
-    tracker._startup_height = 30.0
     sent = []
     tracker._mav = SimpleNamespace(
         target_system=1, target_component=1,
         mav=SimpleNamespace(set_position_target_local_ned_send=lambda *args: sent.append(args)),
     )
-    command = SimpleNamespace(
-        velocity_ned=[10.0, 5.0, 3.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.8
-    )
-    tracker._send(command, 30.0)
-    assert sent[-1][8:11] == (0.0, 0.0, -tracker_module._STARTUP_CLIMB_SPEED)
+    startup = tracker_module.StartupCommand(velocity_ned=(0.0, 0.0, -3.0), yaw_rad=0.3)
+    tracker._send(startup)
+    assert sent[-1][8:11] == (0.0, 0.0, -3.0)
     assert sent[-1][14] == 0.3
-    tracker._gravity_on = True
-    tracker._send(command, 32.0)
-    assert sent[-1][8:11] == (0.0, 0.0, 2.0)
-    tracker._send(command, 29.0)
-    assert sent[-1][8:11] == (0.0, 0.0, -1.0)
-    tracker._startup_done = True
-    tracker._send(command, 30.0)
+    assert tracker._last_transmitted == [0.0, 0.0, -3.0]
+    command = SimpleNamespace(velocity_ned=[10.0, 5.0, 3.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.8)
+    tracker._send(command)
     assert sent[-1][8:11] == (10.0, 5.0, 3.0)
     assert sent[-1][14] == 0.8
+    assert tracker._last_transmitted == [10.0, 5.0, 3.0]
 
 
 def test_send_masks_acceleration_by_default_but_not_when_feedforward_is_enabled(tracker_module):
@@ -211,9 +206,6 @@ def test_send_masks_acceleration_by_default_but_not_when_feedforward_is_enabled(
     assert with_feedforward | accel_bits == tracker_module._POSITION_IGNORE
 
     tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
-    tracker._gravity_on = True
-    tracker._startup_done = True
-    tracker._startup_yaw = 0.0
     command = SimpleNamespace(velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.1, 0.2, 0.3], yaw_rad=0.0)
     sent = []
     tracker._mav = SimpleNamespace(
@@ -222,17 +214,17 @@ def test_send_masks_acceleration_by_default_but_not_when_feedforward_is_enabled(
     )
 
     tracker.guidance = SimpleNamespace(enable_acceleration_feedforward=False)
-    tracker._send(command, 30.0)
+    tracker._send(command)
     assert sent[-1][4] == tracker_module._POSITION_IGNORE
 
     tracker.guidance = SimpleNamespace(enable_acceleration_feedforward=True)
-    tracker._send(command, 30.0)
+    tracker._send(command)
     assert sent[-1][4] == with_feedforward
 
     # No `guidance` attribute at all (matches every other `_send`-only test in this
     # file, built via `__new__`): defaults to masked, same as before this task.
     del tracker.guidance
-    tracker._send(command, 30.0)
+    tracker._send(command)
     assert sent[-1][4] == tracker_module._POSITION_IGNORE
 
 
@@ -242,9 +234,6 @@ def test_mav_access_is_serialised_across_threads(tracker_module):
     import threading
 
     tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
-    tracker._gravity_on = True
-    tracker._startup_done = True
-    tracker._startup_yaw = 0.0
     tracker._hb_armed = False
     tracker._hb_mode = None
     tracker._last_status = None
@@ -281,7 +270,7 @@ def test_mav_access_is_serialised_across_threads(tracker_module):
         recv_match=slow_recv,
     )
     command = SimpleNamespace(velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0)
-    send_thread = threading.Thread(target=lambda: tracker._send(command, 30.0))
+    send_thread = threading.Thread(target=lambda: tracker._send(command))
     poll_thread = threading.Thread(target=tracker._poll_mavlink)
     send_thread.start()
     poll_thread.start()
@@ -290,22 +279,13 @@ def test_mav_access_is_serialised_across_threads(tracker_module):
     assert overlap == []
 
 
-def test_startup_requires_a_sustained_stable_hover(tracker_module):
-    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
-    tracker._startup_done = False
-    tracker._startup_height = 30.0
-    tracker._settled_since = None
-    tracker._hold_start_time = 0.0
-    tracker._update_startup_hold(1.0, 30.0, 0.0)
-    tracker._update_startup_hold(1.8, 31.5, 0.0)
-    tracker._update_startup_hold(2.0, 30.0, 0.0)
-    tracker._update_startup_hold(2.9, 30.0, 0.0)
-    assert not tracker._startup_done
-    tracker._update_startup_hold(3.0, 30.0, 0.0)
-    assert tracker._startup_done
-    tracker._startup_done = False
-    with pytest.raises(RuntimeError, match="did not stabilize"):
-        tracker._update_startup_hold(21.0, 35.0, 1.0)
+def _scorer(timeout_s=20.0):
+    from rotorpy.guidance.scoring import TargetShape, TruthScorer
+
+    return TruthScorer(
+        TargetShape(radius_m=0.75, height_m=3.0), timeout_s=timeout_s,
+        static_target_ground_ned=[100.0, 50.0, 0.0],
+    )
 
 
 def _new_tracker(tracker_module, monkeypatch, armed=True):
@@ -323,15 +303,12 @@ def _new_tracker(tracker_module, monkeypatch, armed=True):
     tracker._command = None
     tracker._startup_yaw = 0.0
     tracker._startup_height = 30.0
-    tracker._sent = 20
     tracker._flight_state = lambda: armed
     tracker._gravity_on = False
-    tracker._motor_start_time = None
     tracker._startup_done = False
-    tracker._hold_start_time = None
-    tracker._settled_since = None
     tracker._hb_mode = None
-    tracker._target_ground_ned = np.array([100.0, 50.0, 0.0])
+    tracker._scorer = _scorer()
+    tracker.guidance = _FakeGuidance()
     tracker.recorder = None
     tracker.telemetry = None
     tracker._pose_truth = lambda: (np.array([0.0, 0.0, 30.0]), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
@@ -340,28 +317,49 @@ def _new_tracker(tracker_module, monkeypatch, armed=True):
     return tracker
 
 
+def _fresh_estimate(tracker, wall_s=None):
+    """Ingest one PX4 estimate at rest at the 30 m airborne spawn (the configured estimator
+    origin), and touch telemetry."""
+    wall_s = time.monotonic() if wall_s is None else wall_s
+    tracker._vehicle_state.ingest_attitude(sim_s=wall_s, wall_s=wall_s, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=wall_s, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+    tracker._watchdogs.touch("telemetry", wall_s)
+
+
 def test_gravity_stays_off_until_armed_offboard_motors_spin(tracker_module, monkeypatch):
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
+    _fresh_estimate(tracker)
+    tracker.step()  # estimate fresh -> ENGAGE
+    tracker.step()  # armed + offboard confirmed -> MOTOR_START
     tracker.step()
     assert not tracker._gravity_on
     tracker._motors_ready = lambda: True
+    _fresh_estimate(tracker)
     tracker.step()
     assert tracker._gravity_on
     assert not tracker._startup_done
 
 
-def test_step_does_not_restamp_the_setpoint_stream_without_a_fresh_estimate(tracker_module, monkeypatch):
-    # Before this fix, `step()` called `set_command` every tick with the current wall
-    # time, including the hold-last-command branch (no fresh image, no PX4 estimate):
-    # the setpoint stream's expiry then never fired, so a dead camera or dead telemetry
-    # never stopped the stream.
+def test_gravity_is_not_released_without_a_fresh_estimate(tracker_module, monkeypatch):
     tracker = _new_tracker(tracker_module, monkeypatch)
-    tracker._motors_ready = lambda: False
-    # No PX4 estimate is ever ingested: `have_estimate` is False on every tick.
+    tracker._motors_ready = lambda: True
+    tracker.step()  # no PX4 estimate was ever ingested
+    tracker.step()
+    assert not tracker._gravity_on
+
+
+def test_homing_stream_is_not_restamped_without_a_fresh_estimate(tracker_module, monkeypatch):
+    # `step()` used to call `set_command` every tick with the current wall time, including
+    # the hold-last-command branch (no fresh image, no PX4 estimate): the stream's expiry
+    # then never fired, so a dead camera or dead telemetry never stopped it.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._startup_done = True
+    tracker._gravity_on = True
     tracker.step()
     _, stamp_first = tracker._setpoints.peek()
-    assert stamp_first is not None
     tracker.step()
     _, stamp_second = tracker._setpoints.peek()
     assert stamp_second == stamp_first
@@ -372,6 +370,8 @@ def test_watchdog_staleness_marks_the_setpoint_stream_fatal(tracker_module, monk
     # consumed anywhere; a dead comms link must stop the normal command.
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
+    tracker._startup_done = True  # the fatal latch is for homing; startup waits within its bounds
+    tracker._gravity_on = True
     fresh_now = time.monotonic()
     for name in ("heartbeat", "telemetry", "image"):
         tracker._watchdogs.touch(name, fresh_now)
@@ -379,8 +379,10 @@ def test_watchdog_staleness_marks_the_setpoint_stream_fatal(tracker_module, monk
     tracker.step()
     assert tracker._setpoints.stats.failed is False
     # Time advances well past every watchdog's timeout with no further touches: stale.
+    # PX4's heartbeat link is lost, so the run ends as an OFFBOARD_FAILURE, not silently.
     monkeypatch.setattr(tracker_module.time, "monotonic", lambda: fresh_now + 10.0)
-    tracker.step()
+    with pytest.raises(tracker_module.OffboardFailure, match="watchdog_lost:heartbeat"):
+        tracker.step()
     assert tracker._setpoints.stats.failed is True
 
 
@@ -459,13 +461,91 @@ def test_abort_marks_the_setpoint_stream_fatal_and_reports_target_lost(tracker_m
     assert tracker._setpoints.stats.failed is True
 
 
+def _end_by(tracker, reason):
+    """Make the truth side end the flight with `reason` at the next step."""
+    if reason == "ground":
+        tracker._pose_truth = lambda: (np.array([0.0, 0.0, 0.1]), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
+    else:
+        tracker._scorer = _scorer(timeout_s=0.0)
+
+
 @pytest.mark.parametrize("reason", ["ground", "timeout"])
 def test_tracker_step_reports_flight_end(tracker_module, monkeypatch, reason):
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._gravity_on = True
     tracker._startup_done = True
-    tracker.recorder = SimpleNamespace(observe=lambda *args: reason)
+    _end_by(tracker, reason)
     assert tracker.step() == reason
+
+
+@pytest.mark.parametrize("reason", ["ground", "timeout"])
+def test_termination_does_not_need_a_recorder_or_telemetry_or_a_camera(tracker_module, monkeypatch, capsys, reason):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._gravity_on = True
+    tracker._startup_done = True
+    tracker.recorder = None
+    tracker.telemetry = None
+    _end_by(tracker, reason)
+    assert tracker._observations.take_fresh("forward")[1] is False  # no camera frame ever arrived
+    assert tracker.step() == reason
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("RUN_OUTCOME")]
+    assert len(lines) == 1
+    assert json.loads(lines[0].split(" ", 1)[1])["outcome"] == {"ground": "GROUND_MISS", "timeout": "TIMEOUT"}[reason]
+
+
+def test_ground_contact_is_never_scored_target_reached_but_a_close_miss_is(tracker_module, monkeypatch):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._gravity_on = True
+    tracker._startup_done = True
+    tracker._pose_truth = lambda: (np.array([0.0, 0.0, 0.1]), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
+    assert tracker.step() == "ground"
+    assert tracker._lifecycle.outcome.name == "GROUND_MISS"
+
+    near = _new_tracker(tracker_module, monkeypatch)
+    near._gravity_on = True
+    near._startup_done = True
+    # ENU (east 52, north 100, up 0.1): 2 m east of the ground point, 1.25 m off the cylinder surface.
+    near._pose_truth = lambda: (np.array([52.0, 100.0, 0.1]), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
+    assert near.step() == "ground"
+    assert near._lifecycle.outcome.name == "TARGET_REACHED"
+
+
+def test_target_contact_ends_the_run_before_the_ground_and_a_moving_target_is_followed(tracker_module, monkeypatch):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._gravity_on = True
+    tracker._startup_done = True
+    clock = [10.0]
+    monkeypatch.setattr(tracker_module.rospy, "get_time", lambda: clock[0], raising=False)
+    # The target drives east at 5 m/s; truth samples come at matching sim times.
+    tracker._target_truth = lambda: np.array([100.0, 50.0 + 5.0 * (clock[0] - 10.0), 0.0])
+    positions = iter([
+        np.array([40.0, 100.0, 1.5]),    # ENU east 40 / north 100 / up 1.5: 10 m west of the target
+        np.array([70.0, 100.0, 1.5]),    # 10 m east of the target, which has moved to east 60
+    ])
+    tracker._pose_truth = lambda: (next(positions), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
+    assert tracker.step() is None
+    clock[0] = 12.0
+    assert tracker.step() == "target"
+    assert tracker._lifecycle.outcome.name == "TARGET_REACHED"
+
+
+def test_a_failed_truth_read_is_recoverable_and_bounded(tracker_module, monkeypatch):
+    from rotorpy.guidance.run_failure import RecoverableBudget, ServiceUnavailable
+
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._gravity_on = True
+    tracker._startup_done = True
+    tracker._budget = RecoverableBudget(max_consecutive=3, max_total=100)
+
+    def broken():
+        raise ServiceUnavailable("get_model_state: no such model")
+
+    tracker._pose_truth = broken
+    for _ in range(3):
+        assert tracker.step() is None  # control keeps going, the failure is counted
+    assert tracker._budget.consecutive == 3
+    with pytest.raises(tracker_module.SimulatorFailure, match="recoverable_errors"):
+        tracker.step()
 
 
 @pytest.mark.parametrize("reason", ["ground", "timeout"])
@@ -482,7 +562,7 @@ def test_main_stops_after_saving_flight(tracker_module, monkeypatch, capsys, rea
     monkeypatch.setattr(sys, "argv", ["tracker", "--config", "config.jsonc"])
     monkeypatch.setattr(tracker_module, "load_homing_config", lambda path: {"camera_rate_hz": 20})
     monkeypatch.setattr(tracker_module, "gazebo_page_path", lambda path: "flight.html")
-    monkeypatch.setattr(tracker_module, "CameraHomingTracker", lambda *args: fake_tracker)
+    monkeypatch.setattr(tracker_module, "CameraHomingTracker", lambda *args, **kwargs: fake_tracker)
     monkeypatch.setattr(tracker_module.atexit, "register", lambda callback: None)
     monkeypatch.setattr(rospy, "init_node", lambda *args, **kwargs: None, raising=False)
     monkeypatch.setattr(rospy, "on_shutdown", lambda callback: None, raising=False)
@@ -495,39 +575,102 @@ def test_main_stops_after_saving_flight(tracker_module, monkeypatch, capsys, rea
     assert ("no recording was written" in output.err) is not has_recording
 
 
-def test_main_marks_the_setpoint_stream_fatal_on_a_step_exception(tracker_module, monkeypatch):
-    # A fatal `step()` failure must stop the normal command just like an expired or
-    # watchdog-stale one, not leave the stream streaming whatever was last held forever.
+def _run_main(tracker_module, monkeypatch, fake_tracker, argv=("tracker", "--config", "config.jsonc")):
+    rospy = tracker_module.rospy
+    monkeypatch.setattr(sys, "argv", list(argv))
+    monkeypatch.setattr(tracker_module, "load_homing_config", lambda path: {"camera_rate_hz": 20})
+    monkeypatch.setattr(tracker_module, "gazebo_page_path", lambda path: "flight.html")
+    monkeypatch.setattr(tracker_module, "CameraHomingTracker", lambda *args, **kwargs: fake_tracker)
+    monkeypatch.setattr(tracker_module.atexit, "register", lambda callback: None)
+    monkeypatch.setattr(rospy, "init_node", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(rospy, "on_shutdown", lambda callback: None, raising=False)
+    monkeypatch.setattr(rospy, "Rate", lambda rate: SimpleNamespace(sleep=lambda: None), raising=False)
+    monkeypatch.setattr(rospy, "is_shutdown", lambda: False, raising=False)
+    return tracker_module.main()
+
+
+def test_main_ends_the_run_on_a_fatal_step_error_and_still_flushes(tracker_module, monkeypatch):
+    # A fatal `step()` failure ends the run: the tracker handler latches the stream and
+    # writes the outcome; main stops (no catch-and-continue), then saves and shuts down.
     events = []
-    outcomes = iter([RuntimeError("boom"), "timeout"])
 
     def step():
-        outcome = next(outcomes)
+        events.append("step")
+        raise RuntimeError("boom")
+
+    fake_tracker = SimpleNamespace(
+        step=step,
+        handle_step_error=lambda exc: events.append(("handle", str(exc))) or False,
+        write_page=lambda: events.append("write") or "flight.html",
+        shutdown=lambda: events.append("shutdown"),
+        exit_code=lambda: 1,
+    )
+    assert _run_main(tracker_module, monkeypatch, fake_tracker) == 1
+    assert events == ["step", ("handle", "boom"), "write", "shutdown"]
+
+
+def test_main_continues_after_a_recoverable_step_error(tracker_module, monkeypatch):
+    events = []
+    steps = iter([RuntimeError("blip"), "timeout"])
+
+    def step():
+        outcome = next(steps)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
 
     fake_tracker = SimpleNamespace(
         step=step,
+        handle_step_error=lambda exc: events.append("recoverable") or True,
         write_page=lambda: events.append("write") or "flight.html",
         shutdown=lambda: events.append("shutdown"),
-        note_failure=lambda exc: events.append(("note_failure", str(exc))),
-        mark_fatal=lambda reason=None: events.extend(["mark_fatal", reason]),
+        exit_code=lambda: 0,
     )
+    assert _run_main(tracker_module, monkeypatch, fake_tracker) == 0
+    assert events == ["recoverable", "write", "shutdown"]
+
+
+def test_main_shuts_down_even_if_the_loop_itself_raises(tracker_module, monkeypatch):
+    events = []
+
+    def step():
+        raise KeyboardInterrupt()
+
+    fake_tracker = SimpleNamespace(
+        step=step,
+        write_page=lambda: events.append("write"),
+        shutdown=lambda: events.append("shutdown"),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        _run_main(tracker_module, monkeypatch, fake_tracker)
+    assert events == ["write", "shutdown"]
+
+
+def test_main_passes_an_explicit_startup_mode_flag(tracker_module, monkeypatch):
+    seen = {}
+    fake_tracker = SimpleNamespace(
+        step=lambda: "timeout", write_page=lambda: "x", shutdown=lambda: None, exit_code=lambda: 0,
+    )
+
+    def build(*args, **kwargs):
+        seen.update(kwargs)
+        return fake_tracker
+
     rospy = tracker_module.rospy
-    monkeypatch.setattr(sys, "argv", ["tracker", "--config", "config.jsonc"])
+    monkeypatch.setattr(sys, "argv", ["tracker", "--config", "c.jsonc", "--startup-mode", "takeoff"])
     monkeypatch.setattr(tracker_module, "load_homing_config", lambda path: {"camera_rate_hz": 20})
     monkeypatch.setattr(tracker_module, "gazebo_page_path", lambda path: "flight.html")
-    monkeypatch.setattr(tracker_module, "CameraHomingTracker", lambda *args: fake_tracker)
+    monkeypatch.setattr(tracker_module, "CameraHomingTracker", build)
     monkeypatch.setattr(tracker_module.atexit, "register", lambda callback: None)
     monkeypatch.setattr(rospy, "init_node", lambda *args, **kwargs: None, raising=False)
     monkeypatch.setattr(rospy, "on_shutdown", lambda callback: None, raising=False)
     monkeypatch.setattr(rospy, "Rate", lambda rate: SimpleNamespace(sleep=lambda: None), raising=False)
     monkeypatch.setattr(rospy, "is_shutdown", lambda: False, raising=False)
     tracker_module.main()
-    assert "mark_fatal" in events
-    assert events.index("mark_fatal") < events.index("write")
-    assert events[events.index("mark_fatal") + 1] == "step_exception: boom"
+    assert seen["startup_mode"] == "takeoff"
+    monkeypatch.setattr(sys, "argv", ["tracker", "--config", "c.jsonc", "--startup-mode", "teleport"])
+    with pytest.raises(SystemExit):
+        tracker_module.main()
 
 
 def test_step_fuses_the_other_cameras_still_recent_cached_image(tracker_module, monkeypatch):
@@ -596,8 +739,10 @@ def _stepping_tracker(tracker_module, monkeypatch, reason, telemetry):
     )
     tracker._gravity_on = True
     tracker._startup_done = True
-    tracker.recorder = SimpleNamespace(observe=lambda *args: reason)
+    # The recorder only records; the truth scorer decides when the flight ends.
+    tracker.recorder = SimpleNamespace(observe=lambda *args, **kwargs: None)
     tracker.telemetry = telemetry
+    _end_by(tracker, reason)
     return tracker
 
 
@@ -712,7 +857,7 @@ def test_setpoint_publisher_cannot_swallow_the_discontinuity_before_step_sees_it
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
     tracker.guidance = _FakeGuidance()
-    tracker._send = lambda command, height: None
+    tracker._send = lambda command: None
     now = time.monotonic()
     for name in ("heartbeat", "telemetry", "image"):
         tracker._watchdogs.touch(name, now)
@@ -728,6 +873,8 @@ def test_setpoint_publisher_cannot_swallow_the_discontinuity_before_step_sees_it
 def _dropout_tracker(tracker_module, monkeypatch, published, clock):
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
+    tracker._startup_done = True  # these tests are about homing-time link loss
+    tracker._gravity_on = True
     tracker.guidance = _FakeGuidance()
     tracker._setpoints = tracker_module.SetpointStream(
         publish=published.append, expiry_s=0.5, now=lambda: clock[0]
@@ -779,7 +926,8 @@ def test_telemetry_loss_is_fatal_and_records_why(tracker_module, monkeypatch):
     tracker.step()
     # Telemetry goes silent while heartbeat and image stay alive.
     _tick_at(tracker_module, monkeypatch, tracker, clock, 2.0, ("heartbeat", "image"))
-    tracker.step()
+    with pytest.raises(tracker_module.EstimatorFailure, match="watchdog_lost:telemetry"):
+        tracker.step()
     assert tracker._setpoints.stats.failed is True
     assert tracker._setpoints.stats.fatal_reason == "watchdog_lost:telemetry"
     # Latched: even a fresh frame and recovered telemetry do not bring normal commands back.
@@ -813,3 +961,301 @@ def test_recording_carries_the_stale_links_and_fatal_reason_in_setpoint_stats(tr
     tracker.step()
     assert seen[-1]["setpoint_stats"]["stale_links"] == ["image"]
     assert seen[-1]["setpoint_stats"]["fatal_reason"] is None
+
+
+# --- plan phase 8: startup gate, explicit stream policy, outcomes, shutdown --------------
+
+
+def test_startup_stream_runs_on_the_estimate_alone_before_the_first_image(tracker_module, monkeypatch):
+    # Carry-over: the placeholder command used to be stamped once and then expire, so the
+    # stream went silent whenever the PX4 estimate preceded the first camera image.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    clock = [100.0]
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: clock[0])
+    _fresh_estimate(tracker, 100.0)
+    stamps = []
+    for step in range(30):  # 1.5 s of steps at 20 Hz: three expiry intervals of 0.5 s
+        clock[0] = 100.0 + 0.05 * step
+        _fresh_estimate(tracker, clock[0])
+        tracker.step()
+        command, stamp = tracker._setpoints.peek()
+        stamps.append(stamp)
+        assert isinstance(command, tracker_module.StartupCommand)
+        assert stamp == pytest.approx(clock[0])  # restamped every step: never expires on its own
+    assert command.velocity_ned == (0.0, 0.0, -3.0)  # airborne spawn, gravity off: the legacy climb hold
+    assert command.yaw_rad == 0.0  # the vehicle's own heading, never a target direction
+
+
+def test_startup_stream_goes_silent_when_the_estimate_stops_being_fresh(tracker_module, monkeypatch):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker._setpoints = tracker_module.SetpointStream(publish=lambda command: None, expiry_s=0.5)
+    clock = [100.0]
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: clock[0])
+    _fresh_estimate(tracker, 100.0)
+    tracker.step()
+    _, stamp = tracker._setpoints.peek()
+    clock[0] = 105.0  # telemetry is silent (never re-touched): the estimate is no longer fresh
+    tracker.step()
+    assert tracker._setpoints.peek()[1] == stamp  # not restamped
+    assert tracker._setpoints.tick(now_s=105.0) is None  # expired: nothing is sent
+
+
+def test_nothing_is_streamed_during_startup_without_an_estimate(tracker_module, monkeypatch):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker.step()
+    assert tracker._setpoints.peek() == (None, None)
+
+
+def test_the_homing_command_never_transmits_while_the_gate_is_still_open(tracker_module, monkeypatch):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker.guidance = _FakeGuidance()
+    _fresh_estimate(tracker)
+    _offer_frame(tracker, time.monotonic())
+    tracker.step()
+    command, _ = tracker._setpoints.peek()
+    assert isinstance(command, tracker_module.StartupCommand)
+    assert tracker._command.velocity_ned == [1.0, 0.0, 0.0]  # guidance runs, but is not sent
+
+
+def _takeoff_tracker(tracker_module, monkeypatch, clock):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker.startup_mode = tracker_module.StartupMode.TAKEOFF
+    tracker.guidance = _FakeGuidance()
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: clock[0])
+    return tracker
+
+
+def test_takeoff_mode_reaches_homing_through_the_gate_without_touching_gravity(tracker_module, monkeypatch):
+    clock = [100.0]
+    tracker = _takeoff_tracker(tracker_module, monkeypatch, clock)
+    gravity_calls = []
+    tracker._set_gravity = lambda enabled: gravity_calls.append(enabled)
+    tracker._motors_ready = lambda: pytest.fail("takeoff mode must not wait on the gravity-hold motor check")
+    engage_calls = []
+    tracker._engage = lambda: engage_calls.append(clock[0])
+    for step in range(120):
+        clock[0] = 100.0 + 0.05 * step
+        _fresh_estimate(tracker, clock[0])
+        _offer_frame(tracker, clock[0])
+        tracker.step()
+        if tracker._startup_done:
+            break
+    assert tracker._startup_done
+    assert gravity_calls == []
+    assert engage_calls == []  # `_flight_state` already reports armed + offboard
+    command, _ = tracker._setpoints.peek()
+    assert command.velocity_ned == [1.0, 0.0, 0.0]  # the guidance command takes over
+
+
+def test_arming_is_requested_through_the_gate_and_bounded(tracker_module, monkeypatch):
+    clock = [100.0]
+    tracker = _takeoff_tracker(tracker_module, monkeypatch, clock)
+    tracker._flight_state = lambda: False
+    engage_calls = []
+    tracker._engage = lambda: engage_calls.append(clock[0])
+    with pytest.raises(tracker_module.StartupFailure, match="offboard_not_confirmed"):
+        for step in range(2000):
+            clock[0] = 100.0 + 0.05 * step
+            _fresh_estimate(tracker, clock[0])
+            tracker.step()
+    assert 1 <= len(engage_calls) <= 20  # PROPOSED_MAX_ARM_ATTEMPTS, never unbounded
+
+
+def test_startup_failure_latches_the_stream_and_writes_exactly_one_outcome(tracker_module, monkeypatch, capsys):
+    clock = [100.0]
+    tracker = _takeoff_tracker(tracker_module, monkeypatch, clock)
+    calls = []
+    tracker.telemetry = SimpleNamespace(
+        step=lambda **kwargs: True,
+        finish=lambda outcome, **kwargs: calls.append((outcome, kwargs)) or True,
+        close=lambda **kwargs: calls.append("close"),
+    )
+    tracker.step()  # the gate starts waiting for an estimate that never arrives
+    clock[0] = 100.0 + 70.0  # past the 60 s estimate wait
+    with pytest.raises(tracker_module.StartupFailure) as info:
+        tracker.step()
+    assert tracker.handle_step_error(info.value) is False
+    assert tracker.handle_step_error(info.value) is False  # a second report adds nothing
+    assert tracker._setpoints.stats.failed
+    assert tracker._setpoints.stats.fatal_reason.startswith("startup_failure")
+    outcomes = [call for call in calls if call != "close"]
+    assert [o[0].name for o in outcomes] == ["STARTUP_FAILURE"]
+    assert outcomes[0][1]["reason"] == "estimate_timeout"
+    assert tracker.exit_code() == 1
+
+
+def test_a_failed_init_is_reported_as_startup_failure_by_the_first_step(tracker_module, monkeypatch):
+    rospy = tracker_module.rospy
+    monkeypatch.setattr(rospy, "Timer", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(rospy, "Duration", lambda seconds: seconds, raising=False)
+    monkeypatch.setattr(rospy, "Subscriber", lambda *a, **k: None, raising=False)
+
+    def never_up(name, timeout=None):
+        raise RuntimeError("timeout waiting for {}".format(name))
+
+    monkeypatch.setattr(rospy, "wait_for_service", never_up, raising=False)
+    config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
+    tracker = tracker_module.CameraHomingTracker(config, "hummingbird_0")  # does not raise or hang
+    with pytest.raises(tracker_module.StartupFailure, match="service_timeout:/gazebo/get_link_properties"):
+        tracker.step()
+    assert tracker.handle_step_error(tracker_module.StartupFailure("x")) is False
+    tracker.shutdown()  # drains the queued outcome
+    assert tracker._lifecycle.outcome.name == "STARTUP_FAILURE"
+
+
+def test_a_missing_heartbeat_is_a_bounded_startup_failure(tracker_module, monkeypatch):
+    rospy = tracker_module.rospy
+    monkeypatch.setattr(rospy, "wait_for_service", lambda name, timeout=None: None, raising=False)
+    monkeypatch.setattr(rospy, "Subscriber", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(rospy, "Timer", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(rospy, "Duration", lambda seconds: seconds, raising=False)
+    monkeypatch.setattr(rospy, "ServiceProxy", lambda name, _type: (lambda *args: None), raising=False)
+    monkeypatch.setattr(tracker_module.CameraHomingTracker, "_set_gravity", lambda self, enabled: None)
+    mav = SimpleNamespace(target_system=1, wait_heartbeat=lambda timeout=None: None)
+    monkeypatch.setattr(tracker_module.mavutil, "mavlink_connection", lambda *args, **kwargs: mav)
+    config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
+    tracker = tracker_module.CameraHomingTracker(config, "hummingbird_0")
+    with pytest.raises(tracker_module.StartupFailure, match="heartbeat_timeout"):
+        tracker.step()
+
+
+def test_airborne_spawn_is_an_explicit_mode_takeoff_never_disables_gravity(tracker_module, monkeypatch):
+    rospy = tracker_module.rospy
+    gravity = []
+    monkeypatch.setattr(rospy, "wait_for_service", lambda name, timeout=None: None, raising=False)
+    monkeypatch.setattr(rospy, "Subscriber", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(rospy, "Timer", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(rospy, "Duration", lambda seconds: seconds, raising=False)
+    monkeypatch.setattr(rospy, "ServiceProxy", lambda name, _type: (lambda *args: None), raising=False)
+    monkeypatch.setattr(
+        tracker_module.CameraHomingTracker, "_set_gravity", lambda self, enabled: gravity.append(enabled)
+    )
+    mav = SimpleNamespace(target_system=1, wait_heartbeat=lambda timeout=None: object())
+    monkeypatch.setattr(tracker_module.mavutil, "mavlink_connection", lambda *args, **kwargs: mav)
+    config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
+    airborne = tracker_module.CameraHomingTracker(config, "hummingbird_0", startup_mode="airborne_spawn")
+    assert gravity == [False]
+    takeoff = tracker_module.CameraHomingTracker(config, "hummingbird_0", startup_mode="takeoff")
+    assert gravity == [False]  # unchanged: takeoff never touches gravity
+    assert takeoff.startup_mode is tracker_module.StartupMode.TAKEOFF
+    with pytest.raises(ValueError, match="startup mode"):
+        tracker_module.CameraHomingTracker(config, "hummingbird_0", startup_mode="teleport")
+    airborne.shutdown()
+    takeoff.shutdown()
+
+
+def test_handle_step_error_bounds_recoverable_errors_and_classifies_the_rest(tracker_module, monkeypatch):
+    from rotorpy.guidance.run_failure import RecoverableBudget, RecoverableError
+
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._budget = RecoverableBudget(max_consecutive=2, max_total=10)
+    assert tracker.handle_step_error(RecoverableError("blip")) is True
+    assert tracker.handle_step_error(RecoverableError("blip")) is True
+    assert not tracker._setpoints.stats.failed
+    assert tracker.handle_step_error(RecoverableError("blip")) is False  # escalated
+    assert tracker._setpoints.stats.failed
+    assert tracker._lifecycle.outcome.name == "SIMULATOR_FAILURE"
+
+    unknown = _new_tracker(tracker_module, monkeypatch)
+    assert unknown.handle_step_error(KeyError("boom")) is False
+    assert unknown._setpoints.stats.fatal_reason.startswith("step_exception")
+    assert unknown._lifecycle.outcome.name == "SIMULATOR_FAILURE"
+    assert unknown._lifecycle.outcome_reason.startswith("unexpected:KeyError")
+
+    offboard = _new_tracker(tracker_module, monkeypatch)
+    offboard.handle_step_error(tracker_module.OffboardFailure("offboard_lost"))
+    assert offboard._lifecycle.outcome.name == "OFFBOARD_FAILURE"
+
+
+def test_shutdown_flushes_and_closes_everything_even_when_sinks_fail(tracker_module, monkeypatch, capsys):
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    closed = []
+
+    class FailingTelemetry(object):
+        def step(self, **kwargs):
+            raise OSError("disk full")
+
+        def finish(self, outcome, **kwargs):
+            raise OSError("disk full")
+
+        def close(self, flush_frames=False):
+            closed.append(("telemetry", flush_frames))
+            raise OSError("close failed")
+
+    tracker.telemetry = FailingTelemetry()
+    recording = SimpleNamespace(close=lambda timeout=None: closed.append(("worker", timeout)))
+    tracker._recording = recording
+    tracker.shutdown()
+    tracker.shutdown()  # idempotent
+    assert closed == [("worker", 5.0), ("telemetry", True)]
+    # No outcome had been decided: shutdown records exactly one infrastructure outcome,
+    # printed even though the telemetry sink failed.
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("RUN_OUTCOME")]
+    assert len(lines) == 1
+    payload = json.loads(lines[0].split(" ", 1)[1])
+    assert payload["outcome"] == "SIMULATOR_FAILURE" and payload["reason"] == "shutdown_before_outcome"
+
+
+def test_shutdown_after_an_orderly_outcome_keeps_it(tracker_module, monkeypatch):
+    calls = []
+    telemetry = SimpleNamespace(
+        step=lambda **kwargs: True,
+        finish=lambda outcome, **kwargs: calls.append(outcome.name) or True,
+        close=lambda flush_frames=False: calls.append("close"),
+    )
+    tracker = _stepping_tracker(tracker_module, monkeypatch, "ground", telemetry)
+    assert tracker.step() == "ground"
+    tracker._recording = SimpleNamespace(close=lambda timeout=None: None)
+    tracker.shutdown()
+    assert calls == ["GROUND_MISS", "close"]
+
+
+def test_telemetry_ticks_carry_the_phase_transmitted_setpoint_and_failure_reason(tracker_module, monkeypatch):
+    seen = []
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker.telemetry = SimpleNamespace(step=lambda **kwargs: seen.append(kwargs) or True)
+    tracker._motors_ready = lambda: False
+    tracker.guidance = _FakeGuidance()
+    tracker._last_transmitted = [0.0, 0.0, -3.0]
+    _fresh_estimate(tracker)
+    tracker._setpoints.mark_fatal("watchdog_lost:telemetry")
+    tracker.step()
+    tick = seen[-1]
+    assert tick["state"] in {"ENGAGE", "MOTOR_START"}
+    assert tick["transmitted_setpoint"] == [0.0, 0.0, -3.0]
+    assert tick["failure_reason"] == "watchdog_lost:telemetry"
+    assert tick["attitude_age_s"] is not None and tick["position_age_s"] is not None
+
+
+def test_target_truth_reads_the_target_model_on_the_truth_side_only(tracker_module):
+    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
+    assert tracker._target_truth() is None  # no model-state service: scorer falls back to the config
+    states = {}
+
+    def model_state(name, relative):
+        states["asked"] = name
+        pose = SimpleNamespace(position=SimpleNamespace(x=50.0, y=100.0, z=1.5))
+        return SimpleNamespace(success=True, pose=pose, status_message="")
+
+    tracker._model_state = model_state
+    tracker._target_height_m = 3.0
+    ground = tracker._target_truth()
+    assert states["asked"] == "homing_target"
+    # ENU centre (50, 100, 1.5) -> NED (100, 50, -1.5); the ground contact is half the height below.
+    assert ground == pytest.approx([100.0, 50.0, 0.0])
+
+
+def test_launcher_selects_the_startup_mode_explicitly():
+    launcher = (ROOT / "Dockerfiles" / "sitl_hummingbird_run.sh").read_text()
+    assert 'HOMING_STARTUP_MODE="${HOMING_STARTUP_MODE:-airborne_spawn}"' in launcher
+    assert '--startup-mode "${HOMING_STARTUP_MODE}"' in launcher
+    assert "takeoff|airborne_spawn" in launcher
+    # The airborne spawn (the one scene_consistency validates) comes first; the takeoff
+    # spawn on the ground is a separate branch.
+    assert launcher.index("-z 30 -Y") < launcher.index('--model-name="hummingbird_0" -x 0 -y 0 -z 0.2 -Y')
+    runner = (ROOT / "Dockerfiles" / "run_hummingbird_sitl.sh").read_text()
+    assert "HOMING_STARTUP_MODE" in runner

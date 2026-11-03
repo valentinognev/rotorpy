@@ -246,6 +246,7 @@ class TelemetryLog(object):
         self.enabled = handle is not None
         self.last_error: Optional[BaseException] = None
         self._consecutive_errors = 0
+        self._outcome_written = False
 
     @classmethod
     def create(
@@ -294,23 +295,34 @@ class TelemetryLog(object):
         return self._write(record)
 
     def finish(self, outcome, reason: Optional[str] = None, **fields_) -> bool:
+        """Write the run's one outcome record. A second outcome is refused (and noted as an
+        `outcome_ignored` event) so a run never carries two; a *failed* write may be retried."""
+        name = outcome.value if isinstance(outcome, Enum) else str(outcome)
+        if self._outcome_written:
+            self.write_event("outcome_ignored", outcome=name, reason=reason)
+            return False
+
         def record():
             return _jsonable(dict(
-                fields_, schema=SCHEMA_VERSION, kind="outcome",
-                outcome=outcome.value if isinstance(outcome, Enum) else str(outcome),
-                reason=reason,
+                fields_, schema=SCHEMA_VERSION, kind="outcome", outcome=name, reason=reason,
             ))
 
-        return self._write(record)
+        written = self._write(record)
+        self._outcome_written = self._outcome_written or written
+        return written
 
     def close(self) -> None:
+        """Flush and close the file; every step is attempted and none raises."""
         if self._file is None:
+            self.enabled = False
             return
-        try:
-            self._file.close()
-        except Exception as exc:
-            self.last_error = exc
+        handle, self._file = self._file, None
         self.enabled = False
+        for step in (handle.flush, handle.close):
+            try:
+                step()
+            except Exception as exc:
+                self.last_error = exc
 
     def _write(self, build: Callable[[], Dict[str, Any]]) -> bool:
         if not self.enabled:
@@ -539,6 +551,16 @@ class RunRecorder(object):
         except Exception as exc:
             self.log.last_error = exc
             return False
+
+    def close(self, flush_frames: bool = False) -> None:
+        """End of run: optionally save the frames still held for an event window, then
+        flush and close the log. Never raises, and is safe to call more than once."""
+        if flush_frames and self.frames is not None and self.log.enabled:
+            try:
+                self.frames.mark_event()
+            except Exception as exc:
+                self.log.last_error = exc
+        self.log.close()
 
     def _offer(self, seq: int, camera: str, frame: Optional[np.ndarray]) -> Optional[str]:
         """Name of the frame a replay must find, or None when no picture was given."""
