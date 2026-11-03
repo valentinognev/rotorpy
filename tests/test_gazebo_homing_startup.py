@@ -263,3 +263,83 @@ def test_main_stops_after_saving_flight(tracker_module, monkeypatch, capsys, rea
     output = capsys.readouterr()
     assert f"flight finished: {reason}" in output.out
     assert ("no recording was written" in output.err) is not has_recording
+
+
+def _stepping_tracker(tracker_module, monkeypatch, reason, telemetry):
+    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
+    tracker._lock = threading.Lock()
+    tracker._fresh = False
+    tracker._forward = tracker._upward = None
+    tracker._forward_raw = tracker._upward_raw = None
+    tracker._image_times = {}
+    tracker._command = SimpleNamespace(
+        locked=True, tracking=True, source="forward", velocity_ned=[1.0, 0.0, 0.0]
+    )
+    tracker._pose = lambda: (np.array([0.0, 0.0, 30.0]), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
+    tracker._send = lambda command, height: None
+    tracker._sent = 20
+    tracker._flight_state = lambda: True
+    tracker._gravity_on = True
+    tracker._startup_done = True
+    tracker._hb_mode = None
+    tracker._target_ground_ned = np.array([100.0, 50.0, 0.0])
+    tracker.recorder = SimpleNamespace(observe=lambda *args: reason)
+    tracker.telemetry = telemetry
+    monkeypatch.setattr(tracker_module.rospy, "get_time", lambda: 10.0, raising=False)
+    return tracker
+
+
+def test_step_records_telemetry_and_a_scored_outcome(tracker_module, monkeypatch):
+    calls = []
+    telemetry = SimpleNamespace(
+        step=lambda **kwargs: calls.append(("step", kwargs)) or True,
+        finish=lambda outcome, **kwargs: calls.append(("finish", outcome, kwargs)) or True,
+    )
+    tracker = _stepping_tracker(tracker_module, monkeypatch, "ground", telemetry)
+    assert tracker.step() == "ground"
+    assert [call[0] for call in calls] == ["step", "finish"]
+    assert calls[0][1]["updated"] is False
+    assert calls[1][1].name == "GROUND_MISS"
+    assert calls[1][2]["miss_m"] > 50.0
+
+
+def test_recording_errors_never_reach_the_control_loop(tracker_module, monkeypatch):
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    telemetry = SimpleNamespace(step=broken, finish=broken, event=broken)
+    tracker = _stepping_tracker(tracker_module, monkeypatch, "timeout", telemetry)
+    assert tracker.step() == "timeout"
+    tracker.note_failure(RuntimeError("boom"))
+
+
+def test_tracker_telemetry_round_trips_through_a_real_recorder(tracker_module, monkeypatch, tmp_path):
+    from rotorpy.guidance.homing_config import guidance_from_config
+    from rotorpy.guidance.outcome import RunOutcome
+    from rotorpy.guidance.replay import replay_run
+    from rotorpy.guidance.telemetry import read_telemetry, start_run_telemetry
+
+    config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
+    config.update(image_width_px=64, image_height_px=64)
+    recorder = start_run_telemetry(tmp_path, config, environ={"HOMING_SAVE_ALL_FRAMES": "1"})
+    tracker = _stepping_tracker(tracker_module, monkeypatch, "timeout", recorder)
+    tracker.guidance = guidance_from_config(config)
+    tracker._startup_done = True
+    raw = np.zeros((64, 64, 3), dtype=np.uint8)
+    raw[20:30, 20:30] = (230, 20, 20)
+    tracker._forward_raw = tracker._upward_raw = raw
+    tracker._forward = tracker._upward = tracker_module.frame_to_float(raw)
+    tracker._command = None
+    tracker._fresh = True
+    tracker._image_times = {"forward": (9.9, 9.95), "upward": (9.9, 9.96)}
+    assert tracker.step() == "timeout"
+    recorder.log.close()
+
+    run = read_telemetry(recorder.log.path)
+    assert run.metadata["rendering_mode"] == "gpu"
+    assert run.ticks[0].image_receipt_s == {"forward": 9.95, "upward": 9.96}
+    assert run.ticks[0].position_ned == [0.0, 0.0, -30.0]
+    assert run.ticks[0].state == "HOMING"
+    assert run.outcome["outcome"] == RunOutcome.TIMEOUT.value
+    assert run.outcome["reason"] == "timeout"
+    assert replay_run(recorder.log.path).matches

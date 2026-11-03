@@ -1,5 +1,11 @@
 # Updates
 
+## 4.4.0 - Homing diagnostics, run outcomes and replay (plan Phase 1)
+- `guidance/telemetry.py`: per-run JSONL (`Results/gazebo_runs/<unique run id>/telemetry.jsonl`, never overwritten) with a metadata record (config, firmware id, PX4 params, rendering mode, timing), per-tick `TickRecord`, events (acquisition/handoff/loss) and a final outcome. `FrameStore` saves lossless uint8 `.npy` frames (around events, or all with `HOMING_SAVE_ALL_FRAMES=1`). Every write is failure-tolerant and a repeatedly failing log disables itself.
+- `outcome.py`: `RunOutcome` (TARGET_REACHED, GROUND_MISS, TIMEOUT, TARGET_LOST, ESTIMATOR/OFFBOARD/SIMULATOR/STARTUP_FAILURE) and `classify_run`; ground contact alone is never TARGET_REACHED. `PROPOSED_REACH_RADIUS_M` (1.5 m) in `homing_config.py` is an unverified proposal.
+- `guidance/replay.py`: `replay_run` reruns guidance on recorded inputs and frames without Gazebo and compares decisions; it stops at the first tick with missing frames. `guidance_from_config` is now shared by the tracker and replay.
+- `Dockerfiles/camera_homing_tracker.py` records each step and the scored outcome through thin, exception-guarded calls. Not flown: PX4 params and firmware id come from the environment (`PX4_FIRMWARE_ID`), not queried live.
+
 ## 4.3.0 - Robust target detection (plan Phase 4)
 - `guidance/pixels.py`: `detect_target` finds the red target as a connected component (red dominance and saturation, area/fill/aspect checks, border clipping flagged with inflated uncertainty) and returns a frozen `TargetObservation` with `DetectionStatus` NO_FRAME/NO_DETECTION/AMBIGUOUS/DETECTED.
 - `TrackPrediction` gates candidates; `TargetAssociator` keeps a per-camera track so distractors cannot move the reference. Not yet wired into `homing.py`; the legacy `target_*` functions are unchanged.

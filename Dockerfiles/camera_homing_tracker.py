@@ -9,6 +9,7 @@ import atexit
 import argparse
 import sys
 import threading
+from pathlib import Path
 
 import numpy as np
 import rospy
@@ -17,11 +18,16 @@ from pymavlink import mavutil
 from sensor_msgs.msg import Image
 from std_srvs.srv import Empty
 
-from rotorpy.guidance.camera_geometry import pinhole_intrinsics, pitched_extrinsics
+from rotorpy.frames import enu_to_ned
 from rotorpy.guidance.gazebo_bridge import attitude_gazebo_to_homing, velocity_gazebo_to_ned
 from rotorpy.guidance.gazebo_record import GazeboHomingRecorder, gazebo_page_path
-from rotorpy.guidance.homing import HomingGuidance
-from rotorpy.guidance.homing_config import initial_velocity_from_config, load_homing_config
+from rotorpy.guidance.homing_config import (
+    guidance_from_config,
+    initial_velocity_from_config,
+    load_homing_config,
+)
+from rotorpy.guidance.outcome import classify_run
+from rotorpy.guidance.telemetry import frame_to_float, start_run_telemetry
 
 _OFFBOARD_MAIN = 6
 _BODY_LINKS = ("base_link", "/imu_link", "rotor_0", "rotor_1", "rotor_2", "rotor_3", "gps0::link")
@@ -47,31 +53,29 @@ def _image_rgb(msg):
     frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, channels)
     if msg.encoding.startswith("bgr"):
         frame = frame[:, :, [2, 1, 0]]
-    return np.array(frame[:, :, :3], dtype=np.float32) / 255.0
+    return np.array(frame[:, :, :3], dtype=np.uint8)
 
 
 class CameraHomingTracker(object):
+    _forward_raw = None
+    _upward_raw = None
+    _image_times = {}
+
     def __init__(self, config, model_name, page_path=None):
         self.model_name = model_name
         initial_velocity = initial_velocity_from_config(config)
         self._startup_yaw = float(np.arctan2(initial_velocity[1], initial_velocity[0]))
         self._startup_height = -float(config["start_ned"][2])
-        intrinsics = pinhole_intrinsics(
-            int(config["image_width_px"]),
-            int(config["image_height_px"]),
-            float(config["fov_x_deg"]),
-            float(config["fov_y_deg"]),
-        )
-        self.guidance = HomingGuidance(
-            nav_constant=float(config["nav_constant"]),
-            lock_pixels=int(config["lock_pixels"]),
-            initial_velocity_ned=initial_velocity,
-            intrinsics=intrinsics,
-            forward_extrinsics=pitched_extrinsics(float(config["forward_pitch_deg"])),
-            upward_extrinsics=pitched_extrinsics(float(config["upward_pitch_deg"])),
-            component_cap=float(config["speed_component_cap_m_s"]),
-        )
+        self.guidance = guidance_from_config(config)
         self.page_path = page_path
+        # Truth for scoring the outcome only. It never reaches guidance.
+        self._target_ground_ned = np.array(config["target_ground_ned"], dtype=float)
+        self.telemetry = None
+        if page_path is not None:
+            self.telemetry = start_run_telemetry(Path(page_path).parent / "gazebo_runs", config)
+        self._forward_raw = None
+        self._upward_raw = None
+        self._image_times = {}
         self._page_printed = False
         self.recorder = None if page_path is None else GazeboHomingRecorder(config)
         self._lock = threading.Lock()
@@ -115,12 +119,16 @@ class CameraHomingTracker(object):
         self._store(msg, forward=False)
 
     def _store(self, msg, forward):
-        image = _image_rgb(msg)
+        raw = _image_rgb(msg)
+        image = frame_to_float(raw)
+        camera = "forward" if forward else "upward"
+        times = (_stamp_seconds(msg), rospy.get_time())
         with self._lock:
             if forward:
-                self._forward = image
+                self._forward, self._forward_raw = image, raw
             else:
-                self._upward = image
+                self._upward, self._upward_raw = image, raw
+            self._image_times = dict(self._image_times, **{camera: times})
             self._fresh = True
 
     def _pose(self):
@@ -139,13 +147,18 @@ class CameraHomingTracker(object):
             fresh = self._fresh
             forward = None if self._forward is None else self._forward
             upward = None if self._upward is None else self._upward
+            raw = (self._forward_raw, self._upward_raw)
+            image_times = dict(self._image_times)
             self._fresh = False
+        process_start = rospy.get_time()
         position, attitude, velocity = self._pose()
         height = float(position[2])
+        updated = fresh or self._command is None
         if fresh:
             command = self.guidance.update(rospy.get_time(), height, attitude, velocity, forward, upward)
         elif self._command is None:
             command = self.guidance.update(rospy.get_time(), height, attitude, velocity, None, None)
+            raw = (None, None)
         else:
             command = self._command
         self._command = command
@@ -175,6 +188,11 @@ class CameraHomingTracker(object):
             status = self.recorder.observe(
                 rospy.get_time(), position, attitude, pictures[0], pictures[1], command
             )
+        self._record_step(
+            process_start, position, attitude, velocity, command, updated, raw, image_times,
+        )
+        if status is not None:
+            self._record_outcome(status, position)
         print(
             "locked={} tracking={} source={} v=[{:.1f} {:.1f} {:.1f}]".format(
                 command.locked,
@@ -187,6 +205,60 @@ class CameraHomingTracker(object):
             flush=True,
         )
         return status
+
+    def _record_step(self, start, position, attitude, velocity, command, updated, raw, image_times):
+        """Hand one tick to telemetry. Recording errors never reach the control loop."""
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is None:
+            return
+        try:
+            now = rospy.get_time()
+            sent = np.array(command.velocity_ned, dtype=float)
+            telemetry.step(
+                seq=self._sent,
+                t_s=now,
+                height_m=float(position[2]),
+                attitude_quat=attitude,
+                velocity_ned=velocity,
+                forward=raw[0] if updated else None,
+                upward=raw[1] if updated else None,
+                updated=updated,
+                command=command,
+                image_capture_s={cam: t[0] for cam, t in image_times.items()},
+                image_receipt_s={cam: t[1] for cam, t in image_times.items()},
+                processing_start_s=start,
+                processing_end_s=now,
+                position_ned=enu_to_ned(np.asarray(position, dtype=float)),
+                measured_velocity_ned=velocity,
+                transmitted_setpoint=sent if self._startup_done else None,
+                state="HOMING" if self._startup_done else "STARTUP",
+                px4_mode=None if self._hb_mode is None else str(self._hb_mode),
+                camera=command.source,
+            )
+        except Exception as exc:
+            print("telemetry step failed: {}".format(exc), file=sys.stderr, flush=True)
+
+    def _record_outcome(self, status, position):
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is None:
+            return
+        try:
+            miss = float(np.linalg.norm(enu_to_ned(np.asarray(position, dtype=float)) - self._target_ground_ned))
+            outcome = classify_run(
+                miss_m=miss, ground_contact=status == "ground", timed_out=status == "timeout"
+            )
+            telemetry.finish(outcome, reason=status, miss_m=miss)
+        except Exception as exc:
+            print("telemetry outcome failed: {}".format(exc), file=sys.stderr, flush=True)
+
+    def note_failure(self, exc):
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is None:
+            return
+        try:
+            telemetry.event("step_failed", reason=str(exc))
+        except Exception:
+            pass
 
     def _send(self, command, height):
         if self._startup_done:
@@ -296,6 +368,13 @@ class CameraHomingTracker(object):
         )
 
 
+def _stamp_seconds(msg):
+    try:
+        return float(msg.header.stamp.to_sec())
+    except Exception:
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Camera-homing tracker for the Gazebo Hummingbird.")
     parser.add_argument("--config", required=True)
@@ -312,6 +391,9 @@ def main():
             status = tracker.step()
         except Exception as exc:
             print("tracker step failed: {}".format(exc), flush=True)
+            note = getattr(tracker, "note_failure", None)
+            if note is not None:
+                note(exc)
             rate.sleep()
             continue
         if status is not None:

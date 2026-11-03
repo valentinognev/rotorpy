@@ -152,3 +152,6 @@ waypoint_traj.py
 
 # DS_Store
 *.DS_Store
+
+# Gazebo homing telemetry runs (JSONL and raw frames)
+Results/gazebo_runs/

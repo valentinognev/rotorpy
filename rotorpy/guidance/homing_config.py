@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
+from rotorpy.guidance.camera_geometry import pinhole_intrinsics, pitched_extrinsics
+from rotorpy.guidance.homing import HomingGuidance
 from rotorpy.guidance.scene import (
     initial_velocity_ned,
     nominal_camera,
@@ -14,6 +16,9 @@ from rotorpy.guidance.scene import (
 )
 
 CONTROLLERS = ("geometric", "pid")
+
+# Proposed, not verified: truth miss distance that counts as reaching the target.
+PROPOSED_REACH_RADIUS_M = 1.5
 
 
 def strip_jsonc(text: str) -> str:
@@ -104,4 +109,22 @@ def initial_velocity_from_config(config: dict) -> np.ndarray:
         np.array(config["start_ned"], dtype=float),
         np.array(config["target_ground_ned"], dtype=float),
         float(config["initial_speed_m_s"]),
+    )
+
+
+def guidance_from_config(config: dict) -> HomingGuidance:
+    """The homing law the Gazebo tracker and its replay both build from `config`."""
+    return HomingGuidance(
+        nav_constant=float(config["nav_constant"]),
+        lock_pixels=int(config["lock_pixels"]),
+        initial_velocity_ned=initial_velocity_from_config(config),
+        intrinsics=pinhole_intrinsics(
+            int(config["image_width_px"]),
+            int(config["image_height_px"]),
+            float(config["fov_x_deg"]),
+            float(config["fov_y_deg"]),
+        ),
+        forward_extrinsics=pitched_extrinsics(float(config["forward_pitch_deg"])),
+        upward_extrinsics=pitched_extrinsics(float(config["upward_pitch_deg"])),
+        component_cap=float(config["speed_component_cap_m_s"]),
     )
