@@ -165,3 +165,41 @@ def test_course_before_lock_follows_the_vehicle_heading_not_the_target(config, h
     heading = np.radians(heading_deg)
     assert np.allclose(command.velocity_ned, [speed * np.cos(heading), speed * np.sin(heading), 0.0], atol=1e-9)
     assert np.isclose(np.cos(command.yaw_rad - heading), 1.0)
+
+
+def test_locked_guidance_keeps_steering_at_and_below_the_reference_height(config):
+    """Once locked, fresh pixels at/below the 1.5 m visible-centre reference height must
+    still move the command: no frozen replay of the last pre-descent velocity/acceleration.
+
+    The upward mount has zero translation offset, so height_m == reference_height_m (1.5 m)
+    is exactly the degenerate plane-intersection case `reference_relative_position` cannot
+    solve; smaller heights (1.0, 0.5 m) stay degenerate too. The diving attitude keeps the
+    upward-camera ray aimed below the horizon throughout (a level attitude would make the
+    upward camera look at the sky, a separate, legitimate no-bearing case). Each step uses a
+    very different pixel position, so a correct fix tracks it (a bug freezes velocity_ned
+    byte-for-byte from the lock, with tracking flipped to False).
+    """
+    guidance = guidance_from_config(config)
+    lock_attitude = attitude_gazebo_to_homing(NORTH_FACING.as_quat())
+    diving = attitude_gazebo_to_homing(Rotation.from_euler("xyz", (0.0, 65.0, 120.0), degrees=True).as_quat())
+    _, _, cx, cy = _intrinsics(config)
+    velocity = np.zeros(3)
+
+    lock = guidance.update(0.0, 30.0, lock_attitude, velocity, _blob_image(config, cx + 100.0, cy), None)
+    assert lock.locked and lock.tracking
+
+    at_reference = guidance.update(
+        1.0, 1.5, diving, velocity, None, _blob_image(config, cx + 250.0, cy + 300.0)
+    )
+    assert at_reference.tracking is True, "a visible, fresh pixel must not flip tracking off"
+    assert not np.allclose(at_reference.velocity_ned, lock.velocity_ned)
+    assert np.all(np.isfinite(at_reference.velocity_ned))
+
+    below_a = guidance.update(2.0, 1.0, diving, velocity, None, _blob_image(config, cx - 280.0, cy + 250.0))
+    assert below_a.tracking is True
+    assert not np.allclose(below_a.velocity_ned, at_reference.velocity_ned)
+
+    below_b = guidance.update(3.0, 0.5, diving, velocity, None, _blob_image(config, cx + 350.0, cy + 200.0))
+    assert below_b.tracking is True
+    assert not np.allclose(below_b.velocity_ned, below_a.velocity_ned)
+    assert below_b.locked is True

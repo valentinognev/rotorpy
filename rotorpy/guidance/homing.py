@@ -13,7 +13,9 @@ from rotorpy.guidance.pixels import target_pixel_count, target_square
 from rotorpy.guidance.sightline import ground_relative_position, reference_relative_position
 from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity
 
-# Below this horizontal speed the measured velocity has no usable heading.
+# Default below this horizontal speed the measured velocity has no usable heading, when
+# the caller does not pass `min_course_speed_m_s`. The Gazebo config path overrides this
+# with the named `PROPOSED_MIN_COURSE_SPEED_M_S` in `homing_config.py`.
 _MIN_COURSE_SPEED_M_S = 1.0
 
 
@@ -199,6 +201,7 @@ class HomingGuidance(object):
         forward_mount: Optional[CameraMount] = None,
         upward_mount: Optional[CameraMount] = None,
         target_reference_height_m: float = 0.0,
+        min_course_speed_m_s: float = _MIN_COURSE_SPEED_M_S,
     ) -> None:
         if initial_velocity_ned is None and initial_speed is None:
             raise ValueError("give an initial velocity or an initial speed")
@@ -214,6 +217,7 @@ class HomingGuidance(object):
         self.upward_extrinsics = upward_extrinsics
         self._mounts = None if forward_mount is None else {"forward": forward_mount, "upward": upward_mount}
         self._reference_height_m = float(target_reference_height_m)
+        self._min_course_speed_m_s = float(min_course_speed_m_s)
         self._initial_speed = None if initial_speed is None else float(initial_speed)
         self._acceleration_ned = np.zeros(3)
         self._initial_velocity_ned: Optional[np.ndarray] = None
@@ -240,7 +244,7 @@ class HomingGuidance(object):
     def _adopt_course(self, velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -> None:
         """Hold the vehicle's own heading at the configured speed until the target is seen."""
         velocity = np.asarray(velocity_ned, dtype=float)
-        if float(np.hypot(velocity[0], velocity[1])) >= _MIN_COURSE_SPEED_M_S:
+        if float(np.hypot(velocity[0], velocity[1])) >= self._min_course_speed_m_s:
             heading = float(np.arctan2(velocity[1], velocity[0]))
         else:
             heading = heading_from_homing_attitude(attitude_sim_quat)
@@ -254,7 +258,17 @@ class HomingGuidance(object):
         height_m: float,
         attitude_sim_quat: np.ndarray,
     ):
-        """Unit sightline and body-to-target vector, or (None, None) without a ground hit."""
+        """Unit sightline and body-to-target vector, or (None, None) without a usable bearing.
+
+        A reference-plane hit (`reference_relative_position`) is unreachable once height
+        drops to or below `target_reference_height_m` (final-approach altitudes), not only
+        when the ray is aimed above the horizon. Freezing the command in the former case
+        would hold a stale velocity indefinitely as the vehicle keeps descending, so that
+        case falls back to steering from the camera-ray bearing alone (the existing speed
+        law only uses direction, so the bearing is a correct, if offset-free, substitute).
+        The latter case (the ray truly never reaches any downward plane) has no bearing
+        either and stays a hold, same as before.
+        """
         if self._mounts is None:
             extrinsics = self.forward_extrinsics if source == "forward" else self.upward_extrinsics
             sightline = _sightline_ned(center, attitude_sim_quat, self.intrinsics, extrinsics)
@@ -263,9 +277,16 @@ class HomingGuidance(object):
         offset, direction = pixel_ray_ned(
             float(center[0]), float(center[1]), self.intrinsics, self._mounts[source], rotation
         )
+        direction = np.asarray(direction, dtype=float)
+        norm = float(np.linalg.norm(direction))
+        if norm == 0.0 or direction[2] <= 0.0:
+            return None, None
         relative = reference_relative_position(height_m, offset, direction, self._reference_height_m)
         if relative is None:
-            return None, None
+            # Fall back to the pure camera-ray bearing (no camera-translation correction):
+            # an approximation, but keeps steering instead of freezing the command.
+            bearing = direction / norm
+            return bearing, bearing
         return relative / np.linalg.norm(relative), relative
 
     def update(

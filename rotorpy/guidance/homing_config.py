@@ -22,6 +22,10 @@ CONTROLLERS = ("geometric", "pid")
 # Proposed, not verified: truth miss distance that counts as reaching the target.
 PROPOSED_REACH_RADIUS_M = 1.5
 
+# Proposed, not verified: below this horizontal speed the measured velocity has no usable
+# heading, so the pre-lock course falls back to the vehicle's attitude instead.
+PROPOSED_MIN_COURSE_SPEED_M_S = 1.0
+
 
 def strip_jsonc(text: str) -> str:
     """Drop // comments that sit outside strings."""
@@ -190,4 +194,5 @@ def guidance_from_config(config: dict) -> HomingGuidance:
         forward_mount=forward_mount,
         upward_mount=upward_mount,
         target_reference_height_m=gazebo_target_reference(config).reference_height_m,
+        min_course_speed_m_s=PROPOSED_MIN_COURSE_SPEED_M_S,
     )
