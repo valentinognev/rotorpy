@@ -28,8 +28,9 @@ PROPOSED_MIN_COURSE_SPEED_M_S = 1.0
 
 # Proposed, not verified: wall-time staleness timeouts for the tracker's comms watchdogs
 # (`watchdog.CommsWatchdogs`). Each link going stale this long with no fresh message is
-# treated as a comms failure independent of simulation time.
-PROPOSED_HEARTBEAT_TIMEOUT_S = 1.0
+# treated as a comms failure independent of simulation time. Heartbeat is 3.0 s because
+# PX4's ~1 Hz period means a 1.0 s timeout would latch on jitter.
+PROPOSED_HEARTBEAT_TIMEOUT_S = 3.0
 PROPOSED_TELEMETRY_TIMEOUT_S = 0.5
 PROPOSED_IMAGE_TIMEOUT_S = 1.0
 

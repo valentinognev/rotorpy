@@ -714,6 +714,7 @@ def test_never_seen_link_does_not_latch_fatal_at_startup(tracker_module, monkeyp
     _tick_at(tracker_module, monkeypatch, tracker, clock, 1.0, ("heartbeat",))
     tracker.step()
     assert tracker._setpoints.stats.failed is False
+    assert tracker._setpoints.tick(now_s=1.6) is None  # past expiry: stream goes quiet
 
 
 def test_recording_carries_the_stale_links_and_fatal_reason_in_setpoint_stats(tracker_module, monkeypatch):
