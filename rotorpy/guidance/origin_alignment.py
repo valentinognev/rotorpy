@@ -9,6 +9,7 @@ The alignment is an explicit translation, a heading offset, and a ground plane.
 import math
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 
 def _vector3(value, name: str) -> np.ndarray:
@@ -64,6 +65,24 @@ class EstimatorOriginAlignment(object):
         """A world heading as an estimator heading."""
         return float(heading_rad) - self.yaw_offset_rad
 
+    def attitude_to_world(self, quat_estimator_xyzw) -> np.ndarray:
+        """A body attitude quaternion (FRD body, estimator's NED) in the world NED frame.
+
+        Only the yaw offset rotates attitude; the origin translation does not apply to
+        an orientation.
+        """
+        rotation = Rotation.from_matrix(self._world_from_estimator) * Rotation.from_quat(
+            np.array(quat_estimator_xyzw, dtype=float, copy=True)
+        )
+        return rotation.as_quat()
+
+    def attitude_to_estimator(self, quat_world_xyzw) -> np.ndarray:
+        """A world-frame body attitude quaternion in the estimator's NED frame."""
+        rotation = Rotation.from_matrix(self._world_from_estimator).inv() * Rotation.from_quat(
+            np.array(quat_world_xyzw, dtype=float, copy=True)
+        )
+        return rotation.as_quat()
+
     @property
     def ground_down_in_estimator_m(self) -> float:
         """The estimator NED down coordinate of the ground plane."""
@@ -73,3 +92,8 @@ class EstimatorOriginAlignment(object):
         """Height above the world ground plane of a position in the estimator frame."""
         down = float(_vector3(estimator_position_ned, "position")[2])
         return self.ground_down_in_estimator_m - down
+
+    def height_above_ground_world(self, position_world_ned) -> float:
+        """Height above the world ground plane of a position already in the world frame."""
+        down = float(_vector3(position_world_ned, "position")[2])
+        return self.ground_down_world_m - down

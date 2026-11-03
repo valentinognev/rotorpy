@@ -77,3 +77,54 @@ def test_alignment_comes_from_the_config_and_matches_the_spawn():
     assert np.allclose(alignment.origin_world_ned, config["start_ned"])
     assert alignment.yaw_offset_rad == 0.0
     assert np.isclose(alignment.height_above_ground([0.0, 0.0, 0.0]), -config["start_ned"][2])
+
+
+def test_attitude_to_world_applies_only_the_yaw_offset_not_the_translation():
+    alignment = EstimatorOriginAlignment([10.0, -5.0, -2.0], np.deg2rad(90.0), 0.0)
+    identity = np.array([0.0, 0.0, 0.0, 1.0])
+    world = alignment.attitude_to_world(identity)
+    # A body aligned with the estimator's north now points 90 degrees clockwise of world north.
+    assert np.isclose(heading_from_homing_attitude_proxy(world), np.deg2rad(90.0))
+
+
+def heading_from_homing_attitude_proxy(q_xyzw):
+    from scipy.spatial.transform import Rotation
+    matrix = Rotation.from_quat(q_xyzw).as_matrix()
+    return float(np.arctan2(matrix[1, 0], matrix[0, 0]))
+
+
+def test_attitude_to_world_and_back_round_trips():
+    alignment = EstimatorOriginAlignment([1.0, 2.0, -30.0], np.deg2rad(37.0), 0.0)
+    quat = np.array([0.1, 0.2, 0.3, 0.9])
+    quat = quat / np.linalg.norm(quat)
+    world = alignment.attitude_to_world(quat)
+    assert np.allclose(alignment.attitude_to_estimator(world), quat) or np.allclose(
+        alignment.attitude_to_estimator(world), -quat
+    )
+
+
+def test_attitude_to_world_heading_matches_heading_to_world():
+    alignment = EstimatorOriginAlignment([0.0, 0.0, 0.0], np.deg2rad(25.0), 0.0)
+    estimator_heading = np.deg2rad(15.0)
+    quat = np.array([0.0, 0.0, np.sin(estimator_heading / 2.0), np.cos(estimator_heading / 2.0)])
+    world = alignment.attitude_to_world(quat)
+    assert np.isclose(
+        heading_from_homing_attitude_proxy(world), alignment.heading_to_world(estimator_heading)
+    )
+
+
+def test_attitude_to_world_is_identity_with_no_yaw_offset():
+    alignment = _spawn_aligned()
+    quat = np.array([0.1, 0.2, 0.3, 0.9])
+    quat = quat / np.linalg.norm(quat)
+    assert np.allclose(alignment.attitude_to_world(quat), quat)
+
+
+def test_height_above_ground_world_uses_world_z_directly():
+    alignment = EstimatorOriginAlignment([0.0, 0.0, -30.0], np.deg2rad(40.0), ground_down_world_m=0.0)
+    # World height above ground does not depend on the origin translation or yaw at all.
+    assert np.isclose(alignment.height_above_ground_world([5.0, 5.0, -12.0]), 12.0)
+    assert np.isclose(
+        alignment.height_above_ground_world(alignment.estimator_to_world([5.0, 5.0, 18.0])),
+        alignment.height_above_ground([5.0, 5.0, 18.0]),
+    )

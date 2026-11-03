@@ -26,6 +26,22 @@ PROPOSED_REACH_RADIUS_M = 1.5
 # heading, so the pre-lock course falls back to the vehicle's attitude instead.
 PROPOSED_MIN_COURSE_SPEED_M_S = 1.0
 
+# Proposed, not verified: wall-time staleness timeouts for the tracker's comms watchdogs
+# (`watchdog.CommsWatchdogs`). Each link going stale this long with no fresh message is
+# treated as a comms failure independent of simulation time.
+PROPOSED_HEARTBEAT_TIMEOUT_S = 1.0
+PROPOSED_TELEMETRY_TIMEOUT_S = 0.5
+PROPOSED_IMAGE_TIMEOUT_S = 1.0
+
+
+def watchdog_timeouts() -> dict:
+    """Named comms-watchdog timeouts, for `watchdog.CommsWatchdogs(watchdog_timeouts())`."""
+    return {
+        "heartbeat": PROPOSED_HEARTBEAT_TIMEOUT_S,
+        "telemetry": PROPOSED_TELEMETRY_TIMEOUT_S,
+        "image": PROPOSED_IMAGE_TIMEOUT_S,
+    }
+
 
 def strip_jsonc(text: str) -> str:
     """Drop // comments that sit outside strings."""

@@ -3,7 +3,7 @@
 import importlib.util
 from pathlib import Path
 import sys
-import threading
+import time
 from types import ModuleType, SimpleNamespace
 import xml.etree.ElementTree as ET
 
@@ -66,6 +66,8 @@ def test_physics_unpauses_only_after_gravity_is_disabled(tracker_module, monkeyp
     rospy = tracker_module.rospy
     monkeypatch.setattr(rospy, "wait_for_service", lambda name: events.append(("wait", name)), raising=False)
     monkeypatch.setattr(rospy, "Subscriber", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(rospy, "Timer", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(rospy, "Duration", lambda seconds: seconds, raising=False)
 
     def service(name, _type):
         return lambda *args: events.append(("call", name))
@@ -78,8 +80,9 @@ def test_physics_unpauses_only_after_gravity_is_disabled(tracker_module, monkeyp
     mav = SimpleNamespace(target_system=1, wait_heartbeat=lambda: None)
     monkeypatch.setattr(tracker_module.mavutil, "mavlink_connection", lambda *args, **kwargs: mav)
     config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
-    tracker_module.CameraHomingTracker(config, "hummingbird_0")
+    tracker = tracker_module.CameraHomingTracker(config, "hummingbird_0")
     assert events.index(("gravity", False)) < events.index(("call", "/gazebo/unpause_physics"))
+    tracker.shutdown()
 
     launcher = (ROOT / "Dockerfiles" / "sitl_hummingbird_run.sh").read_text()
     assert launcher.index("rosservice call /gazebo/pause_physics") < launcher.index(
@@ -93,6 +96,7 @@ def test_last_heartbeat_state_persists_until_a_new_heartbeat(tracker_module):
     tracker._hb_mode = None
     tracker._offboard = False
     tracker._last_status = None
+    tracker._watchdogs = tracker_module.CommsWatchdogs(tracker_module.watchdog_timeouts())
     mavlink = tracker_module.mavutil.mavlink
     messages = [
         SimpleNamespace(
@@ -103,9 +107,11 @@ def test_last_heartbeat_state_persists_until_a_new_heartbeat(tracker_module):
         )
     ]
     tracker._mav = SimpleNamespace(recv_match=lambda **kwargs: messages.pop(0) if messages else None)
+    tracker._poll_mavlink()
     assert tracker._flight_state()
     assert tracker._flight_state()
     messages.append(SimpleNamespace(get_type=lambda: "HEARTBEAT", type=0, base_mode=0, custom_mode=0))
+    tracker._poll_mavlink()
     assert not tracker._flight_state()
 
 
@@ -189,27 +195,40 @@ def test_startup_requires_a_sustained_stable_hover(tracker_module):
         tracker._update_startup_hold(21.0, 35.0, 1.0)
 
 
-def test_gravity_stays_off_until_armed_offboard_motors_spin(tracker_module, monkeypatch):
+def _new_tracker(tracker_module, monkeypatch, armed=True):
+    """A `CameraHomingTracker` with its ROS/Gazebo/MAVLink I/O stubbed out, but real
+    `rotorpy.guidance` collaborators (observation buffer, vehicle state, watchdogs,
+    setpoint stream), so tests exercise the actual wiring `step()` relies on."""
+    config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
     tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
-    tracker._lock = threading.Lock()
-    tracker._fresh = False
-    tracker._forward = tracker._upward = None
-    tracker._command = SimpleNamespace(
-        locked=False, tracking=False, source=None, velocity_ned=[0.0, 0.0, 0.0]
-    )
-    tracker._pose = lambda: (np.array([0.0, 0.0, 30.0]), None, np.zeros(3))
-    tracker._send = lambda command, height: None
+    tracker._mav = SimpleNamespace(recv_match=lambda **kwargs: None)
+    tracker._observations = tracker_module.ObservationBuffer(cameras=("forward", "upward"))
+    tracker._vehicle_state = tracker_module.VehicleState(tracker_module.alignment_from_config(config))
+    tracker._watchdogs = tracker_module.CommsWatchdogs(tracker_module.watchdog_timeouts())
+    tracker._setpoints = tracker_module.SetpointStream(publish=lambda command: None, expiry_s=10.0)
+    tracker._recording = SimpleNamespace(submit=lambda item: tracker._record_sink(item))
+    tracker._command = None
+    tracker._startup_yaw = 0.0
+    tracker._startup_height = 30.0
     tracker._sent = 20
-    tracker._flight_state = lambda: True
+    tracker._flight_state = lambda: armed
     tracker._gravity_on = False
     tracker._motor_start_time = None
     tracker._startup_done = False
-    tracker._startup_height = 30.0
     tracker._hold_start_time = None
     tracker._settled_since = None
+    tracker._hb_mode = None
+    tracker._target_ground_ned = np.array([100.0, 50.0, 0.0])
     tracker.recorder = None
+    tracker.telemetry = None
+    tracker._pose_truth = lambda: (np.array([0.0, 0.0, 30.0]), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
     tracker._set_gravity = lambda enabled: setattr(tracker, "_gravity_on", enabled)
     monkeypatch.setattr(tracker_module.rospy, "get_time", lambda: 10.0, raising=False)
+    return tracker
+
+
+def test_gravity_stays_off_until_armed_offboard_motors_spin(tracker_module, monkeypatch):
+    tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
     tracker.step()
     assert not tracker._gravity_on
@@ -221,21 +240,10 @@ def test_gravity_stays_off_until_armed_offboard_motors_spin(tracker_module, monk
 
 @pytest.mark.parametrize("reason", ["ground", "timeout"])
 def test_tracker_step_reports_flight_end(tracker_module, monkeypatch, reason):
-    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
-    tracker._lock = threading.Lock()
-    tracker._fresh = False
-    tracker._forward = tracker._upward = None
-    tracker._command = SimpleNamespace(
-        locked=True, tracking=True, source="forward", velocity_ned=[1.0, 0.0, 0.0]
-    )
-    tracker._pose = lambda: (np.array([0.0, 0.0, 30.0]), None, np.zeros(3))
-    tracker._send = lambda command, height: None
-    tracker._sent = 20
-    tracker._flight_state = lambda: True
+    tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._gravity_on = True
     tracker._startup_done = True
     tracker.recorder = SimpleNamespace(observe=lambda *args: reason)
-    monkeypatch.setattr(tracker_module.rospy, "get_time", lambda: 10.0, raising=False)
     assert tracker.step() == reason
 
 
@@ -247,6 +255,7 @@ def test_main_stops_after_saving_flight(tracker_module, monkeypatch, capsys, rea
     fake_tracker = SimpleNamespace(
         step=lambda: events.append("step") or next(statuses),
         write_page=lambda: events.append("write") or ("flight.html" if has_recording else None),
+        shutdown=lambda: events.append("shutdown"),
     )
     rospy = tracker_module.rospy
     monkeypatch.setattr(sys, "argv", ["tracker", "--config", "config.jsonc"])
@@ -259,33 +268,29 @@ def test_main_stops_after_saving_flight(tracker_module, monkeypatch, capsys, rea
     monkeypatch.setattr(rospy, "Rate", lambda rate: SimpleNamespace(sleep=lambda: events.append("sleep")), raising=False)
     monkeypatch.setattr(rospy, "is_shutdown", lambda: False, raising=False)
     tracker_module.main()
-    assert events == ["step", "sleep", "step", "write"]
+    assert events == ["step", "sleep", "step", "write", "shutdown"]
     output = capsys.readouterr()
     assert f"flight finished: {reason}" in output.out
     assert ("no recording was written" in output.err) is not has_recording
 
 
 def _stepping_tracker(tracker_module, monkeypatch, reason, telemetry):
-    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
-    tracker._lock = threading.Lock()
-    tracker._fresh = False
-    tracker._forward = tracker._upward = None
-    tracker._forward_raw = tracker._upward_raw = None
-    tracker._image_times = {}
+    """A tracker with a PX4 estimate already ingested, matching the old truth pose
+    (spawn at (0, 0, 30 m) ENU, identity attitude, zero velocity), so world-frame
+    telemetry fields come out the same as when Gazebo truth fed the control loop."""
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._vehicle_state.ingest_attitude(sim_s=9.9, wall_s=9.9, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=9.9, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+    tracker._watchdogs.touch("telemetry", time.monotonic())
     tracker._command = SimpleNamespace(
         locked=True, tracking=True, source="forward", velocity_ned=[1.0, 0.0, 0.0]
     )
-    tracker._pose = lambda: (np.array([0.0, 0.0, 30.0]), np.array([0.0, 0.0, 0.0, 1.0]), np.zeros(3))
-    tracker._send = lambda command, height: None
-    tracker._sent = 20
-    tracker._flight_state = lambda: True
     tracker._gravity_on = True
     tracker._startup_done = True
-    tracker._hb_mode = None
-    tracker._target_ground_ned = np.array([100.0, 50.0, 0.0])
     tracker.recorder = SimpleNamespace(observe=lambda *args: reason)
     tracker.telemetry = telemetry
-    monkeypatch.setattr(tracker_module.rospy, "get_time", lambda: 10.0, raising=False)
     return tracker
 
 
@@ -327,11 +332,12 @@ def test_tracker_telemetry_round_trips_through_a_real_recorder(tracker_module, m
     tracker._startup_done = True
     raw = np.zeros((64, 64, 3), dtype=np.uint8)
     raw[20:30, 20:30] = (230, 20, 20)
-    tracker._forward_raw = tracker._upward_raw = raw
-    tracker._forward = tracker._upward = tracker_module.frame_to_float(raw)
     tracker._command = None
-    tracker._fresh = True
-    tracker._image_times = {"forward": (9.9, 9.95), "upward": (9.9, 9.96)}
+    for camera, receipt_s in (("forward", 9.95), ("upward", 9.96)):
+        tracker._observations.offer(
+            camera, capture_s=9.9, receipt_s=receipt_s, raw_bytes=raw.tobytes(),
+            width=64, height=64, encoding="rgb8", step=64 * 3,
+        )
     assert tracker.step() == "timeout"
     recorder.log.close()
 
@@ -351,10 +357,8 @@ def test_startup_heading_comes_from_the_vehicle_not_the_target(tracker_module, m
     tracker = _stepping_tracker(tracker_module, monkeypatch, "timeout", None)
     heading = np.deg2rad(200.0)
     tracker._startup_yaw = None
-    tracker._pose = lambda: (
-        np.array([0.0, 0.0, 30.0]),
-        Rotation.from_euler("z", heading).as_quat(),
-        np.zeros(3),
+    tracker._vehicle_state.ingest_attitude(
+        sim_s=9.9, wall_s=9.9, quat_estimator_xyzw=Rotation.from_euler("z", heading).as_quat()
     )
     tracker.step()
     assert np.isclose(np.cos(tracker._startup_yaw - heading), 1.0)
