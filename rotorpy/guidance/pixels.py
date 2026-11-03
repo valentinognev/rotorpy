@@ -224,6 +224,88 @@ def detect_target(image: Optional[np.ndarray], timestamp: float = 0.0, camera: s
     return _observation(chosen, timestamp, camera, len(components), config)
 
 
+@dataclass(frozen=True)
+class LabeledFrame:
+    """One evaluation frame: its image and whether a target is actually present.
+
+    `reference` is the labeled ground-truth (u, v) of the target when `has_target`,
+    used to reject a detection that locked onto the wrong thing (still a miss, even
+    though `detect_target` reported DETECTED).
+    """
+
+    image: np.ndarray
+    has_target: bool
+    reference: Optional[Tuple[float, float]] = None
+
+
+@dataclass(frozen=True)
+class DetectionRates:
+    """False-positive / missed-detection rates of a held-out labeled set.
+
+    These describe only the labeled set they were computed over (synthetic, by
+    construction, unless real recorded frames are labeled and passed in); they are not
+    a verified real-world performance claim.
+    """
+
+    num_frames: int
+    num_positive: int
+    num_negative: int
+    false_positive_rate: float
+    missed_detection_rate: float
+
+
+def split_tuning_and_held_out(frames: List[LabeledFrame], held_out_fraction: float = 0.5,
+                              rng: Optional[np.random.Generator] = None
+                              ) -> Tuple[List[LabeledFrame], List[LabeledFrame]]:
+    """Shuffle `frames` with `rng` and split into (tuning, held_out), with no overlap.
+
+    Calibration must never be tuned on the frames it is scored against: pass a fixed
+    `rng` (e.g. `np.random.default_rng(seed)`) for a reproducible split.
+    """
+    rng = np.random.default_rng() if rng is None else rng
+    order = rng.permutation(len(frames))
+    cut = int(round(len(frames) * (1.0 - held_out_fraction)))
+    tuning = [frames[index] for index in order[:cut]]
+    held_out = [frames[index] for index in order[cut:]]
+    return tuning, held_out
+
+
+def evaluate_detection_rates(frames: List[LabeledFrame], config: DetectorConfig = DEFAULT_CONFIG,
+                             match_radius_px: float = 15.0) -> DetectionRates:
+    """False-positive and missed-detection rates of bare per-frame `detect_target` calls.
+
+    Each frame is scored independently (no track/prediction), matching a single still
+    frame with no temporal context. A positive frame only counts as a hit when a
+    reference was labeled and the detection falls within `match_radius_px` of it;
+    detecting something elsewhere in the frame is still a miss, not a hit.
+    """
+    num_positive = num_negative = 0
+    false_positives = missed = 0
+    for frame in frames:
+        obs = detect_target(frame.image, config=config)
+        detected = obs.status is DetectionStatus.DETECTED
+        if frame.has_target:
+            num_positive += 1
+            hit = detected
+            if hit and frame.reference is not None and obs.reference is not None:
+                distance = float(np.hypot(obs.reference[0] - frame.reference[0],
+                                          obs.reference[1] - frame.reference[1]))
+                hit = distance <= match_radius_px
+            if not hit:
+                missed += 1
+        else:
+            num_negative += 1
+            if detected:
+                false_positives += 1
+    return DetectionRates(
+        num_frames=len(frames),
+        num_positive=num_positive,
+        num_negative=num_negative,
+        false_positive_rate=0.0 if num_negative == 0 else false_positives / num_negative,
+        missed_detection_rate=0.0 if num_positive == 0 else missed / num_positive,
+    )
+
+
 class TargetAssociator:
     """Keeps one image-plane track and gates each new frame with it."""
 
@@ -241,10 +323,20 @@ class TargetAssociator:
         self.track = None
 
     def update(self, image: Optional[np.ndarray], timestamp: float,
-               camera: str) -> TargetObservation:
+               camera: str, allow_reacquire: bool = False) -> TargetObservation:
+        """Gate against the existing track (same camera), else start a fresh one.
+
+        `allow_reacquire=True` retries an ungated search when the gate rejects every
+        candidate: a legitimate large jump since the last detection (not a same-frame
+        distractor, which the gate already preferred over) must not stay lost just
+        because the gate has not grown wide enough yet. Default False keeps every other
+        caller's existing gate-only behavior unchanged.
+        """
         same_camera = self.track is not None and camera == self._camera
-        obs = detect_target(image, timestamp, camera,
-                            self.track if same_camera else None, self.config)
+        prediction = self.track if same_camera else None
+        obs = detect_target(image, timestamp, camera, prediction, self.config)
+        if obs.status is DetectionStatus.NO_DETECTION and prediction is not None and allow_reacquire:
+            obs = detect_target(image, timestamp, camera, None, self.config)
         if obs.status is DetectionStatus.DETECTED:
             sigma = max(self.min_sigma_px, obs.uncertainty_px)
             self.track = TrackPrediction(obs.reference[0], obs.reference[1], sigma)
@@ -255,3 +347,4 @@ class TargetAssociator:
         if obs.status is DetectionStatus.DETECTED or same_camera:
             self._timestamp = timestamp
         return obs
+

@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from rotorpy.guidance.outcome import RunOutcome
+from rotorpy.guidance.pixels import DetectionStatus, TargetObservation
 from rotorpy.guidance.telemetry import (
     SCHEMA_VERSION,
     EventDetector,
@@ -14,6 +15,7 @@ from rotorpy.guidance.telemetry import (
     RunMetadata,
     TelemetryLog,
     TickRecord,
+    detection_fields_from_command,
     frame_to_float,
     new_run_id,
     read_telemetry,
@@ -60,6 +62,60 @@ def _tick(seq=0):
         guidance_update={"t": 0.0, "forward_frame": "frames/000000_forward.npy"},
         decision={"locked": True},
     )
+
+
+def _observation(status, camera, reference=None, bounds=None, confidence=0.0, area=0,
+                 clipped=False, num_candidates=0, timestamp=0.0):
+    return TargetObservation(
+        status=status, timestamp=timestamp, camera=camera, bounds=bounds, reference=reference,
+        confidence=confidence, area=area, clipped=clipped, num_candidates=num_candidates,
+    )
+
+
+def test_detection_fields_from_command_is_empty_without_structured_detections():
+    from rotorpy.guidance.homing import HomingCommand
+
+    command = HomingCommand(
+        np.zeros(3), np.zeros(3), np.zeros(3), 0.0, True, True, "forward",
+        np.array([4.0, 4.0]), 6.0,
+    )
+    assert detection_fields_from_command(command) == {}
+
+
+def test_detection_fields_from_command_reports_candidates_selected_and_confidence():
+    from rotorpy.guidance.homing import HomingCommand
+
+    forward_obs = _observation(
+        DetectionStatus.DETECTED, "forward", reference=(10.0, 12.0), bounds=(7, 9, 12, 14),
+        confidence=0.8, area=30, num_candidates=1, timestamp=1.5,
+    )
+    upward_obs = _observation(DetectionStatus.NO_DETECTION, "upward")
+    command = HomingCommand(
+        np.zeros(3), np.zeros(3), np.zeros(3), 0.0, True, True, "forward",
+        np.array([10.0, 12.0]), 6.0, detections={"forward": forward_obs, "upward": upward_obs},
+    )
+    fields = detection_fields_from_command(command)
+    assert fields["confidence"] == 0.8
+    assert fields["selected"]["camera"] == "forward"
+    assert fields["selected"]["center"] == [10.0, 12.0]
+    assert fields["selected"]["status"] == "detected"
+    camera_names = {entry["camera"] for entry in fields["candidates"]}
+    assert camera_names == {"forward", "upward"}
+
+
+def test_detection_fields_from_command_omits_no_frame_cameras():
+    from rotorpy.guidance.homing import HomingCommand
+
+    forward_obs = _observation(
+        DetectionStatus.DETECTED, "forward", reference=(1.0, 2.0), bounds=(0, 0, 3, 3), confidence=0.5,
+    )
+    upward_obs = _observation(DetectionStatus.NO_FRAME, "upward")
+    command = HomingCommand(
+        np.zeros(3), np.zeros(3), np.zeros(3), 0.0, True, True, "forward",
+        np.array([1.0, 2.0]), 4.0, detections={"forward": forward_obs, "upward": upward_obs},
+    )
+    fields = detection_fields_from_command(command)
+    assert {entry["camera"] for entry in fields["candidates"]} == {"forward"}
 
 
 def test_run_ids_are_unique_and_never_overwrite(tmp_path):

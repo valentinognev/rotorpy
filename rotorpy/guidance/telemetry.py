@@ -68,6 +68,44 @@ def decision_from_command(command: Any) -> Dict[str, Any]:
     })
 
 
+def _candidate_entry(camera: str, obs: Any) -> Dict[str, Any]:
+    side = None
+    if obs.bounds is not None:
+        side = max(obs.bounds[2] - obs.bounds[0], obs.bounds[3] - obs.bounds[1]) + 1
+    return {
+        "camera": camera,
+        "status": obs.status.value,
+        "center": None if obs.reference is None else list(obs.reference),
+        "bounds": obs.bounds,
+        "side": side,
+        "area": obs.area,
+        "confidence": obs.confidence,
+        "clipped": obs.clipped,
+        "num_candidates": obs.num_candidates,
+        "timestamp": obs.timestamp,
+    }
+
+
+def detection_fields_from_command(command: Any) -> Dict[str, Any]:
+    """`candidates`/`selected`/`confidence` `TickRecord` fields from a `HomingCommand`'s
+    per-camera `pixels.TargetObservation`s (`command.detections`).
+
+    `{}` when the command carries none (the legacy no-mounts path, or any caller that
+    never set `detections`): the tick's `TickRecord` then keeps its unpopulated defaults
+    instead of fabricating placeholder detection data.
+    """
+    detections = getattr(command, "detections", None)
+    if not detections:
+        return {}
+    candidates = [
+        _candidate_entry(camera, obs) for camera, obs in detections.items()
+        if obs is not None and obs.status.value != "no_frame"
+    ]
+    selected = next((entry for entry in candidates if entry["camera"] == command.source), None)
+    confidence = None if selected is None else selected["confidence"]
+    return {"candidates": candidates, "selected": selected, "confidence": confidence}
+
+
 @dataclass
 class RunMetadata:
     """What a run was: configuration, firmware, effective parameters, rendering, timing."""

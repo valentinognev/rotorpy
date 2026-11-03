@@ -1,6 +1,6 @@
 """Camera homing command: lock, proportional navigation, and flat output."""
 
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -9,7 +9,15 @@ from rotorpy.guidance.camera_geometry import CameraMount, pixel_ray_ned, pixel_t
 from rotorpy.guidance.frames import ned_to_sim, sim_body_to_frd, sim_to_ned
 from rotorpy.guidance.gazebo_bridge import attitude_homing_to_ned_frd, heading_from_homing_attitude
 from rotorpy.guidance.navigation import pn_acceleration
-from rotorpy.guidance.pixels import target_pixel_count, target_square
+from rotorpy.guidance.pixels import (
+    DEFAULT_CONFIG,
+    DetectionStatus,
+    DetectorConfig,
+    TargetAssociator,
+    TargetObservation,
+    target_pixel_count,
+    target_square,
+)
 from rotorpy.guidance.sightline import ground_relative_position, reference_relative_position
 from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity
 
@@ -33,6 +41,7 @@ class HomingCommand(object):
         source: Optional[str],
         tracker_center: Optional[np.ndarray],
         tracker_side: Optional[float],
+        detections: Optional[Dict[str, TargetObservation]] = None,
     ) -> None:
         self.velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
         self.acceleration_ned = np.array(acceleration_ned, dtype=float, copy=True)
@@ -46,6 +55,9 @@ class HomingCommand(object):
         else:
             self.tracker_center = np.array(tracker_center, dtype=float, copy=True)
         self.tracker_side = None if tracker_side is None else float(tracker_side)
+        # Per-camera `pixels.TargetObservation` for this tick, Gazebo (mounts) path only.
+        # `None` on the legacy no-mounts path, which keeps target_square/target_pixel_count.
+        self.detections = detections
 
 
 def body_frd_velocity(velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -> np.ndarray:
@@ -202,6 +214,7 @@ class HomingGuidance(object):
         upward_mount: Optional[CameraMount] = None,
         target_reference_height_m: float = 0.0,
         min_course_speed_m_s: float = _MIN_COURSE_SPEED_M_S,
+        detector_config: DetectorConfig = DEFAULT_CONFIG,
     ) -> None:
         if initial_velocity_ned is None and initial_speed is None:
             raise ValueError("give an initial velocity or an initial speed")
@@ -216,6 +229,12 @@ class HomingGuidance(object):
         self.forward_extrinsics = forward_extrinsics
         self.upward_extrinsics = upward_extrinsics
         self._mounts = None if forward_mount is None else {"forward": forward_mount, "upward": upward_mount}
+        # Structured detection (pixels.detect_target/TargetAssociator) replaces
+        # target_square/target_pixel_count only on the Gazebo (mounts) path; the legacy
+        # no-mounts path keeps those functions and never builds `detections`.
+        self._associators = None if self._mounts is None else {
+            "forward": TargetAssociator(detector_config), "upward": TargetAssociator(detector_config)
+        }
         self._reference_height_m = float(target_reference_height_m)
         self._min_course_speed_m_s = float(min_course_speed_m_s)
         self._initial_speed = None if initial_speed is None else float(initial_speed)
@@ -235,6 +254,7 @@ class HomingGuidance(object):
         self._tracker_side: Optional[float] = None
         self._last_image_time: Optional[float] = None
         self._last_sightline: Optional[np.ndarray] = None
+        self._detections: Optional[Dict[str, TargetObservation]] = None
 
     def _set_course(self, velocity_ned: np.ndarray) -> None:
         self._initial_velocity_ned = velocity_ned
@@ -310,8 +330,13 @@ class HomingGuidance(object):
         if self._lost:
             return self._command(attitude_sim_quat)
 
-        forward_sees = self._sees(forward_image)
-        upward_sees = self._sees(upward_image)
+        forward_obs = self._detect("forward", forward_image, t)
+        upward_obs = self._detect("upward", upward_image, t)
+        if self._associators is not None:
+            self._detections = {"forward": forward_obs, "upward": upward_obs}
+
+        forward_sees = self._sees(forward_image, forward_obs)
+        upward_sees = self._sees(upward_image, upward_obs)
         if forward_sees or upward_sees:
             self._locked = True
         if upward_sees:
@@ -323,38 +348,78 @@ class HomingGuidance(object):
         if self._upward_latched:
             source = "upward"
             image = upward_image
+            obs = upward_obs
         elif forward_sees:
             source = "forward"
             image = forward_image
+            obs = forward_obs
         else:
             return self._hold(attitude_sim_quat)
 
-        if image is None:
+        center, side = self._tracked_square(image, obs)
+        if center is None:
             return self._hold(attitude_sim_quat)
-        square = target_square(image)
-        if square is None:
-            return self._hold(attitude_sim_quat)
-        center = np.array([square[0], square[1]], dtype=float)
         sightline, relative = self._sightline_and_relative(source, center, height_m, attitude_sim_quat)
         if relative is None:
             return self._hold(attitude_sim_quat)
         return self._steer(
-            t, attitude_sim_quat, velocity_ned, source, center, square[2], sightline, relative,
+            t, attitude_sim_quat, velocity_ned, source, center, side, sightline, relative,
         )
 
+    def _detect(self, camera: str, image: Optional[np.ndarray], t: float) -> Optional[TargetObservation]:
+        """`TargetObservation` through this camera's associator, or None on the legacy
+        (no-mounts) path, which keeps `target_square`/`target_pixel_count` instead.
+
+        `allow_reacquire=True`: a target that moved further between ticks than the gate
+        currently allows must still be picked up (no persistent distractor is assumed
+        just because the gate briefly misses); a genuine same-frame distractor is still
+        rejected because the gated candidate is tried, and accepted, first.
+        """
+        if self._associators is None:
+            return None
+        return self._associators[camera].update(image, t, camera, allow_reacquire=True)
+
+    def _tracked_square(self, image: Optional[np.ndarray], obs: Optional[TargetObservation]):
+        """(center, side) of the tracked square for this tick, or (None, None).
+
+        With structured detections (Gazebo/mounts path), the center and side come from
+        the associator-gated `TargetObservation`, not every red-like pixel in the frame.
+        Without them (legacy no-mounts path), `target_square` is unchanged.
+        """
+        if obs is not None:
+            if obs.status is not DetectionStatus.DETECTED:
+                return None, None
+            u_min, v_min, u_max, v_max = obs.bounds
+            side = float(max(u_max - u_min, v_max - v_min) + 1)
+            return np.array(obs.reference, dtype=float), side
+        if image is None:
+            return None, None
+        square = target_square(image)
+        if square is None:
+            return None, None
+        return np.array([square[0], square[1]], dtype=float), float(square[2])
+
     def reset_derivative_history(self) -> None:
-        """Clear the proportional-navigation derivative history (previous sightline/time).
+        """Clear the proportional-navigation derivative history (previous sightline/time)
+        and any per-camera detection track.
 
         Call this after a `VehicleState` clock discontinuity (sim-time reset, backward
         jump, or detected pause) is reported: the previous sightline/timestamp pair was
         recorded before the discontinuity, and feeding it into the next line-of-sight-rate
         computation would fabricate a spurious angular rate from two readings that are no
-        longer actually adjacent in (sim) time.
+        longer actually adjacent in (sim) time. The same discontinuity also makes any
+        standing per-camera detection track (Gazebo/mounts path) a stale prediction of
+        where the target now is; it is dropped rather than gating the next frame on it.
         """
         self._last_sightline = None
         self._last_image_time = None
+        if self._associators is not None:
+            for associator in self._associators.values():
+                associator.reset()
 
-    def _sees(self, image: Optional[np.ndarray]) -> bool:
+    def _sees(self, image: Optional[np.ndarray], obs: Optional[TargetObservation] = None) -> bool:
+        if obs is not None:
+            return obs.status is DetectionStatus.DETECTED
         count = 0 if image is None else target_pixel_count(image)
         return count >= self.lock_pixels
 
@@ -436,4 +501,5 @@ class HomingGuidance(object):
                 self._tracker_center, dtype=float, copy=True
             ),
             self._tracker_side,
+            self._detections,
         )

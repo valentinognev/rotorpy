@@ -1,5 +1,49 @@
+import base64
+import io
+from pathlib import Path
+
 import numpy as np
 from rotorpy.guidance.pixels import target_centroid, target_pixel_count, target_square
+
+_GAZEBO_HTML_PATH = Path(__file__).resolve().parents[1] / "Results" / "camera_homing_gazebo.html"
+
+
+def _opening_forward_frame():
+    """The first forward-camera frame embedded in `Results/camera_homing_gazebo.html`.
+
+    This is the plan's documented baseline-failure evidence: "The opening recorded
+    square spans almost the entire preview although the target is small." Decoded here
+    from the actual recorded JPEG rather than synthesized, per the task-4 brief.
+    """
+    from PIL import Image
+
+    content = _GAZEBO_HTML_PATH.read_text()
+    marker = '"forward_image": "data:image/jpeg;base64,'
+    start = content.index(marker) + len(marker)
+    end = content.index('"', start)
+    raw = base64.b64decode(content[start:end])
+    image = Image.open(io.BytesIO(raw)).convert("RGB")
+    return np.asarray(image, dtype=float) / 255.0
+
+
+def test_opening_failure_frame_selects_the_cylinder_not_an_image_wide_region():
+    from rotorpy.guidance.pixels import DetectionStatus, detect_target
+
+    image = _opening_forward_frame()
+    height, width = image.shape[:2]
+
+    old = target_square(image)
+    assert old is not None
+    # The baseline-failure evidence: the legacy bounding square spans nearly the whole
+    # frame even though the recorded target cylinder is small.
+    assert old[2] >= 0.9 * width
+
+    obs = detect_target(image, timestamp=0.0, camera="forward")
+    assert obs.status is DetectionStatus.DETECTED
+    assert obs.area < 0.01 * height * width
+    extent = max(obs.bounds[2] - obs.bounds[0], obs.bounds[3] - obs.bounds[1]) + 1
+    assert extent < 0.1 * width
+
 
 def test_empty_image_has_no_target():
     image = np.zeros((4, 4, 3))
@@ -248,6 +292,42 @@ def test_associator_ignores_the_track_from_another_camera_and_can_reset():
     assert associator.update(None, 0.1, "up").status is DetectionStatus.NO_FRAME
     associator.reset()
     assert associator.track is None
+
+
+def test_allow_reacquire_recovers_a_single_candidate_outside_the_gate():
+    """`allow_reacquire=True` falls back to an ungated search when the gate rejects
+    everything, so a legitimate large jump is not permanently lost -- but the default
+    (`allow_reacquire=False`, every other test above) keeps rejecting it."""
+    first = _background()
+    _blob(first, 20, 20, 8, 8)
+    moved = _background()
+    _blob(moved, 70, 90, 8, 8)
+
+    default_associator = TargetAssociator()
+    default_associator.update(first, 0.0, "forward")
+    default = default_associator.update(moved, 0.05, "forward")
+    assert default.status is DetectionStatus.NO_DETECTION
+
+    reacquiring_associator = TargetAssociator()
+    reacquiring_associator.update(first, 0.0, "forward")
+    recovered = reacquiring_associator.update(moved, 0.05, "forward", allow_reacquire=True)
+    assert recovered.status is DetectionStatus.DETECTED
+    assert np.allclose(recovered.reference, [93.5, 73.5])
+
+
+def test_allow_reacquire_still_prefers_the_gated_candidate_over_a_distractor():
+    """A real distractor present in the *same* frame as the gated candidate must still
+    lose to it, even with `allow_reacquire=True`: the gate is checked first."""
+    associator = TargetAssociator()
+    first = _background()
+    _blob(first, 20, 20, 8, 8)
+    associator.update(first, 0.0, "forward")
+    second = _background()
+    _blob(second, 22, 24, 8, 8)
+    _blob(second, 70, 90, 20, 20)  # a larger distractor well outside the gate
+    obs = associator.update(second, 0.05, "forward", allow_reacquire=True)
+    assert obs.status is DetectionStatus.DETECTED
+    assert np.allclose(obs.reference, [27.5, 25.5])
 
 
 def test_noise_robustness():
