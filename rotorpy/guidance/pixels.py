@@ -1,8 +1,11 @@
 """Target-pixel detection for camera homing."""
 
-from typing import Optional, Tuple
+from dataclasses import dataclass, replace
+from enum import Enum
+from typing import List, Optional, Tuple
 
 import numpy as np
+from scipy import ndimage
 
 
 def _target_mask(image: np.ndarray) -> np.ndarray:
@@ -38,3 +41,217 @@ def target_square(image: np.ndarray) -> Optional[Tuple[float, float, int]]:
     center_v = (row_min + row_max) / 2
     side = max(col_max - col_min + 1, row_max - row_min + 1)
     return (center_u, center_v, side)
+
+
+class DetectionStatus(Enum):
+    NO_FRAME = "no_frame"
+    NO_DETECTION = "no_detection"
+    AMBIGUOUS = "ambiguous"
+    DETECTED = "detected"
+
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    min_red: float = 0.4
+    min_dominance: float = 0.25  # red minus the larger of green and blue
+    min_saturation: float = 0.5  # (red - min channel) / red
+    min_area: int = 4
+    max_area_fraction: float = 0.7
+    min_fill: float = 0.35  # component area / bounding-box area
+    max_aspect: float = 8.0  # unclipped bounding-box long side / short side
+    clipped_confidence: float = 0.5
+    clipped_score: float = 0.5
+    dominance_ratio: float = 1.5  # best score must beat the runner-up by this factor
+    base_uncertainty_px: float = 0.5
+    extent_uncertainty: float = 0.1  # per pixel of the longer bounding-box side
+    clipped_extent_uncertainty: float = 0.5
+    gate_sigmas: float = 3.0
+    gate_ambiguity_ratio: float = 2.0
+    gate_ambiguity_margin_px: float = 1.0
+
+
+DEFAULT_CONFIG = DetectorConfig()
+
+
+@dataclass(frozen=True)
+class TrackPrediction:
+    """Predicted target location (u, v) and one-sigma position uncertainty."""
+
+    u: float
+    v: float
+    sigma_px: float
+
+
+@dataclass(frozen=True)
+class TargetObservation:
+    status: DetectionStatus
+    timestamp: float
+    camera: str
+    bounds: Optional[Tuple[int, int, int, int]] = None  # inclusive (u_min, v_min, u_max, v_max)
+    reference: Optional[Tuple[float, float]] = None  # (u, v), component centroid
+    confidence: float = 0.0
+    uncertainty_px: float = float("inf")
+    area: int = 0
+    clipped: bool = False
+    num_candidates: int = 0
+
+
+@dataclass(frozen=True)
+class _Component:
+    bounds: Tuple[int, int, int, int]
+    centroid: Tuple[float, float]
+    area: int
+    fill: float
+    clipped: bool
+
+    @property
+    def extent(self) -> int:
+        return max(self.bounds[2] - self.bounds[0], self.bounds[3] - self.bounds[1]) + 1
+
+    def score(self, config: DetectorConfig) -> float:
+        return self.area * self.fill * (config.clipped_score if self.clipped else 1.0)
+
+
+def _as_unit_float(image: np.ndarray) -> np.ndarray:
+    if np.issubdtype(image.dtype, np.integer):
+        return image.astype(float) / 255.0
+    return image.astype(float, copy=False)
+
+
+def _red_mask(image: np.ndarray, config: DetectorConfig) -> np.ndarray:
+    red, green, blue = image[:, :, 0], image[:, :, 1], image[:, :, 2]
+    dominance = red - np.maximum(green, blue)
+    saturation = (red - np.minimum(green, blue)) / np.maximum(red, 1e-6)
+    return (
+        (red >= config.min_red)
+        & (dominance >= config.min_dominance)
+        & (saturation >= config.min_saturation)
+    )
+
+
+def _components(image: np.ndarray, config: DetectorConfig) -> List[_Component]:
+    height, width = image.shape[:2]
+    labels, count = ndimage.label(_red_mask(image, config), structure=np.ones((3, 3)))
+    components = []
+    for index, box in enumerate(ndimage.find_objects(labels), start=1):
+        rows, columns = np.nonzero(labels[box] == index)
+        area = rows.size
+        if area < config.min_area or area > config.max_area_fraction * height * width:
+            continue
+        v_min, u_min = box[0].start, box[1].start
+        v_max, u_max = box[0].stop - 1, box[1].stop - 1
+        box_height, box_width = v_max - v_min + 1, u_max - u_min + 1
+        fill = area / (box_height * box_width)
+        clipped = u_min == 0 or v_min == 0 or u_max == width - 1 or v_max == height - 1
+        if fill < config.min_fill:
+            continue
+        if not clipped and max(box_height, box_width) > config.max_aspect * min(box_height, box_width):
+            continue
+        components.append(
+            _Component(
+                bounds=(u_min, v_min, u_max, v_max),
+                centroid=(float(columns.mean() + u_min), float(rows.mean() + v_min)),
+                area=area,
+                fill=fill,
+                clipped=clipped,
+            )
+        )
+    return components
+
+
+def _observation(component: _Component, timestamp: float, camera: str,
+                 count: int, config: DetectorConfig) -> TargetObservation:
+    extent = component.extent
+    uncertainty = config.base_uncertainty_px + config.extent_uncertainty * extent
+    confidence = component.fill * min(1.0, np.sqrt(component.area) / 5.0)
+    if component.clipped:
+        uncertainty += config.clipped_extent_uncertainty * extent
+        confidence *= config.clipped_confidence
+    return TargetObservation(
+        status=DetectionStatus.DETECTED,
+        timestamp=timestamp,
+        camera=camera,
+        bounds=component.bounds,
+        reference=component.centroid,
+        confidence=float(confidence),
+        uncertainty_px=float(uncertainty),
+        area=component.area,
+        clipped=component.clipped,
+        num_candidates=count,
+    )
+
+
+def _select(components: List[_Component], prediction: Optional[TrackPrediction],
+            config: DetectorConfig) -> Tuple[DetectionStatus, Optional[_Component]]:
+    if prediction is None:
+        ranked = sorted(components, key=lambda c: c.score(config), reverse=True)
+        if len(ranked) > 1 and ranked[0].score(config) < config.dominance_ratio * ranked[1].score(config):
+            return DetectionStatus.AMBIGUOUS, None
+        return DetectionStatus.DETECTED, ranked[0]
+
+    gated = []
+    for component in components:
+        distance = float(np.hypot(component.centroid[0] - prediction.u,
+                                  component.centroid[1] - prediction.v))
+        if distance <= config.gate_sigmas * prediction.sigma_px + 0.5 * component.extent:
+            gated.append((distance, component))
+    if not gated:
+        return DetectionStatus.NO_DETECTION, None
+    gated.sort(key=lambda item: item[0])
+    if len(gated) > 1 and gated[1][0] < (config.gate_ambiguity_ratio * gated[0][0]
+                                         + config.gate_ambiguity_margin_px):
+        return DetectionStatus.AMBIGUOUS, None
+    return DetectionStatus.DETECTED, gated[0][1]
+
+
+def detect_target(image: Optional[np.ndarray], timestamp: float = 0.0, camera: str = "",
+                  prediction: Optional[TrackPrediction] = None,
+                  config: DetectorConfig = DEFAULT_CONFIG) -> TargetObservation:
+    """Detect the red target as one connected component.
+
+    With a prediction, only components inside its gate are candidates, so a
+    distractor elsewhere cannot move the reference. Without one, the best
+    component must clearly dominate the others or the result is AMBIGUOUS.
+    """
+    if image is None:
+        return TargetObservation(DetectionStatus.NO_FRAME, timestamp, camera)
+    components = _components(_as_unit_float(np.asarray(image)), config)
+    if not components:
+        return TargetObservation(DetectionStatus.NO_DETECTION, timestamp, camera)
+    status, chosen = _select(components, prediction, config)
+    if chosen is None:
+        return TargetObservation(status, timestamp, camera, num_candidates=len(components))
+    return _observation(chosen, timestamp, camera, len(components), config)
+
+
+class TargetAssociator:
+    """Keeps one image-plane track and gates each new frame with it."""
+
+    def __init__(self, config: DetectorConfig = DEFAULT_CONFIG, min_sigma_px: float = 4.0,
+                 growth_px_per_s: float = 20.0, max_sigma_px: float = 200.0):
+        self.config = config
+        self.min_sigma_px = min_sigma_px
+        self.growth_px_per_s = growth_px_per_s
+        self.max_sigma_px = max_sigma_px
+        self.track: Optional[TrackPrediction] = None
+        self._camera = ""
+        self._timestamp = 0.0
+
+    def reset(self) -> None:
+        self.track = None
+
+    def update(self, image: Optional[np.ndarray], timestamp: float,
+               camera: str) -> TargetObservation:
+        same_camera = self.track is not None and camera == self._camera
+        obs = detect_target(image, timestamp, camera,
+                            self.track if same_camera else None, self.config)
+        if obs.status is DetectionStatus.DETECTED:
+            sigma = max(self.min_sigma_px, obs.uncertainty_px)
+            self.track = TrackPrediction(obs.reference[0], obs.reference[1], sigma)
+            self._camera = camera
+        elif same_camera:
+            grown = self.track.sigma_px + self.growth_px_per_s * max(0.0, timestamp - self._timestamp)
+            self.track = replace(self.track, sigma_px=min(self.max_sigma_px, grown))
+        if obs.status is DetectionStatus.DETECTED or same_camera:
+            self._timestamp = timestamp
+        return obs

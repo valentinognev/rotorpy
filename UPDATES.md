@@ -1,5 +1,9 @@
 # Updates
 
+## 4.3.0 - Robust target detection (plan Phase 4)
+- `guidance/pixels.py`: `detect_target` finds the red target as a connected component (red dominance and saturation, area/fill/aspect checks, border clipping flagged with inflated uncertainty) and returns a frozen `TargetObservation` with `DetectionStatus` NO_FRAME/NO_DETECTION/AMBIGUOUS/DETECTED.
+- `TrackPrediction` gates candidates; `TargetAssociator` keeps a per-camera track so distractors cannot move the reference. Not yet wired into `homing.py`; the legacy `target_*` functions are unchanged.
+
 ## 4.2.1 - Camera homing documentation
 - Correct the current Python controller selection and distinguish it from Gazebo's PX4 control.
 - Document Gazebo's GPU and software rendering, startup, automatic stop, and recording behavior.
