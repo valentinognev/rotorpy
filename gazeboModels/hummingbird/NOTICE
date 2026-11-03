@@ -1,0 +1,4 @@
+Body mesh hummingbird.dae, propeller_cw.dae, and propeller_ccw.dae, and the
+inertial and rotor numbers in hummingbird.sdf.jinja, come from
+PX4/rotors_simulator rotors_description (a fork of ethz-asl/rotors_simulator).
+That package is licensed ASL 2.0.

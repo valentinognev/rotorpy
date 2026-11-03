@@ -1,5 +1,73 @@
 # Updates
 
+## 4.2.1 - Camera homing documentation
+- Correct the current Python controller selection and distinguish it from Gazebo's PX4 control.
+- Document Gazebo's GPU and software rendering, startup, automatic stop, and recording behavior.
+
+## 4.2.0 - Stop Gazebo after homing
+- Save the flight page and stop the Gazebo session when homing reaches the ground or its configured timeout.
+- Supervise and clean up only the processes started by the simulation launcher.
+
+## 4.1.0 - NVIDIA Gazebo rendering
+- Use the NVIDIA GPU for Gazebo cameras and visualization by default, verifying the OpenGL renderer in the container.
+- `LIBGL_ALWAYS_SOFTWARE=1` explicitly selects software rendering; headless camera rendering retains the X display.
+
+## 4.0.0 - Root Gazebo homing launcher
+- Moved `run_camera_homing_sitl.sh` to the project root; the old `Dockerfiles/` path no longer works.
+
+## 3.14.2 - Gazebo motor startup before homing
+- Disable throw launch, wait for the motors to spool, and stabilize at the starting altitude before commanding camera homing.
+- Start the Gazebo flight recording after the startup hover so initialization does not consume the flight timeout.
+
+## 3.14.1 - Stable Gazebo homing startup
+- Pause physics while spawning and disable gravity on every Hummingbird link, including the GPS, until PX4 arms in offboard mode.
+- Retain the last PX4 heartbeat state between updates instead of repeatedly requesting arm and offboard.
+
+## 3.14.0 - Larger Gazebo homing target
+- Tripled the Gazebo target cylinder's dimensions to 1.5 m diameter and 3 m height, keeping it on the ground.
+
+## 3.13.2 - Local Conda environment
+- Created the Python 3.11 `rotorpy` environment with an editable installation of all project extras and CPU-only PyTorch.
+- Selected it in VS Code, configured the Conda executable, and documented shell activation without relying on Conda being on PATH.
+
+## 3.13.1 - Forward camera clear of the airframe
+- The Gazebo forward camera sits 0.36 m ahead of the body and 0.05 m up, still pitched 10° down. The shell, legs, and rotors are behind that lens.
+- Propeller visuals are scaled to the 0.1 m rotor disk. The mesh was a metre across, which is the red and blue shape in the forward picture.
+
+## 3.13.0 - Gazebo homing page
+- The Gazebo tracker writes `Results/camera_homing_gazebo.html` when the flight hits the ground, times out, or the tracker stops. The page is the same slider view as `Results/camera_homing.html`.
+- The SITL container installs Pillow when it is missing, because that page encodes the camera pictures with it.
+
+## 3.12.6 - Restart Gazebo if spawn aborts it
+- The Hummingbird spawn waits until Gazebo is serving, then checks that `gzserver` is still alive. An empty transport header aborts the server during spawn; the launch starts Gazebo again instead of booting PX4 against a dead server.
+
+## 3.12.5 - Kill the sim container first
+- `run_hummingbird_sitl.sh` removes `rotorpy-hummingbird-sitl` before checks, xhost, or starting Gazebo.
+
+## 3.12.4 - Software GL for the Gazebo window
+- The homing launch uses software OpenGL. Nouveau aborts `gzclient` after the window opens, with an empty Gazebo header. `LIBGL_ALWAYS_SOFTWARE=0` keeps the GPU.
+
+## 3.12.3 - Gazebo server survives startup on this host
+- The SITL container is not started with a docker TTY. That TTY makes `gzserver` abort with an empty transport header.
+- If `gzserver` still aborts, the next attempt clears it and uses software GL. Nouveau DRI was aborting the server the same way.
+
+## 3.12.2 - Retry PX4 arm for camera homing
+- Offboard is requested as PX4 main mode 6. The packed heartbeat value was cast away, so the vehicle stayed in loiter.
+- The tracker asks again until the heartbeat is armed in offboard. Gravity stays off until then, so the 30 m spawn does not fall during the wait.
+- The offboard setpoint is velocity and yaw. The homing acceleration is the RotorPy feedforward, and PX4 was tilting the Hummingbird with it.
+- The airframe enables in-air start and sets hover thrust for the 0.68 kg vehicle. PX4 otherwise treats the 30 m spawn as landed and commands zero thrust.
+
+## 3.12.1 - Gazebo path variables on a fresh container
+- `sitl_hummingbird_run.sh` sets `GAZEBO_PLUGIN_PATH`, `GAZEBO_MODEL_PATH`, and `LD_LIBRARY_PATH` before sourcing PX4's setup script. Nounset was aborting the launch when those were unset.
+
+## 3.12.0 - Gazebo camera homing
+- The Hummingbird Gazebo model has the forward and upward cameras from `examples/camera_homing.jsonc`.
+- `Dockerfiles/run_camera_homing_sitl.sh` spawns a red 0.5 m by 1 m cylinder on the homing ground point and runs `camera_homing_tracker.py`, which homes from those pictures through PX4 offboard.
+
+## 3.11.0 - Hummingbird Gazebo Classic injection
+- `gazeboModels/hummingbird/` is the AscTec Hummingbird mesh and a PX4 Gazebo Classic SDF (mass 0.68 kg, plus layout, arm 0.17 m).
+- `Dockerfiles/run_hummingbird_sitl.sh` bind-mounts that model into the existing image `px4-noetic-sim-ros`. `sitl_hummingbird_run.sh` spawns it. `px4_noetic_sim_bash.sh` opens a shell with the same mounts.
+
 ## 3.10.0 - Camera homing JSONC
 - `examples/camera_homing.jsonc` holds the homing scene, positions, and controller. `controller` is `geometric` (SE3Control) or `pid` (Px4Cascade). The shipped choice is `pid`.
 - `examples/camera_homing.py` reads that file for the flight and the sweep.

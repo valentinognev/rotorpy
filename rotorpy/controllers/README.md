@@ -6,7 +6,7 @@ The geometric tracking controller is `SE3Control` in `quadrotor_control/`. Based
 
 `px4_cascade/` is `Px4Cascade`, the PX4 position, velocity, attitude, and rate cascade. It outputs Hummingbird motor speeds. `raptor/` is the RAPTOR foundation policy. `controller_template/` is the empty controller to copy.
 
-Camera homing picks the inner loop in `examples/camera_homing.jsonc`. `"controller": "geometric"` is `SE3Control`. `"controller": "pid"` is `Px4Cascade`, and that is the shipped choice.
+The Python camera-homing example picks the inner loop in `examples/camera_homing.jsonc`. `"controller": "geometric"` is `SE3Control` and is the current configured choice. `"controller": "pid"` is `Px4Cascade`. The Gazebo homing flight uses PX4 offboard control instead.
 
 Currently, the `Multirotor` object accepts the following controller inputs (abstractions): 
 - `cmd_motor_speeds`: the lowest control abstraction. The controller directly commands individual motor speeds.

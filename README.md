@@ -37,6 +37,22 @@ pip install rotorpy.[px4]       # for integration with PX4
 
 For other tagged versions, see `pyproject.toml`. It's an evolving thing.
 
+## Local Conda Environment
+
+For this checkout, use the `rotorpy` environment with Python 3.11:
+
+```bash
+source "$HOME/Anaconda3/etc/profile.d/conda.sh"
+conda activate rotorpy
+python examples/camera_homing.py
+```
+
+To recreate the environment, run `conda create -n rotorpy python=3.11 pip -y`,
+activate it, and run `python -m pip install -e '.[all]'` from the project root.
+The current installation uses CPU-only PyTorch, installed before the project
+with `python -m pip install torch --index-url https://download.pytorch.org/whl/cpu`.
+The workspace selects this environment for Python and debugging.
+
 # Usage
 
 There are a few example scripts found in `rotorpy/examples/` that demonstrate how to use RotorPy in a variety of ways including for Monte Carlo evaluations, reinforcement learning, swarms, and even visual servoing (as of `v3.0`). 
@@ -106,7 +122,23 @@ For an example of how to interface with this environment, see `rotorpy/examples/
 You can find this new environment in the `rotorpy/learning/` module. 
 
 #### Camera homing
-[`examples/camera_homing.py`](/examples/camera_homing.py) flies a Hummingbird at a red box and writes `Results/camera_homing.html`. The start, the target, both cameras, the timing, and the inner loop are [`examples/camera_homing.jsonc`](/examples/camera_homing.jsonc). `controller` is `pid` for `Px4Cascade` (the file as shipped) or `geometric` for `SE3Control`. `--sweep` repeats the flight for the navigation constants in that file.
+[`examples/camera_homing.py`](/examples/camera_homing.py) flies a Hummingbird at a red box and writes `Results/camera_homing.html`. The start, the target, both cameras, the timing, and the inner loop are [`examples/camera_homing.jsonc`](/examples/camera_homing.jsonc). The Python simulation uses `geometric` (`SE3Control`) in the current configuration; `pid` selects `Px4Cascade`. `--sweep` repeats the flight for the navigation constants in that file.
+
+For Gazebo, run `./run_camera_homing_sitl.sh` from the project root. It requires
+Docker, the existing `px4-noetic-sim-ros` image, and a working X display. The
+launcher replaces any existing `rotorpy-hummingbird-sitl` container and
+temporarily disables X server access control.
+
+Gazebo's cameras and visualization use the NVIDIA GPU by default, requiring an
+NVIDIA driver and Docker's NVIDIA runtime; physics may still run on the CPU.
+Run `LIBGL_ALWAYS_SOFTWARE=1 ./run_camera_homing_sitl.sh` to use software
+rendering. `HEADLESS=1` hides the Gazebo window but still requires a display for
+the camera sensors.
+
+Gazebo uses PX4 offboard control regardless of the Python `controller` choice.
+After motor startup and a stable hover, it flies until ground contact or
+`timeout_s` (20 seconds in the current configuration), then saves
+`Results/camera_homing_gazebo.html` if camera frames are available and stops.
 
 #### And much more
 RotorPy is intended to be flexible to support the aerial robotics field as it expands. Explore the examples in this repository and [citations](https://scholar.google.com/scholar?oi=bibs&hl=en&cites=17472125763442225756) to see the many ways RotorPy can be used to learn more about aerial robotics. 
@@ -139,7 +171,11 @@ See how academics have been using RotorPy:
 We would like to acknowledge [Jimmy Paulos](https://github.com/jpaulos) who wrote the majority of the underlying engine for RotorPy, and the teaching assistants who contributed code to the initial version of this simulator, especially [Dan Mox](https://github.com/danmox), [Laura Jarin-Lipschitz](https://github.com/ljarin), [Rebecca Li](https://github.com/rebeccali), [Shane Rozen-Levy](https://github.com/ShaneRozenLevy), [Xu Liu](https://github.com/XuRobotics), [Yuezhan Tao](https://github.com/tyuezhan), [Yu-Ming Chen](https://github.com/yminchen), and [Fernando Cladera](https://github.com/fcladera).
 
 ## Architecture
-Each controller is a package under `rotorpy/controllers/`. `Px4Cascade` in `rotorpy/controllers/px4_cascade/` outputs Hummingbird `cmd_motor_speeds` from the PX4 position, velocity, attitude, and rate loops. `examples/camera_homing.jsonc` selects that cascade with `"controller": "pid"`, or `SE3Control` from `rotorpy/controllers/quadrotor_control/` with `"controller": "geometric"`. Other examples keep `SE3Control`.
+Each controller is a package under `rotorpy/controllers/`. `Px4Cascade` in `rotorpy/controllers/px4_cascade/` outputs Hummingbird `cmd_motor_speeds` from the PX4 position, velocity, attitude, and rate loops. For the Python camera-homing simulation, `examples/camera_homing.jsonc` selects that cascade with `"controller": "pid"`, or `SE3Control` from `rotorpy/controllers/quadrotor_control/` with `"controller": "geometric"`. Other examples keep `SE3Control`.
+
+`gazeboModels/hummingbird/` is an AscTec Hummingbird for PX4 Gazebo Classic. The forward camera is 0.36 m ahead of the body and 0.05 m up, pitched 10° down, so the airframe stays outside that picture. Propeller visuals are scaled to the 0.1 m rotor disk. The upward camera is at the body origin, pitched 70° above the nose. `Dockerfiles/run_hummingbird_sitl.sh` starts it in the existing image `px4-noetic-sim-ros` by bind-mounting that model, `Dockerfiles/sitl_hummingbird_run.sh`, and airframe `1100_gazebo-classic_hummingbird`. `Dockerfiles/px4_noetic_sim_bash.sh` opens a shell in the same image with those mounts. The container name is `rotorpy-hummingbird-sitl`, so it does not remove a container already named `px4-noetic-sim-ros`.
+
+`run_camera_homing_sitl.sh` places that Hummingbird at the camera-homing start, 30 m up, aimed at a red cylinder on the homing ground point (diameter 1.5 m, height 3 m). `Dockerfiles/camera_homing_tracker.py` waits for motor spin and a stable hover before starting the homing law on the two camera topics and commanding PX4 offboard velocity. It writes `Results/camera_homing_gazebo.html`, the same page as the RotorPy flight.
 
 ## Reading order for agents
 1. Read this `README.md`.
