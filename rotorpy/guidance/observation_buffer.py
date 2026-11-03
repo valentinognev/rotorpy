@@ -54,14 +54,22 @@ def decode_image(data: bytes, width: int, height: int, encoding: str, step: int)
             )
         )
     buffer = np.frombuffer(data, dtype=np.uint8)
-    needed = step * height
+    # Only the tight data of every row is structurally required; `step` padding after the
+    # very last row is commonly omitted by encoders, so do not demand it.
+    needed = (height - 1) * step + row_bytes if height > 0 else 0
     if buffer.size < needed:
         raise ValueError(
-            "image buffer has {} bytes, needs {} for height {} at stride {}".format(
+            "image buffer has {} bytes, needs at least {} for height {} at stride {}".format(
                 buffer.size, needed, height, step
             )
         )
-    rows = buffer[:needed].reshape(height, step)[:, :row_bytes]
+    if buffer.size >= step * height:
+        rows = buffer[: step * height].reshape(height, step)[:, :row_bytes]
+    else:
+        full_row_count = height - 1
+        full_rows = buffer[: step * full_row_count].reshape(full_row_count, step)[:, :row_bytes]
+        last_row = buffer[step * full_row_count : step * full_row_count + row_bytes].reshape(1, row_bytes)
+        rows = np.concatenate([full_rows, last_row], axis=0)
     frame = rows.reshape(height, width, channels)
     if is_bgr_order:
         order = [2, 1, 0, 3] if channels == 4 else [2, 1, 0]
@@ -81,6 +89,32 @@ class CameraObservation:
     receipt_s: float
     image: np.ndarray
     encoding: str
+
+
+# Proposed, not verified: a cached (not freshly offered this tick) observation older than
+# this is no longer fused into guidance -- same proposed value as the image comms
+# watchdog's timeout, kept as a separate constant since it is a different concept (guidance
+# fusion staleness vs. "the link itself looks dead").
+PROPOSED_CAMERA_FUSION_MAX_AGE_S = 1.0
+
+
+def select_fresh_or_recent(observation, is_fresh, now_wall_s, max_age_s=PROPOSED_CAMERA_FUSION_MAX_AGE_S):
+    """The observation to fuse into this guidance tick, or `None` if it is unusable.
+
+    A fresh observation (offered since the last read) is always usable. One camera
+    getting a fresh frame this tick must not make the *other* camera's cached frame look
+    fresh too (the old tracker's shared `fresh` flag bug) -- but a stale cached
+    observation that is still genuinely recent (within `max_age_s` of wall-clock age) is
+    still useful context and is not unconditionally dropped just because nothing new
+    arrived on that camera this particular tick. Older than `max_age_s`, it is treated the
+    same as a dead camera: `None`.
+    """
+    if observation is None:
+        return None
+    if is_fresh:
+        return observation
+    age = float(now_wall_s) - observation.receipt_s
+    return observation if age <= max_age_s else None
 
 
 class CameraSlot(object):

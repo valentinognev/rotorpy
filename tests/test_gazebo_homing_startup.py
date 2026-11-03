@@ -115,6 +115,27 @@ def test_last_heartbeat_state_persists_until_a_new_heartbeat(tracker_module):
     assert not tracker._flight_state()
 
 
+def test_image_watchdog_is_touched_only_after_a_successful_decode(tracker_module):
+    # Touching the watchdog before decoding means a corrupt/garbage frame (a bad
+    # `encoding`/`step`/buffer size) would still mark the image link "healthy".
+    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
+    tracker._watchdogs = tracker_module.CommsWatchdogs(tracker_module.watchdog_timeouts())
+    tracker._observations = tracker_module.ObservationBuffer(cameras=("forward", "upward"))
+    bad_msg = SimpleNamespace(
+        header=SimpleNamespace(stamp=SimpleNamespace(to_sec=lambda: 1.0)),
+        data=b"\x00" * 4, width=4, height=4, encoding="yuv422", step=16,
+    )
+    with pytest.raises(ValueError):
+        tracker._on_forward(bad_msg)
+    assert tracker._watchdogs.stale("image", time.monotonic())
+    good_msg = SimpleNamespace(
+        header=SimpleNamespace(stamp=SimpleNamespace(to_sec=lambda: 1.0)),
+        data=bytes(4 * 4 * 3), width=4, height=4, encoding="rgb8", step=4 * 3,
+    )
+    tracker._on_forward(good_msg)
+    assert not tracker._watchdogs.stale("image", time.monotonic())
+
+
 def test_normal_takeoff_and_motor_ready_threshold_match_the_model(tracker_module):
     airframe = (ROOT / "Dockerfiles" / "airframes" / "1100_gazebo-classic_hummingbird").read_text()
     assert "param set-default COM_THROW_EN 0" in airframe
@@ -175,6 +196,60 @@ def test_startup_commands_climb_then_hold_before_homing(tracker_module):
     tracker._send(command, 30.0)
     assert sent[-1][8:11] == (10.0, 5.0, 3.0)
     assert sent[-1][14] == 0.8
+
+
+def test_mav_access_is_serialised_across_threads(tracker_module):
+    # pymavlink is not thread-safe: the 50 Hz setpoint-publisher thread's `_send` and the
+    # step thread's `_poll_mavlink` must never run inside the same connection at once.
+    import threading
+
+    tracker = tracker_module.CameraHomingTracker.__new__(tracker_module.CameraHomingTracker)
+    tracker._gravity_on = True
+    tracker._startup_done = True
+    tracker._startup_yaw = 0.0
+    tracker._hb_armed = False
+    tracker._hb_mode = None
+    tracker._last_status = None
+    tracker._watchdogs = tracker_module.CommsWatchdogs(tracker_module.watchdog_timeouts())
+
+    active = [0]
+    overlap = []
+    section_lock = threading.Lock()
+
+    def enter():
+        with section_lock:
+            active[0] += 1
+            if active[0] > 1:
+                overlap.append(True)
+
+    def leave():
+        with section_lock:
+            active[0] -= 1
+
+    def slow_send(*args):
+        enter()
+        time.sleep(0.02)
+        leave()
+
+    def slow_recv(**kwargs):
+        enter()
+        time.sleep(0.02)
+        leave()
+        return None
+
+    tracker._mav = SimpleNamespace(
+        target_system=1, target_component=1,
+        mav=SimpleNamespace(set_position_target_local_ned_send=slow_send),
+        recv_match=slow_recv,
+    )
+    command = SimpleNamespace(velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0)
+    send_thread = threading.Thread(target=lambda: tracker._send(command, 30.0))
+    poll_thread = threading.Thread(target=tracker._poll_mavlink)
+    send_thread.start()
+    poll_thread.start()
+    send_thread.join()
+    poll_thread.join()
+    assert overlap == []
 
 
 def test_startup_requires_a_sustained_stable_hover(tracker_module):
@@ -238,6 +313,67 @@ def test_gravity_stays_off_until_armed_offboard_motors_spin(tracker_module, monk
     assert not tracker._startup_done
 
 
+def test_step_does_not_restamp_the_setpoint_stream_without_a_fresh_estimate(tracker_module, monkeypatch):
+    # Before this fix, `step()` called `set_command` every tick with the current wall
+    # time, including the hold-last-command branch (no fresh image, no PX4 estimate):
+    # the setpoint stream's expiry then never fired, so a dead camera or dead telemetry
+    # never stopped the stream.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    # No PX4 estimate is ever ingested: `have_estimate` is False on every tick.
+    tracker.step()
+    _, stamp_first = tracker._setpoints.peek()
+    assert stamp_first is not None
+    tracker.step()
+    _, stamp_second = tracker._setpoints.peek()
+    assert stamp_second == stamp_first
+
+
+def test_watchdog_staleness_marks_the_setpoint_stream_fatal(tracker_module, monkeypatch):
+    # Spec: the image/telemetry/heartbeat watchdogs were touched but `any_stale` was never
+    # consumed anywhere; a dead comms link must stop the normal command.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    fresh_now = time.monotonic()
+    for name in ("heartbeat", "telemetry", "image"):
+        tracker._watchdogs.touch(name, fresh_now)
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: fresh_now)
+    tracker.step()
+    assert tracker._setpoints.stats.failed is False
+    # Time advances well past every watchdog's timeout with no further touches: stale.
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: fresh_now + 10.0)
+    tracker.step()
+    assert tracker._setpoints.stats.failed is True
+
+
+def test_step_resets_guidance_derivative_history_on_a_clock_discontinuity(tracker_module, monkeypatch):
+    from rotorpy.guidance.homing_config import guidance_from_config
+
+    config = load_homing_config(ROOT / "examples" / "camera_homing.jsonc")
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker.guidance = guidance_from_config(config)
+    reset_calls = []
+    original_reset = tracker.guidance.reset_derivative_history
+
+    def spy_reset():
+        reset_calls.append(1)
+        original_reset()
+
+    tracker.guidance.reset_derivative_history = spy_reset
+    now = time.monotonic()
+    for name in ("heartbeat", "telemetry", "image"):
+        tracker._watchdogs.touch(name, now)
+    tracker._vehicle_state.ingest_attitude(sim_s=10.0, wall_s=10.0, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=10.0, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+    # A backward jump to near zero: the simulation restarted (a clock discontinuity).
+    tracker._vehicle_state.ingest_attitude(sim_s=0.0, wall_s=10.01, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker.step()
+    assert reset_calls == [1]
+
+
 @pytest.mark.parametrize("reason", ["ground", "timeout"])
 def test_tracker_step_reports_flight_end(tracker_module, monkeypatch, reason):
     tracker = _new_tracker(tracker_module, monkeypatch)
@@ -272,6 +408,91 @@ def test_main_stops_after_saving_flight(tracker_module, monkeypatch, capsys, rea
     output = capsys.readouterr()
     assert f"flight finished: {reason}" in output.out
     assert ("no recording was written" in output.err) is not has_recording
+
+
+def test_main_marks_the_setpoint_stream_fatal_on_a_step_exception(tracker_module, monkeypatch):
+    # A fatal `step()` failure must stop the normal command just like an expired or
+    # watchdog-stale one, not leave the stream streaming whatever was last held forever.
+    events = []
+    outcomes = iter([RuntimeError("boom"), "timeout"])
+
+    def step():
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    fake_tracker = SimpleNamespace(
+        step=step,
+        write_page=lambda: events.append("write") or "flight.html",
+        shutdown=lambda: events.append("shutdown"),
+        note_failure=lambda exc: events.append(("note_failure", str(exc))),
+        mark_fatal=lambda: events.append("mark_fatal"),
+    )
+    rospy = tracker_module.rospy
+    monkeypatch.setattr(sys, "argv", ["tracker", "--config", "config.jsonc"])
+    monkeypatch.setattr(tracker_module, "load_homing_config", lambda path: {"camera_rate_hz": 20})
+    monkeypatch.setattr(tracker_module, "gazebo_page_path", lambda path: "flight.html")
+    monkeypatch.setattr(tracker_module, "CameraHomingTracker", lambda *args: fake_tracker)
+    monkeypatch.setattr(tracker_module.atexit, "register", lambda callback: None)
+    monkeypatch.setattr(rospy, "init_node", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(rospy, "on_shutdown", lambda callback: None, raising=False)
+    monkeypatch.setattr(rospy, "Rate", lambda rate: SimpleNamespace(sleep=lambda: None), raising=False)
+    monkeypatch.setattr(rospy, "is_shutdown", lambda: False, raising=False)
+    tracker_module.main()
+    assert "mark_fatal" in events
+    assert events.index("mark_fatal") < events.index("write")
+
+
+def test_step_fuses_the_other_cameras_still_recent_cached_image(tracker_module, monkeypatch):
+    # Spec: a fresh frame from one camera must not make the *other* camera's stale cached
+    # frame appear fresh, but that other camera's still-valid recent observation (within
+    # the fusion max age) should still reach guidance instead of being unconditionally
+    # dropped to `None`.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: 1.0)
+    tracker._watchdogs.touch("telemetry", 1.0)
+    tracker._vehicle_state.ingest_attitude(sim_s=1.0, wall_s=1.0, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=1.0, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+    calls = []
+
+    class FakeGuidance(object):
+        def update(self, t, height_m, attitude, velocity_ned, forward_image, upward_image):
+            calls.append((forward_image is not None, upward_image is not None))
+            return SimpleNamespace(
+                locked=False, tracking=False, source=None,
+                velocity_ned=[0.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,
+            )
+
+    tracker.guidance = FakeGuidance()
+    raw = np.zeros((2, 2, 3), dtype=np.uint8).tobytes()
+    tracker._observations.offer(
+        "forward", capture_s=1.0, receipt_s=1.0, raw_bytes=raw, width=2, height=2, encoding="rgb8", step=2 * 3,
+    )
+    tracker.step()
+    assert calls[-1] == (True, False)  # only the forward camera has ever offered anything
+
+    # Shortly after (well within the fusion max age): upward offers a fresh frame, and
+    # forward offers nothing new this tick, but its tick-1 frame is still recent.
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: 1.1)
+    tracker._watchdogs.touch("telemetry", 1.1)
+    tracker._observations.offer(
+        "upward", capture_s=1.1, receipt_s=1.1, raw_bytes=raw, width=2, height=2, encoding="rgb8", step=2 * 3,
+    )
+    tracker.step()
+    assert calls[-1] == (True, True)
+
+    # Much later: forward's tick-1 frame has aged out of the fusion window.
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: 10.0)
+    tracker._watchdogs.touch("telemetry", 10.0)
+    tracker._observations.offer(
+        "upward", capture_s=10.0, receipt_s=10.0, raw_bytes=raw, width=2, height=2, encoding="rgb8", step=2 * 3,
+    )
+    tracker.step()
+    assert calls[-1] == (False, True)
 
 
 def _stepping_tracker(tracker_module, monkeypatch, reason, telemetry):
@@ -346,6 +567,7 @@ def test_tracker_telemetry_round_trips_through_a_real_recorder(tracker_module, m
     assert run.ticks[0].image_receipt_s == {"forward": 9.95, "upward": 9.96}
     assert run.ticks[0].position_ned == [0.0, 0.0, -30.0]
     assert run.ticks[0].state == "HOMING"
+    assert run.ticks[0].setpoint_stats["publish_count"] == 0  # the 50 Hz timer, not step(), publishes
     assert run.outcome["outcome"] == RunOutcome.TIMEOUT.value
     assert run.outcome["reason"] == "timeout"
     assert replay_run(recorder.log.path).matches

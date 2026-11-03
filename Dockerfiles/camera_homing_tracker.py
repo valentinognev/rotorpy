@@ -22,6 +22,7 @@ approximation (documented here, not claimed as verified).
 import atexit
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -42,10 +43,11 @@ from rotorpy.guidance.gazebo_bridge import (
 from rotorpy.guidance.gazebo_record import GazeboHomingRecorder, gazebo_page_path
 from rotorpy.guidance.homing import HomingCommand
 from rotorpy.guidance.homing_config import alignment_from_config, guidance_from_config, load_homing_config, watchdog_timeouts
-from rotorpy.guidance.observation_buffer import ObservationBuffer
+from rotorpy.guidance.observation_buffer import ObservationBuffer, PROPOSED_CAMERA_FUSION_MAX_AGE_S, select_fresh_or_recent
 from rotorpy.guidance.outcome import classify_run
 from rotorpy.guidance.recording_worker import PROPOSED_RECORDING_QUEUE_DEPTH, RecordingWorker
-from rotorpy.guidance.setpoint_stream import PROPOSED_SETPOINT_EXPIRY_S, SetpointStream
+from rotorpy.guidance.setpoint_stream import PROPOSED_FAILURE_COMMAND, PROPOSED_SETPOINT_EXPIRY_S, SetpointStream
+from rotorpy.guidance.step_decision import command_and_stamp
 from rotorpy.guidance.telemetry import frame_to_float, start_run_telemetry
 from rotorpy.guidance.vehicle_state import VehicleState
 from rotorpy.guidance.watchdog import CommsWatchdogs
@@ -81,6 +83,20 @@ def _placeholder_command():
     )
 
 
+def _lock_for(obj, attr_name):
+    """The `threading.Lock` stored at `attr_name` on `obj`, creating it on first use.
+
+    Lazy so tests that construct a tracker via `__new__` (bypassing `__init__`, as most of
+    `tests/test_gazebo_homing_startup.py` does to exercise one method at a time) do not
+    need to also set up every lock `__init__` would have created.
+    """
+    lock = getattr(obj, attr_name, None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(obj, attr_name, lock)
+    return lock
+
+
 class CameraHomingTracker(object):
     def __init__(self, config, model_name, page_path=None):
         self.model_name = model_name
@@ -105,9 +121,20 @@ class CameraHomingTracker(object):
         self._setpoints = SetpointStream(
             publish=self._publish_setpoint,
             expiry_s=PROPOSED_SETPOINT_EXPIRY_S,
-            failure_command=None,
+            # Explicit, documented decision (not an unexamined default): send nothing on
+            # expiry/fatal, so PX4 loses its offboard stream and falls back to its own
+            # configured failsafe (RTL/land/hold) instead of this tracker fabricating a
+            # velocity command of its own.
+            failure_command=PROPOSED_FAILURE_COMMAND,
             now=time.monotonic,
         )
+        # Protects cross-thread pymavlink access (not thread-safe) between the step
+        # thread (`_poll_mavlink`, `_engage`) and the independent setpoint-publisher
+        # thread (`_send`).
+        self._mav_lock = threading.Lock()
+        # Protects `_startup_done`/`_gravity_on`/`_startup_yaw`, written by the step
+        # thread and read by the setpoint-publisher thread's `_send`.
+        self._flags_lock = threading.Lock()
         self._command = None
         self._sent = 0
         self._offboard = False
@@ -151,7 +178,6 @@ class CameraHomingTracker(object):
         self._on_image(msg, camera="upward")
 
     def _on_image(self, msg, camera):
-        self._watchdogs.touch("image", time.monotonic())
         self._observations.offer(
             camera,
             capture_s=_stamp_seconds(msg),
@@ -162,11 +188,17 @@ class CameraHomingTracker(object):
             encoding=msg.encoding,
             step=msg.step,
         )
+        # Touch only after a successful decode: a corrupt/garbage frame (bad encoding,
+        # stride or buffer size) must not make the image link look healthy.
+        self._watchdogs.touch("image", time.monotonic())
 
     def _poll_mavlink(self):
         """Drain whatever PX4 messages have arrived; never blocks waiting for one."""
         while True:
-            msg = self._mav.recv_match(type=list(_MAVLINK_POLL_TYPES), blocking=False)
+            # pymavlink is not thread-safe: serialise against the setpoint-publisher
+            # thread's `_send`, which also touches `self._mav`.
+            with _lock_for(self, "_mav_lock"):
+                msg = self._mav.recv_match(type=list(_MAVLINK_POLL_TYPES), blocking=False)
             if msg is None:
                 return
             kind = msg.get_type()
@@ -220,6 +252,12 @@ class CameraHomingTracker(object):
         wall_now = time.monotonic()
         self._poll_mavlink()
         self._offboard = self._flight_state()
+        # A comms link that is stale (heartbeat, telemetry or image) means this tracker
+        # cannot trust what it would otherwise command: stop the normal setpoint stream
+        # the same way a fatal failure would, rather than silently continuing to hold
+        # whatever was last commanded forever.
+        if self._watchdogs.any_stale(wall_now):
+            self._setpoints.mark_fatal()
         forward_obs, forward_fresh = self._observations.take_fresh("forward")
         upward_obs, upward_fresh = self._observations.take_fresh("upward")
         fresh = forward_fresh or upward_fresh
@@ -229,13 +267,19 @@ class CameraHomingTracker(object):
         elif upward_fresh and upward_obs is not None:
             capture_sim_s = upward_obs.capture_s
         sample = self._vehicle_state.sample_at(capture_sim_s, wall_now)
+        if sample.discontinuity is not None:
+            # The sim clock reset/jumped/paused: the previous sightline/timestamp the
+            # guidance law holds is no longer meaningfully adjacent in time to the next
+            # one it will see.
+            self.guidance.reset_derivative_history()
         # The homing law's attitude convention (`attitude_gazebo_to_homing`'s output); it
         # is what every `guidance.update` call consumes and what a replay must feed back.
         homing_attitude = (
             None if sample.attitude_quat_world is None else attitude_homing_to_ned_frd(sample.attitude_quat_world)
         )
         if self._startup_yaw is None and homing_attitude is not None:
-            self._startup_yaw = heading_from_homing_attitude(homing_attitude)
+            with _lock_for(self, "_flags_lock"):
+                self._startup_yaw = heading_from_homing_attitude(homing_attitude)
         updated = fresh or self._command is None
         have_estimate = (
             sample.height_above_ground_m is not None
@@ -243,23 +287,34 @@ class CameraHomingTracker(object):
             and sample.velocity_ned is not None
             and not self._watchdogs.stale("telemetry", wall_now)
         )
-        if have_estimate:
-            forward_image = None if forward_obs is None or not forward_fresh else frame_to_float(forward_obs.image)
-            upward_image = None if upward_obs is None or not upward_fresh else frame_to_float(upward_obs.image)
-            if fresh or self._command is None:
-                command = self.guidance.update(
-                    rospy.get_time(), sample.height_above_ground_m, homing_attitude, sample.velocity_ned,
-                    forward_image, upward_image,
-                )
-            else:
-                command = self._command
-        else:
-            # No fresh PX4 estimate: hold whatever was last commanded, or a benign zero
-            # placeholder before the very first one, instead of fabricating guidance
-            # from Gazebo truth or starving the setpoint stream.
-            command = self._command if self._command is not None else _placeholder_command()
+        # A fresh frame from one camera must not make the *other* camera's stale cached
+        # frame appear fresh, but that other camera's still-valid recent observation
+        # (within the fusion max age) is still usable context, not unconditionally `None`.
+        forward_used = select_fresh_or_recent(forward_obs, forward_fresh, wall_now, PROPOSED_CAMERA_FUSION_MAX_AGE_S)
+        upward_used = select_fresh_or_recent(upward_obs, upward_fresh, wall_now, PROPOSED_CAMERA_FUSION_MAX_AGE_S)
+        forward_image = None if forward_used is None else frame_to_float(forward_used.image)
+        upward_image = None if upward_used is None else frame_to_float(upward_used.image)
+        receipts = [obs.receipt_s for obs, is_fresh in ((forward_obs, forward_fresh), (upward_obs, upward_fresh))
+                    if is_fresh and obs is not None]
+        observation_wall_s = max(receipts) if receipts else wall_now
+
+        def compute_command():
+            return self.guidance.update(
+                rospy.get_time(), sample.height_above_ground_m, homing_attitude, sample.velocity_ned,
+                forward_image, upward_image,
+            )
+
+        command, stamp_wall_s = command_and_stamp(
+            have_estimate=have_estimate, fresh=fresh, previous_command=self._command,
+            placeholder_command=_placeholder_command(), compute_command=compute_command,
+            observation_wall_s=observation_wall_s,
+        )
         self._command = command
-        self._setpoints.set_command(command, wall_now)
+        # `stamp_wall_s` is `None` on the hold-last-command branch: do NOT restamp the
+        # setpoint stream there, or its expiry never fires and a dead camera/dead PX4
+        # estimate never stops the stream (the held time must keep aging).
+        if stamp_wall_s is not None:
+            self._setpoints.set_command(command, stamp_wall_s)
         self._sent += 1
         # PX4 rejects the first arm while the estimator is still starting.
         # Keep streaming setpoints and ask again until the heartbeat is armed in offboard.
@@ -362,6 +417,7 @@ class CameraHomingTracker(object):
                 state="HOMING" if self._startup_done else "STARTUP",
                 px4_mode=None if self._hb_mode is None else str(self._hb_mode),
                 camera=command.source,
+                setpoint_stats=self._setpoints.stats_snapshot(),
             )
         except Exception as exc:
             print("telemetry step failed: {}".format(exc), file=sys.stderr, flush=True)
@@ -404,32 +460,43 @@ class CameraHomingTracker(object):
         self._send(command, height)
 
     def _send(self, command, height):
-        if self._startup_done:
+        # Read the cross-thread flags together, under the same lock `step()` writes them
+        # with, so `_send` (running on the setpoint-publisher thread) never sees a
+        # partially-updated combination of them.
+        with _lock_for(self, "_flags_lock"):
+            startup_done = self._startup_done
+            gravity_on = self._gravity_on
+            startup_yaw = self._startup_yaw
+        if startup_done:
             velocity = command.velocity_ned
-        elif self._gravity_on:
+        elif gravity_on:
             velocity = (0.0, 0.0, float(np.clip(height - self._startup_height, -2.0, 2.0)))
         else:
             velocity = (0.0, 0.0, -_STARTUP_CLIMB_SPEED)
-        yaw = command.yaw_rad if self._startup_done or self._startup_yaw is None else self._startup_yaw
+        yaw = command.yaw_rad if startup_done or startup_yaw is None else startup_yaw
         accel = command.acceleration_ned
-        self._mav.mav.set_position_target_local_ned_send(
-            0,
-            self._mav.target_system,
-            self._mav.target_component,
-            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            _POSITION_IGNORE,
-            0, 0, 0,
-            float(velocity[0]), float(velocity[1]), float(velocity[2]),
-            float(accel[0]), float(accel[1]), float(accel[2]),
-            float(yaw), 0.0,
-        )
+        # pymavlink is not thread-safe: serialise against the step thread's
+        # `_poll_mavlink`/`_engage`, which also touch `self._mav`.
+        with _lock_for(self, "_mav_lock"):
+            self._mav.mav.set_position_target_local_ned_send(
+                0,
+                self._mav.target_system,
+                self._mav.target_component,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                _POSITION_IGNORE,
+                0, 0, 0,
+                float(velocity[0]), float(velocity[1]), float(velocity[2]),
+                float(accel[0]), float(accel[1]), float(accel[2]),
+                float(yaw), 0.0,
+            )
 
     def _update_startup_hold(self, now, height, velocity_down):
         if abs(height - self._startup_height) <= 1.0 and abs(velocity_down) <= 0.5:
             if self._settled_since is None:
                 self._settled_since = now
             elif now - self._settled_since >= 1.0:
-                self._startup_done = True
+                with _lock_for(self, "_flags_lock"):
+                    self._startup_done = True
                 print("startup hover settled; beginning camera homing", flush=True)
                 return
         else:
@@ -450,17 +517,20 @@ class CameraHomingTracker(object):
 
     def _engage(self):
         target = (self._mav.target_system, self._mav.target_component)
-        self._mav.mav.command_long_send(
-            target[0], target[1],
-            mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
-            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-            float(_OFFBOARD_MAIN), 0, 0, 0, 0, 0,
-        )
-        self._mav.mav.command_long_send(
-            target[0], target[1],
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
-            1, 0, 0, 0, 0, 0, 0,
-        )
+        # pymavlink is not thread-safe: serialise against the setpoint-publisher
+        # thread's `_send`, which also touches `self._mav`.
+        with _lock_for(self, "_mav_lock"):
+            self._mav.mav.command_long_send(
+                target[0], target[1],
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                float(_OFFBOARD_MAIN), 0, 0, 0, 0, 0,
+            )
+            self._mav.mav.command_long_send(
+                target[0], target[1],
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                1, 0, 0, 0, 0, 0, 0,
+            )
         print(
             "offboard and arm requested (armed={} custom_mode={})".format(self._hb_armed, self._hb_mode),
             flush=True,
@@ -478,7 +548,8 @@ class CameraHomingTracker(object):
             )
             if not result.success:
                 raise RuntimeError(result.status_message)
-        self._gravity_on = bool(enabled)
+        with _lock_for(self, "_flags_lock"):
+            self._gravity_on = bool(enabled)
         print("gravity {}".format("on" if enabled else "off"), flush=True)
 
     def write_page(self):
@@ -493,6 +564,11 @@ class CameraHomingTracker(object):
 
     def shutdown(self):
         self._recording.close(timeout=5.0)
+
+    def mark_fatal(self):
+        """A fatal `step()` failure stops the normal setpoint command, same as an expired
+        or watchdog-stale one, instead of streaming whatever was last held forever."""
+        self._setpoints.mark_fatal()
 
 
 def _stamp_seconds(msg):
@@ -523,6 +599,9 @@ def main():
             note = getattr(tracker, "note_failure", None)
             if note is not None:
                 note(exc)
+            mark_fatal = getattr(tracker, "mark_fatal", None)
+            if mark_fatal is not None:
+                mark_fatal()
             rate.sleep()
             continue
         if status is not None:

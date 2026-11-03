@@ -93,7 +93,19 @@ class AttitudeHistory(object):
         return len(self._times)
 
     def record(self, sim_s: float, quat_xyzw: np.ndarray) -> None:
-        self._times.append(float(sim_s))
+        """Record one attitude sample at `sim_s`, keeping times strictly increasing.
+
+        Several PX4 attitude messages drained in the same quantised sim tick (or any
+        duplicate/out-of-order `sim_s` too small for `ClockModel` to flag as a
+        discontinuity) would otherwise violate `interpolate`'s strictly-increasing
+        requirement and crash `Slerp`. Treat a non-increasing `sim_s` as the same instant
+        as the most recent sample: keep the existing time but take the newest attitude.
+        """
+        sim_s = float(sim_s)
+        if self._times and sim_s <= self._times[-1]:
+            self._quats[-1] = np.array(quat_xyzw, dtype=float, copy=True)
+            return
+        self._times.append(sim_s)
         self._quats.append(np.array(quat_xyzw, dtype=float, copy=True))
 
     def clear(self) -> None:
@@ -152,11 +164,17 @@ class VehicleState(object):
         self._velocity_world_ned: Optional[np.ndarray] = None
         self._position_wall_s: Optional[float] = None
         self.last_discontinuity: Optional[str] = None
+        # Sticky until a `sample_at` call consumes it: several MAVLink messages can be
+        # drained (several `ingest_attitude` calls) in the same tick before the single
+        # `sample_at` call that reports it, and a later ingest with no discontinuity of
+        # its own must not silently erase an earlier one in the same drain.
+        self._pending_discontinuity: Optional[str] = None
 
     def ingest_attitude(self, sim_s: float, wall_s: float, quat_estimator_xyzw) -> None:
         """Record one PX4 `ATTITUDE_QUATERNION`-style sample (estimator-frame, FRD body)."""
         self.last_discontinuity = self._clock.update(sim_s, wall_s)
         if self.last_discontinuity is not None:
+            self._pending_discontinuity = self.last_discontinuity
             self._attitude_history.clear()
         world_quat = self._alignment.attitude_to_world(quat_estimator_xyzw)
         self._attitude_history.record(sim_s, world_quat)
@@ -170,7 +188,12 @@ class VehicleState(object):
 
     def sample_at(self, capture_sim_s: Optional[float], now_wall_s: float) -> VehicleSample:
         """The vehicle state for an image captured at `capture_sim_s` (or `None` for "now",
-        i.e. no fresh image this tick: report the most recent attitude as-is)."""
+        i.e. no fresh image this tick: report the most recent attitude as-is).
+
+        Consumes (and clears) any pending clock discontinuity: the caller is expected to
+        act on `sample.discontinuity` (for example resetting guidance's own derivative
+        history) exactly once per report.
+        """
         if capture_sim_s is not None:
             quat, in_range = self._attitude_history.interpolate(capture_sim_s)
         else:
@@ -184,6 +207,8 @@ class VehicleState(object):
             if self._position_world_ned is None
             else self._alignment.height_above_ground_world(self._position_world_ned)
         )
+        discontinuity = self._pending_discontinuity
+        self._pending_discontinuity = None
         return VehicleSample(
             attitude_quat_world=quat,
             attitude_in_range=in_range,
@@ -193,5 +218,5 @@ class VehicleState(object):
             height_above_ground_m=height,
             position_age_s=position_age,
             velocity_age_s=position_age,
-            discontinuity=self.last_discontinuity,
+            discontinuity=discontinuity,
         )

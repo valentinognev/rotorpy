@@ -124,6 +124,10 @@ class TickRecord:
     state: Optional[str] = None
     px4_mode: Optional[str] = None
     failure_reason: Optional[str] = None
+    # A snapshot of `SetpointStream.stats` (publish_count/interval/observation-age/
+    # expired_count/failed) at this tick, so a dead setpoint stream is visible in
+    # telemetry instead of only inferable from the absence of commanded motion.
+    setpoint_stats: Optional[Dict[str, Any]] = None
     # Inputs of the guidance call, present only on ticks that ran it.
     guidance_update: Optional[Dict[str, Any]] = None
     decision: Optional[Dict[str, Any]] = None

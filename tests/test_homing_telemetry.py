@@ -118,6 +118,23 @@ def test_schema_round_trip(tmp_path):
     assert run.truncated_lines == 0
 
 
+def test_setpoint_stats_round_trip(tmp_path):
+    # Spec: setpoint publish stats were never surfaced through telemetry, making a dead
+    # setpoint stream invisible except by inferring it from a lack of commanded motion.
+    log = TelemetryLog.create(tmp_path, _metadata())
+    tick = _tick(0)
+    tick.setpoint_stats = {
+        "publish_count": 42, "last_interval_s": 0.02, "mean_interval_s": 0.02,
+        "max_interval_s": 0.03, "last_observation_age_s": 0.01, "max_observation_age_s": 0.4,
+        "expired_count": 1, "failed": False,
+    }
+    assert log.write_tick(tick)
+    log.close()
+    run = read_telemetry(log.path)
+    assert run.ticks[0].setpoint_stats["publish_count"] == 42
+    assert run.ticks[0].setpoint_stats["expired_count"] == 1
+
+
 def test_tick_schema_covers_the_plan_fields():
     fields = set(TickRecord.__dataclass_fields__)
     assert {
@@ -127,7 +144,7 @@ def test_tick_schema_covers_the_plan_fields():
         "candidates", "selected", "confidence", "camera", "target_motion",
         "requested_setpoint", "limited_setpoint", "transmitted_setpoint",
         "limiting_reasons", "measured_velocity_ned",
-        "state", "px4_mode", "failure_reason",
+        "state", "px4_mode", "failure_reason", "setpoint_stats",
     } <= fields
 
 

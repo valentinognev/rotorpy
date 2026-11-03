@@ -172,6 +172,24 @@ def test_upward_latch_survives_a_skyward_sightline_then_steers_nose_down():
     assert not np.allclose(steered.velocity_ned, _course())
 
 
+def test_reset_derivative_history_clears_stale_sightline_and_time():
+    # After a vehicle-state clock discontinuity, the previous sightline/timestamp pair
+    # came from before the discontinuity and must not be fed into the next line-of-sight
+    # rate computation (which would silently fabricate a spurious angular rate from two
+    # readings that are not actually adjacent in time).
+    guidance = _guidance()
+    black = np.zeros((32, 32, 3))
+    blob = _blob(13, 13)
+    first = guidance.update(0.0, 30.0, IDENTITY, _course(), blob, black)
+    shifted = guidance.update(0.05, 30.0, IDENTITY, _course(), _blob(17, 13), black)
+    assert shifted.tracking is True and not np.allclose(shifted.acceleration_ned, 0.0)
+    guidance.reset_derivative_history()
+    after_reset = guidance.update(1000.05, 30.0, IDENTITY, _course(), _blob(17, 13), black)
+    # Same image again right after a reset: no stale previous sightline/time survives to
+    # produce a (meaningless, huge-dt-driven) acceleration.
+    assert np.allclose(after_reset.acceleration_ned, 0.0)
+
+
 def test_forward_loss_lets_the_upward_camera_steer_then_loss_sticks():
     guidance = _guidance()
     black = np.zeros((32, 32, 3))

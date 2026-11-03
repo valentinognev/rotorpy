@@ -99,6 +99,32 @@ def test_attitude_history_clear_empties_it():
     assert in_range is False
 
 
+def test_attitude_history_record_does_not_crash_on_a_duplicate_timestamp():
+    # Several PX4 attitude messages drained in the same quantised sim tick share one
+    # `rospy.get_time()` value; `interpolate` requires strictly increasing times, so a
+    # naive append would crash the very next `sample_at` call with a fresh image.
+    history = AttitudeHistory(maxlen=10)
+    history.record(1.0, _yaw_quat(0.0))
+    history.record(1.0, _yaw_quat(np.deg2rad(10.0)))
+    assert len(history) == 1
+    quat, in_range = history.interpolate(1.0)
+    assert in_range is True
+    # The newest attitude for that instant wins, not the first one recorded.
+    yaw = 2.0 * np.arctan2(quat[2], quat[3])
+    assert np.isclose(yaw, np.deg2rad(10.0), atol=1e-6)
+
+
+def test_attitude_history_record_does_not_crash_on_an_out_of_order_timestamp():
+    history = AttitudeHistory(maxlen=10)
+    history.record(2.0, _yaw_quat(0.0))
+    # Not a clock-model discontinuity (too small a regression to be flagged), just jitter
+    # within one sim tick: must not append a non-increasing timestamp.
+    history.record(1.999, _yaw_quat(np.deg2rad(20.0)))
+    assert len(history) == 1
+    quat, in_range = history.interpolate(2.0)
+    assert in_range is True
+
+
 # --- VehicleState -------------------------------------------------------------------
 
 
@@ -179,3 +205,23 @@ def test_vehicle_state_clock_discontinuity_clears_attitude_history():
     # The sim_s=10.0 sample from before the discontinuity is gone.
     assert sample.attitude_in_range is False
     assert sample.discontinuity == "backward_jump"
+
+
+def test_sample_discontinuity_is_sticky_until_consumed_by_sample_at():
+    # Several MAVLink messages are drained (several `ingest_attitude` calls) before the
+    # tracker's single `sample_at` call for that tick: a discontinuity flagged by an
+    # earlier ingest in the same drain must not be overwritten back to `None` by a later
+    # ingest in the same drain that detects no further discontinuity.
+    state = VehicleState(_alignment(), clock_backward_jump_s=0.05, clock_pause_wall_s=0.5)
+    state.ingest_attitude(sim_s=10.0, wall_s=10.0, quat_estimator_xyzw=_yaw_quat(0.0))
+    state.ingest_attitude(sim_s=1.0, wall_s=10.05, quat_estimator_xyzw=_yaw_quat(np.deg2rad(10.0)))
+    assert state.last_discontinuity == "backward_jump"
+    # A second, unrelated ingest in the same drain reports no discontinuity of its own...
+    state.ingest_attitude(sim_s=1.01, wall_s=10.06, quat_estimator_xyzw=_yaw_quat(np.deg2rad(11.0)))
+    assert state.last_discontinuity is None
+    # ...but the pending discontinuity from the first ingest must still reach `sample_at`.
+    sample = state.sample_at(capture_sim_s=1.01, now_wall_s=10.06)
+    assert sample.discontinuity == "backward_jump"
+    # Consumed: the next `sample_at` call reports no (new) discontinuity.
+    sample_again = state.sample_at(capture_sim_s=1.01, now_wall_s=10.06)
+    assert sample_again.discontinuity is None

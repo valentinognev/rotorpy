@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from rotorpy.guidance.observation_buffer import ObservationBuffer, decode_image
+from rotorpy.guidance.observation_buffer import CameraObservation, ObservationBuffer, decode_image, select_fresh_or_recent
 
 
 def _rgb_bytes(width, height, step=None):
@@ -82,6 +82,28 @@ def test_decode_rejects_stride_smaller_than_one_tight_row():
         decode_image(b"\x00" * 100, width=4, height=4, encoding="rgb8", step=8)
 
 
+def test_decode_does_not_require_trailing_padding_on_the_last_row():
+    # A buffer with padded rows (step > tight row) commonly omits the padding bytes after
+    # the very last row: only `(height - 1) * step + row_bytes` bytes are structurally
+    # required, not a full `step * height` (which demands padding that may not exist).
+    width, height, step = 4, 3, 20
+    row_bytes = width * 3
+    needed = (height - 1) * step + row_bytes
+    data = _rgb_bytes(width, height, step=step)[:needed]
+    image = decode_image(data, width=width, height=height, encoding="rgb8", step=step)
+    assert image.shape == (height, width, 3)
+    assert list(image[2, 3]) == [2, 3, 0]
+
+
+def test_decode_still_rejects_a_buffer_missing_last_row_data():
+    width, height, step = 4, 3, 20
+    row_bytes = width * 3
+    needed = (height - 1) * step + row_bytes
+    data = _rgb_bytes(width, height, step=step)[: needed - 1]
+    with pytest.raises(ValueError):
+        decode_image(data, width=width, height=height, encoding="rgb8", step=step)
+
+
 def test_buffer_slots_are_independent_per_camera():
     buffer = ObservationBuffer(cameras=("forward", "upward"))
     data = _rgb_bytes(2, 2)
@@ -139,3 +161,35 @@ def test_unknown_camera_name_raises_key_error():
     buffer = ObservationBuffer(cameras=("forward",))
     with pytest.raises(KeyError):
         buffer.take_fresh("upward")
+
+
+# --- select_fresh_or_recent --------------------------------------------------------
+
+
+def _observation(receipt_s):
+    return CameraObservation(capture_s=receipt_s, receipt_s=receipt_s, image=np.zeros((1, 1, 3)), encoding="rgb8")
+
+
+def test_select_fresh_or_recent_returns_none_observations_as_none():
+    assert select_fresh_or_recent(None, is_fresh=False, now_wall_s=1.0, max_age_s=1.0) is None
+    assert select_fresh_or_recent(None, is_fresh=True, now_wall_s=1.0, max_age_s=1.0) is None
+
+
+def test_select_fresh_or_recent_always_returns_a_genuinely_fresh_observation():
+    obs = _observation(0.0)
+    # Fresh this tick, regardless of its (irrelevant here) age.
+    assert select_fresh_or_recent(obs, is_fresh=True, now_wall_s=100.0, max_age_s=0.1) is obs
+
+
+def test_select_fresh_or_recent_keeps_a_stale_flagged_observation_within_max_age():
+    # Not freshly offered this tick (the other camera's frame drove this tick), but still
+    # within `max_age_s`: the still-valid cached observation is usable, with its own age.
+    obs = _observation(1.0)
+    assert select_fresh_or_recent(obs, is_fresh=False, now_wall_s=1.5, max_age_s=1.0) is obs
+
+
+def test_select_fresh_or_recent_drops_an_observation_older_than_max_age():
+    # A genuinely stale cached image (older than `max_age_s`) must not appear fresh/usable
+    # just because it is the only thing in the slot.
+    obs = _observation(1.0)
+    assert select_fresh_or_recent(obs, is_fresh=False, now_wall_s=3.0, max_age_s=1.0) is None

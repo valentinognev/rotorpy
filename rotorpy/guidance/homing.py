@@ -342,6 +342,18 @@ class HomingGuidance(object):
             t, attitude_sim_quat, velocity_ned, source, center, square[2], sightline, relative,
         )
 
+    def reset_derivative_history(self) -> None:
+        """Clear the proportional-navigation derivative history (previous sightline/time).
+
+        Call this after a `VehicleState` clock discontinuity (sim-time reset, backward
+        jump, or detected pause) is reported: the previous sightline/timestamp pair was
+        recorded before the discontinuity, and feeding it into the next line-of-sight-rate
+        computation would fabricate a spurious angular rate from two readings that are no
+        longer actually adjacent in (sim) time.
+        """
+        self._last_sightline = None
+        self._last_image_time = None
+
     def _sees(self, image: Optional[np.ndarray]) -> bool:
         count = 0 if image is None else target_pixel_count(image)
         return count >= self.lock_pixels
