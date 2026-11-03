@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 
 from rotorpy.guidance.gazebo_bridge import gazebo_position_to_sim
-from rotorpy.guidance.homing_config import scene_from_config
+from rotorpy.guidance.homing_config import gazebo_scene_from_config
 from rotorpy.guidance.homing_page import write_homing_page
 from rotorpy.guidance.runner import (
     HomingRecord,
@@ -30,7 +30,7 @@ class GazeboHomingRecorder(object):
     """Poses and both camera previews for one Gazebo homing flight."""
 
     def __init__(self, config):
-        _state, self.world, self.forward_camera, self.upward_camera = scene_from_config(config)
+        self.world, self.forward_camera, self.upward_camera = gazebo_scene_from_config(config)
         self.preview = preview_step(
             int(config["image_height_px"]),
             int(config["image_width_px"]),

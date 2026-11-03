@@ -177,6 +177,8 @@ for gz_attempt in 1 2 3; do
 	if [ "${HOMING:-0}" = "1" ]; then
 		# Gazebo is east-north-up. The homing start is north 0, east 0, 30 m up.
 		# The red cylinder stands on north 100, east 50. Nose points at that ground point.
+		# Every number below is checked against examples/camera_homing.jsonc by
+		# rotorpy.guidance.scene_consistency (tests/test_homing_scene_consistency.py).
 		TARGET_SDF="${TARGET_SDF:-${src_path}/Tools/simulation/gazebo-classic/target_cylinder.sdf}"
 		if ! rosservice call /gazebo/pause_physics; then
 			spawn_ok=0

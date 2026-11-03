@@ -343,3 +343,18 @@ def test_tracker_telemetry_round_trips_through_a_real_recorder(tracker_module, m
     assert run.outcome["outcome"] == RunOutcome.TIMEOUT.value
     assert run.outcome["reason"] == "timeout"
     assert replay_run(recorder.log.path).matches
+
+
+def test_startup_heading_comes_from_the_vehicle_not_the_target(tracker_module, monkeypatch):
+    from scipy.spatial.transform import Rotation
+
+    tracker = _stepping_tracker(tracker_module, monkeypatch, "timeout", None)
+    heading = np.deg2rad(200.0)
+    tracker._startup_yaw = None
+    tracker._pose = lambda: (
+        np.array([0.0, 0.0, 30.0]),
+        Rotation.from_euler("z", heading).as_quat(),
+        np.zeros(3),
+    )
+    tracker.step()
+    assert np.isclose(np.cos(tracker._startup_yaw - heading), 1.0)

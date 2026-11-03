@@ -19,13 +19,13 @@ from sensor_msgs.msg import Image
 from std_srvs.srv import Empty
 
 from rotorpy.frames import enu_to_ned
-from rotorpy.guidance.gazebo_bridge import attitude_gazebo_to_homing, velocity_gazebo_to_ned
-from rotorpy.guidance.gazebo_record import GazeboHomingRecorder, gazebo_page_path
-from rotorpy.guidance.homing_config import (
-    guidance_from_config,
-    initial_velocity_from_config,
-    load_homing_config,
+from rotorpy.guidance.gazebo_bridge import (
+    attitude_gazebo_to_homing,
+    heading_from_homing_attitude,
+    velocity_gazebo_to_ned,
 )
+from rotorpy.guidance.gazebo_record import GazeboHomingRecorder, gazebo_page_path
+from rotorpy.guidance.homing_config import guidance_from_config, load_homing_config
 from rotorpy.guidance.outcome import classify_run
 from rotorpy.guidance.telemetry import frame_to_float, start_run_telemetry
 
@@ -63,8 +63,8 @@ class CameraHomingTracker(object):
 
     def __init__(self, config, model_name, page_path=None):
         self.model_name = model_name
-        initial_velocity = initial_velocity_from_config(config)
-        self._startup_yaw = float(np.arctan2(initial_velocity[1], initial_velocity[0]))
+        # Taken from the vehicle's own heading at the first pose, never from the target.
+        self._startup_yaw = None
         self._startup_height = -float(config["start_ned"][2])
         self.guidance = guidance_from_config(config)
         self.page_path = page_path
@@ -152,6 +152,8 @@ class CameraHomingTracker(object):
             self._fresh = False
         process_start = rospy.get_time()
         position, attitude, velocity = self._pose()
+        if getattr(self, "_startup_yaw", None) is None and attitude is not None:
+            self._startup_yaw = heading_from_homing_attitude(attitude)
         height = float(position[2])
         updated = fresh or self._command is None
         if fresh:
@@ -267,6 +269,7 @@ class CameraHomingTracker(object):
             velocity = (0.0, 0.0, float(np.clip(height - self._startup_height, -2.0, 2.0)))
         else:
             velocity = (0.0, 0.0, -_STARTUP_CLIMB_SPEED)
+        yaw = command.yaw_rad if self._startup_done or self._startup_yaw is None else self._startup_yaw
         accel = command.acceleration_ned
         self._mav.mav.set_position_target_local_ned_send(
             0,
@@ -277,7 +280,7 @@ class CameraHomingTracker(object):
             0, 0, 0,
             float(velocity[0]), float(velocity[1]), float(velocity[2]),
             float(accel[0]), float(accel[1]), float(accel[2]),
-            float(command.yaw_rad if self._startup_done else self._startup_yaw), 0.0,
+            float(yaw), 0.0,
         )
 
     def _update_startup_hold(self, now, height, velocity_down):

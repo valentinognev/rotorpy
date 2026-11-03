@@ -18,13 +18,10 @@ from rotorpy.controllers.px4_cascade import Px4Cascade
 from rotorpy.controllers.quadrotor_control import SE3Control
 from rotorpy.guidance.frames import sim_to_ned
 from rotorpy.guidance.homing import HomingCommand, HomingGuidance, flat_output
-from rotorpy.guidance.homing_config import initial_velocity_from_config, scene_from_config
+from rotorpy.guidance.homing_config import scene_from_config
 from rotorpy.guidance.outcome import HomingOutcome, miss_outcome, timeout_outcome
 from rotorpy.guidance.scene import (
     INITIAL_SPEED,
-    START_NED,
-    TARGET_GROUND_NED,
-    initial_velocity_ned,
     nominal_camera,
     nominal_initial_state,
     nominal_upward_camera,
@@ -231,7 +228,7 @@ def _fly_homing(
         forward_camera = nominal_camera()
         upward_camera = nominal_upward_camera()
         state = copy.deepcopy(nominal_initial_state())
-        course = initial_velocity_ned(START_NED, TARGET_GROUND_NED, INITIAL_SPEED)
+        initial_speed = INITIAL_SPEED
         kind = "pid"
         sim_dt = _SIM_DT
         camera_period = _CAMERA_PERIOD
@@ -249,7 +246,7 @@ def _fly_homing(
     else:
         state, world, forward_camera, upward_camera = scene_from_config(config)
         state = copy.deepcopy(state)
-        course = initial_velocity_from_config(config)
+        initial_speed = float(config["initial_speed_m_s"])
         kind = config["controller"]
         sim_dt = 1.0 / float(config["sim_rate_hz"])
         camera_period = 1.0 / float(config["camera_rate_hz"])
@@ -270,7 +267,8 @@ def _fly_homing(
     guidance = HomingGuidance(
         nav_constant=nav_constant,
         lock_pixels=lock_pixels,
-        initial_velocity_ned=course,
+        initial_velocity_ned=None,
+        initial_speed=initial_speed,
         intrinsics=forward_camera.intrinsics,
         forward_extrinsics=forward_camera.extrinsics,
         upward_extrinsics=upward_camera.extrinsics,

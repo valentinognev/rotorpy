@@ -33,3 +33,25 @@ def gazebo_position_to_sim(position_enu: np.ndarray) -> np.ndarray:
 def velocity_gazebo_to_ned(velocity_enu: np.ndarray) -> np.ndarray:
     """Gazebo world velocity (east, north, up) to NED."""
     return enu_to_ned(np.asarray(velocity_enu, dtype=float))
+
+
+# The homing simulator world is (north, east, up) and its body is (forward, left, up).
+# Conjugating by this reflection maps its attitude onto the true NED/FRD one: the
+# vertical axes flip sign and the mirrored body-left becomes body-right.
+_VERTICAL_FLIP = np.diag([1.0, 1.0, -1.0])
+
+
+def attitude_homing_to_ned_frd(q_xyzw: np.ndarray) -> np.ndarray:
+    """Scalar-last homing simulator quaternion to the true body-FRD-in-NED quaternion.
+
+    Inverse of the NED/FRD half of `attitude_gazebo_to_homing`. It is its own
+    inverse, because the reflection squares to the identity.
+    """
+    homing = Rotation.from_quat(np.array(q_xyzw, dtype=float, copy=True)).as_matrix()
+    return Rotation.from_matrix(_VERTICAL_FLIP @ homing @ _VERTICAL_FLIP).as_quat()
+
+
+def heading_from_homing_attitude(q_xyzw: np.ndarray) -> float:
+    """Heading, radians clockwise from north, of the body nose in a homing quaternion."""
+    matrix = Rotation.from_quat(np.array(q_xyzw, dtype=float, copy=True)).as_matrix()
+    return float(np.arctan2(matrix[1, 0], matrix[0, 0]))

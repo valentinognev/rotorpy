@@ -12,7 +12,9 @@
   // Ground point the box stands on, north, east, down.
   "target_ground_ned": [100.0, 50.0, 0.0],
 
-  // Horizontal speed at the start, metres per second, from the start xy toward the target xy.
+  // Horizontal speed at the start, metres per second. The Python example's initial state aims it
+  // from the start xy toward the target xy. The guidance only takes the speed: before lock it flies
+  // this speed along the vehicle's own heading, and never reads the target position.
   "initial_speed_m_s": 10.0,
 
   // Body angular rate at the start, radians per second.
@@ -76,7 +78,29 @@
   "fov_y_deg": 90.0,
 
   // Camera mount in the simulator body, metres. Both cameras use this position.
+  // Python example only; the Gazebo cameras use the two mounts below.
   "camera_position_body_m": [0.0, 0.0, 0.0],
+
+  // Gazebo forward camera position in the body, forward-left-up, metres. Matches the
+  // sdf sensor pose. Checked against the sdf by rotorpy.guidance.scene_consistency.
+  "forward_camera_position_flu_m": [0.36, 0.0, 0.05],
+
+  // Gazebo upward camera position in the body, forward-left-up, metres.
+  "upward_camera_position_flu_m": [0.0, 0.0, 0.0],
+
+  // Gazebo target cylinder radius, metres. Matches gazeboModels/homing/target_cylinder.sdf.
+  "gazebo_target_radius_m": 0.75,
+
+  // Gazebo target cylinder height, metres. The visible centre, which the guidance
+  // tracks, is half this above target_ground_ned. The spawn pose is that centre.
+  "gazebo_target_height_m": 3.0,
+
+  // PROPOSED, not verified in flight: the PX4 local NED origin in the world NED frame,
+  // metres. SITL places it at the spawn pose, so this is start_ned.
+  "estimator_origin_world_ned": [0.0, 0.0, -30.0],
+
+  // PROPOSED, not verified in flight: heading of the PX4 local north axis, degrees clockwise from world north.
+  "estimator_yaw_offset_deg": 0.0,
 
   // Forward camera pitch, degrees. Positive looks down from the body forward axis.
   "forward_pitch_deg": 10.0,

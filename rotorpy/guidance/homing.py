@@ -5,12 +5,16 @@ from typing import Optional
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from rotorpy.guidance.camera_geometry import pixel_to_camera_ray
+from rotorpy.guidance.camera_geometry import CameraMount, pixel_ray_ned, pixel_to_camera_ray
 from rotorpy.guidance.frames import ned_to_sim, sim_body_to_frd, sim_to_ned
+from rotorpy.guidance.gazebo_bridge import attitude_homing_to_ned_frd, heading_from_homing_attitude
 from rotorpy.guidance.navigation import pn_acceleration
 from rotorpy.guidance.pixels import target_pixel_count, target_square
-from rotorpy.guidance.sightline import ground_relative_position
+from rotorpy.guidance.sightline import ground_relative_position, reference_relative_position
 from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity
+
+# Below this horizontal speed the measured velocity has no usable heading.
+_MIN_COURSE_SPEED_M_S = 1.0
 
 
 class HomingCommand(object):
@@ -167,28 +171,56 @@ def flat_output(
 
 
 class HomingGuidance(object):
-    """Home from the forward camera until the upward camera latches, then from upward."""
+    """Home from the forward camera until the upward camera latches, then from upward.
+
+    Two camera geometries exist. Without mounts, the legacy RotorPy example
+    geometry converts pixels through `forward_extrinsics` into its simulator
+    frames, where the body's +y points east at the identity yaw. With
+    `forward_mount` and `upward_mount`, pixels become NED rays through the
+    true camera frame, body FRD and the vehicle attitude, including each
+    camera's translation. In both, `attitude_sim_quat` is the homing
+    simulator quaternion that `attitude_gazebo_to_homing` produces.
+
+    With no `initial_velocity_ned`, the course held before lock is
+    `initial_speed` along the vehicle's own heading at its first update. The
+    guidance never sees where the target is.
+    """
 
     def __init__(
         self,
         nav_constant: float,
         lock_pixels: int,
-        initial_velocity_ned: np.ndarray,
+        initial_velocity_ned: Optional[np.ndarray],
         intrinsics: dict,
-        forward_extrinsics: dict,
-        upward_extrinsics: dict,
+        forward_extrinsics: Optional[dict],
+        upward_extrinsics: Optional[dict],
         component_cap: float = COMPONENT_CAP,
+        initial_speed: Optional[float] = None,
+        forward_mount: Optional[CameraMount] = None,
+        upward_mount: Optional[CameraMount] = None,
+        target_reference_height_m: float = 0.0,
     ) -> None:
+        if initial_velocity_ned is None and initial_speed is None:
+            raise ValueError("give an initial velocity or an initial speed")
+        if (forward_mount is None) != (upward_mount is None):
+            raise ValueError("give both camera mounts or neither")
+        if forward_mount is None and (forward_extrinsics is None or upward_extrinsics is None):
+            raise ValueError("legacy geometry needs both extrinsics")
         self.nav_constant = float(nav_constant)
         self.lock_pixels = int(lock_pixels)
         self._component_cap = float(component_cap)
         self.intrinsics = intrinsics
         self.forward_extrinsics = forward_extrinsics
         self.upward_extrinsics = upward_extrinsics
-        self._initial_velocity_ned = np.array(initial_velocity_ned, dtype=float, copy=True)
-        self._velocity_ned = np.array(self._initial_velocity_ned, dtype=float, copy=True)
+        self._mounts = None if forward_mount is None else {"forward": forward_mount, "upward": upward_mount}
+        self._reference_height_m = float(target_reference_height_m)
+        self._initial_speed = None if initial_speed is None else float(initial_speed)
         self._acceleration_ned = np.zeros(3)
-        self._yaw_rad = float(np.arctan2(self._initial_velocity_ned[1], self._initial_velocity_ned[0]))
+        self._initial_velocity_ned: Optional[np.ndarray] = None
+        self._velocity_ned = np.zeros(3)
+        self._yaw_rad = 0.0
+        if initial_velocity_ned is not None:
+            self._set_course(np.array(initial_velocity_ned, dtype=float, copy=True))
         self._locked = False
         self._tracking = False
         self._lost = False
@@ -199,6 +231,42 @@ class HomingGuidance(object):
         self._tracker_side: Optional[float] = None
         self._last_image_time: Optional[float] = None
         self._last_sightline: Optional[np.ndarray] = None
+
+    def _set_course(self, velocity_ned: np.ndarray) -> None:
+        self._initial_velocity_ned = velocity_ned
+        self._velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
+        self._yaw_rad = float(np.arctan2(velocity_ned[1], velocity_ned[0]))
+
+    def _adopt_course(self, velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -> None:
+        """Hold the vehicle's own heading at the configured speed until the target is seen."""
+        velocity = np.asarray(velocity_ned, dtype=float)
+        if float(np.hypot(velocity[0], velocity[1])) >= _MIN_COURSE_SPEED_M_S:
+            heading = float(np.arctan2(velocity[1], velocity[0]))
+        else:
+            heading = heading_from_homing_attitude(attitude_sim_quat)
+        speed = self._initial_speed
+        self._set_course(np.array([speed * np.cos(heading), speed * np.sin(heading), 0.0]))
+
+    def _sightline_and_relative(
+        self,
+        source: str,
+        center: np.ndarray,
+        height_m: float,
+        attitude_sim_quat: np.ndarray,
+    ):
+        """Unit sightline and body-to-target vector, or (None, None) without a ground hit."""
+        if self._mounts is None:
+            extrinsics = self.forward_extrinsics if source == "forward" else self.upward_extrinsics
+            sightline = _sightline_ned(center, attitude_sim_quat, self.intrinsics, extrinsics)
+            return sightline, ground_relative_position(height_m, sightline)
+        rotation = Rotation.from_quat(attitude_homing_to_ned_frd(attitude_sim_quat)).as_matrix()
+        offset, direction = pixel_ray_ned(
+            float(center[0]), float(center[1]), self.intrinsics, self._mounts[source], rotation
+        )
+        relative = reference_relative_position(height_m, offset, direction, self._reference_height_m)
+        if relative is None:
+            return None, None
+        return relative / np.linalg.norm(relative), relative
 
     def update(
         self,
@@ -214,6 +282,8 @@ class HomingGuidance(object):
         Both images None means no new frame. One None image is a camera tick
         whose missing picture has no target pixels.
         """
+        if self._initial_velocity_ned is None:
+            self._adopt_course(velocity_ned, attitude_sim_quat)
         if forward_image is None and upward_image is None:
             return self._command(attitude_sim_quat)
         if self._lost:
@@ -232,11 +302,9 @@ class HomingGuidance(object):
         if self._upward_latched:
             source = "upward"
             image = upward_image
-            extrinsics = self.upward_extrinsics
         elif forward_sees:
             source = "forward"
             image = forward_image
-            extrinsics = self.forward_extrinsics
         else:
             return self._hold(attitude_sim_quat)
 
@@ -246,8 +314,7 @@ class HomingGuidance(object):
         if square is None:
             return self._hold(attitude_sim_quat)
         center = np.array([square[0], square[1]], dtype=float)
-        sightline = _sightline_ned(center, attitude_sim_quat, self.intrinsics, extrinsics)
-        relative = ground_relative_position(height_m, sightline)
+        sightline, relative = self._sightline_and_relative(source, center, height_m, attitude_sim_quat)
         if relative is None:
             return self._hold(attitude_sim_quat)
         return self._steer(
@@ -319,10 +386,15 @@ class HomingGuidance(object):
 
     def _command(self, attitude_sim_quat: np.ndarray) -> HomingCommand:
         velocity = np.array(self._velocity_ned, dtype=float, copy=True)
+        if self._mounts is None:
+            body_velocity = body_frd_velocity(velocity, attitude_sim_quat)
+        else:
+            rotation = Rotation.from_quat(attitude_homing_to_ned_frd(attitude_sim_quat))
+            body_velocity = rotation.inv().apply(velocity)
         return HomingCommand(
             velocity,
             np.array(self._acceleration_ned, dtype=float, copy=True),
-            body_frd_velocity(velocity, attitude_sim_quat),
+            body_velocity,
             self._yaw_rad,
             self._locked,
             self._tracking,

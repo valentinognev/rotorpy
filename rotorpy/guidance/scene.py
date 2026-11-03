@@ -1,6 +1,7 @@
 """Nominal Hummingbird camera-homing scene: start state, world, and camera."""
 
 import numpy as np
+from dataclasses import dataclass
 from scipy.spatial.transform import Rotation
 
 from rotorpy.guidance.camera_geometry import pinhole_intrinsics, pitched_extrinsics, square_resolution
@@ -8,6 +9,39 @@ from rotorpy.guidance.frames import ned_to_sim
 from rotorpy.sensors.camera import PinholeCamera
 from rotorpy.vehicles.hummingbird_params import quad_params
 from rotorpy.world import World
+
+
+@dataclass(frozen=True)
+class TargetReference:
+    """A standing target: where it touches the ground and what the cameras see of it.
+
+    The guidance tracks the centre of the visible red component, which sits
+    half the target height above the ground contact point. They are different
+    points. `visible_reference_ned` is the tracked one. `ground_contact_ned`
+    is the point on the ground beneath it.
+    """
+
+    ground_contact_ned: np.ndarray
+    height_m: float
+    radius_m: float
+
+    @property
+    def visible_reference_ned(self) -> np.ndarray:
+        return np.asarray(self.ground_contact_ned, dtype=float) + np.array([0.0, 0.0, -self.height_m / 2.0])
+
+    @property
+    def reference_height_m(self) -> float:
+        return self.height_m / 2.0
+
+
+def box_target_reference(config: dict) -> TargetReference:
+    """Reference of the Python example's block, from its extents in the simulator frame."""
+    extents = np.asarray(config["box_extents_m"], dtype=float)
+    return TargetReference(
+        ground_contact_ned=np.asarray(config["target_ground_ned"], dtype=float),
+        height_m=float(extents[5] - extents[4]),
+        radius_m=float(max(extents[1] - extents[0], extents[3] - extents[2]) / 2.0),
+    )
 
 START_NED = np.array([0.0, 0.0, -30.0])
 TARGET_GROUND_NED = np.array([100.0, 50.0, 0.0])
