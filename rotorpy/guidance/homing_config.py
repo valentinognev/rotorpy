@@ -34,6 +34,33 @@ PROPOSED_HEARTBEAT_TIMEOUT_S = 3.0
 PROPOSED_TELEMETRY_TIMEOUT_S = 0.5
 PROPOSED_IMAGE_TIMEOUT_S = 1.0
 
+# Proposed, not verified: `tracking.TrackingStateMachine` thresholds for the recoverable
+# tracking state machine (plan Phase 5). 1 consecutive frame to (re)acquire keeps the
+# single-sighting lock/steer behavior every existing test already exercises; raise either
+# frame count to require sustained confirmation before steering/resuming instead. The
+# switch margin only matters between two simultaneously visible, equal-priority cameras
+# (the Gazebo forward/upward pair has a fixed priority, so it rarely engages there; it
+# protects a future same-priority pair from flapping on a marginal confidence lead). The
+# prediction gap and uncertainty bounds are independent: whichever is tighter triggers
+# the explicit ABORT failure response first (never an indefinitely held stale command).
+PROPOSED_ACQUIRE_FRAMES = 1
+PROPOSED_REACQUIRE_FRAMES = 1
+PROPOSED_CAMERA_SWITCH_MARGIN = 0.1
+PROPOSED_MAX_PREDICTION_GAP_S = 2.0
+PROPOSED_MAX_TRACK_UNCERTAINTY_PX = 150.0
+
+
+def tracking_thresholds() -> dict:
+    """Named tracking-state-machine thresholds, for
+    `HomingGuidance(..., **tracking_thresholds())`."""
+    return {
+        "acquire_frames": PROPOSED_ACQUIRE_FRAMES,
+        "reacquire_frames": PROPOSED_REACQUIRE_FRAMES,
+        "camera_switch_margin": PROPOSED_CAMERA_SWITCH_MARGIN,
+        "max_prediction_gap_s": PROPOSED_MAX_PREDICTION_GAP_S,
+        "max_track_uncertainty_px": PROPOSED_MAX_TRACK_UNCERTAINTY_PX,
+    }
+
 
 def watchdog_timeouts() -> dict:
     """Named comms-watchdog timeouts, for `watchdog.CommsWatchdogs(watchdog_timeouts())`."""
@@ -212,4 +239,5 @@ def guidance_from_config(config: dict) -> HomingGuidance:
         upward_mount=upward_mount,
         target_reference_height_m=gazebo_target_reference(config).reference_height_m,
         min_course_speed_m_s=PROPOSED_MIN_COURSE_SPEED_M_S,
+        **tracking_thresholds(),
     )

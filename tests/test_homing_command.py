@@ -12,6 +12,7 @@ from rotorpy.guidance.homing import (
 )
 from rotorpy.guidance.sightline import ground_relative_position
 from rotorpy.guidance.speed import desired_velocity
+from rotorpy.guidance.tracking import TrackingState
 
 IDENTITY = np.array([0.0, 0.0, 0.0, 1.0])
 INTRINSICS = {"fx": 16.0, "fy": 16.0, "width": 32, "height": 32,
@@ -190,7 +191,17 @@ def test_reset_derivative_history_clears_stale_sightline_and_time():
     assert np.allclose(after_reset.acceleration_ned, 0.0)
 
 
-def test_forward_loss_lets_the_upward_camera_steer_then_loss_sticks():
+def test_upward_loss_recovers_through_the_forward_camera():
+    """Regression for the plan's baseline-failure evidence: a single recorded flight
+    (`Results/camera_homing_gazebo.html`) showed the upward camera latch at ~2.14 s,
+    lose visibility at ~2.3 s, and *stay* lost for the rest of the flight even though
+    the forward camera kept seeing the target the whole time (see
+    `tests/test_homing_recorded_handoff_replay.py` for the real recorded frames). The
+    old code's one-way `_upward_latched`/`_permanent_loss` pair had no recovery path at
+    all once upward latched once. This test replaces
+    `test_forward_loss_lets_the_upward_camera_steer_then_loss_sticks`, which asserted
+    exactly that permanent-loss behavior as if it were correct.
+    """
     guidance = _guidance()
     black = np.zeros((32, 32, 3))
     blob = _blob(13, 13)
@@ -202,9 +213,59 @@ def test_forward_loss_lets_the_upward_camera_steer_then_loss_sticks():
     assert coast.tracking is False and coast.source is None
     assert np.allclose(coast.velocity_ned, shifted.velocity_ned)
     upward = guidance.update(0.15, 30.0, nose_down, _course(), blob, blob)
+    # Both cameras visible: upward (the documented preferred source) latches.
     assert upward.source == "upward" and upward.tracking is True
-    assert np.allclose(upward.acceleration_ned, 0.0)
+    assert np.allclose(upward.acceleration_ned, 0.0)  # discontinuous handoff: no stale derivative
     lost = guidance.update(0.20, 30.0, nose_down, _course(), blob, black)
-    assert lost.tracking is False and np.allclose(lost.velocity_ned, upward.velocity_ned)
+    # Regression: upward disappearing no longer permanently disables guidance -- forward
+    # (still visible this very tick) recovers steering immediately, not a stale hold.
+    assert lost.tracking is True and lost.source == "forward"
+    assert np.allclose(lost.acceleration_ned, 0.0)  # camera handoff: no artificial spike
+    assert lost.tracking_state is TrackingState.TRACK
     again = guidance.update(0.25, 30.0, nose_down, _course(), blob, blob)
-    assert again.tracking is False and np.allclose(again.velocity_ned, lost.velocity_ned)
+    # Upward reappearing takes priority back over forward (documented camera preference),
+    # itself another handoff -- still just a recoverable camera switch, not a failure.
+    assert again.tracking is True and again.source == "upward"
+
+
+def test_prolonged_loss_aborts_instead_of_holding_a_stale_command_forever():
+    """Spec: "Transition to an explicit failure response after prolonged loss" and
+    "Prolonged loss does not leave the vehicle in normal stale-command homing." Unlike
+    the old permanent-loss hold (a stale velocity command, held forever, indistinguishable
+    from a normal in-progress hold), `ABORT` is explicit on the command and one-way.
+    """
+    guidance = _guidance()
+    black = np.zeros((32, 32, 3))
+    blob = _blob(13, 13)
+    guidance.update(0.0, 30.0, IDENTITY, _course(), blob, black)
+    command = None
+    # Comfortably past any reasonable proposed max-prediction-gap default.
+    for step in range(1, 400):
+        command = guidance.update(0.05 * step, 30.0, IDENTITY, _course(), black, black)
+        if command.tracking_state is TrackingState.ABORT:
+            break
+    assert command.tracking_state is TrackingState.ABORT
+    assert command.abort_reason is not None
+    assert command.tracking is False
+    assert np.allclose(command.velocity_ned, 0.0)
+    assert np.allclose(command.acceleration_ned, 0.0)
+    # One-way: a later sighting must not resurrect a run guidance already gave up on.
+    recovered = guidance.update(0.05 * 401, 30.0, IDENTITY, _course(), blob, black)
+    assert recovered.tracking_state is TrackingState.ABORT
+    assert recovered.tracking is False
+
+
+def test_complete_is_external_and_stops_steering_without_truth_in_guidance():
+    """Spec (controller decision): COMPLETE is a transition the tracker/runner can
+    trigger with a reason (the truth-side scorer owns *when*); guidance itself never
+    reads truth to decide it."""
+    guidance = _guidance()
+    blob = _blob(13, 13)
+    locked = guidance.update(0.0, 30.0, IDENTITY, _course(), blob, np.zeros((32, 32, 3)))
+    assert locked.tracking is True
+    guidance.complete("target_reached")
+    command = guidance.update(0.05, 30.0, IDENTITY, _course(), blob, np.zeros((32, 32, 3)))
+    assert command.tracking_state is TrackingState.COMPLETE
+    assert command.tracking is False
+    assert np.allclose(command.velocity_ned, 0.0)
+

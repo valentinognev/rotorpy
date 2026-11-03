@@ -49,6 +49,7 @@ from rotorpy.guidance.recording_worker import PROPOSED_RECORDING_QUEUE_DEPTH, Re
 from rotorpy.guidance.setpoint_stream import PROPOSED_FAILURE_COMMAND, PROPOSED_SETPOINT_EXPIRY_S, SetpointStream
 from rotorpy.guidance.step_decision import command_and_stamp
 from rotorpy.guidance.telemetry import detection_fields_from_command, frame_to_float, start_run_telemetry
+from rotorpy.guidance.tracking import TrackingState
 from rotorpy.guidance.vehicle_state import VehicleState
 from rotorpy.guidance.watchdog import CommsWatchdogs
 
@@ -343,6 +344,14 @@ class CameraHomingTracker(object):
         if self._offboard and self._gravity_on and not self._startup_done and have_estimate:
             self._update_startup_hold(rospy.get_time(), sample.height_above_ground_m, sample.velocity_ned[2])
         status = None
+        if command is not None and getattr(command, "tracking_state", None) is TrackingState.ABORT:
+            # The explicit, one-way failure response: do NOT keep issuing normal
+            # stale-command homing after `ABORT` (decision, proposed default: map it to
+            # the T3 `SetpointStream` failure-response path and the T1 `TARGET_LOST`
+            # outcome, not a silently-held last command).
+            abort_reason = getattr(command, "abort_reason", None) or "unspecified"
+            self._setpoints.mark_fatal("target_lost:" + abort_reason)
+            status = "target_lost"
         if command is not None:
             need_truth = self.recorder is not None or self.telemetry is not None
             if need_truth:
@@ -350,9 +359,10 @@ class CameraHomingTracker(object):
                 if self.recorder is not None and self._startup_done:
                     forward_picture = forward_obs.image if (fresh and forward_obs is not None) else None
                     upward_picture = upward_obs.image if (fresh and upward_obs is not None) else None
-                    status = self.recorder.observe(
+                    observed_status = self.recorder.observe(
                         rospy.get_time(), position_truth, attitude_truth, forward_picture, upward_picture, command
                     )
+                    status = status or observed_status
                 self._recording.submit((
                     "step", wall_now, sample, homing_attitude, command, updated,
                     forward_obs.image if (updated and forward_obs is not None) else None,
@@ -443,7 +453,8 @@ class CameraHomingTracker(object):
                 np.linalg.norm(enu_to_ned(np.asarray(position_truth, dtype=float)) - self._target_ground_ned)
             )
             outcome = classify_run(
-                miss_m=miss, ground_contact=status == "ground", timed_out=status == "timeout"
+                miss_m=miss, ground_contact=status == "ground", timed_out=status == "timeout",
+                target_lost=status == "target_lost",
             )
             telemetry.finish(outcome, reason=status, miss_m=miss)
         except Exception as exc:

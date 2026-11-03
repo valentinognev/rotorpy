@@ -374,6 +374,53 @@ def test_step_resets_guidance_derivative_history_on_a_clock_discontinuity(tracke
     assert reset_calls == [1]
 
 
+def test_abort_marks_the_setpoint_stream_fatal_and_reports_target_lost(tracker_module, monkeypatch):
+    # Spec (controller decision): the explicit ABORT failure response maps to the T3
+    # `SetpointStream` failure-response path and the T1 `TARGET_LOST` outcome, instead
+    # of `step()` keeping on issuing (or scoring) a normal command.
+    from rotorpy.guidance.tracking import TrackingState
+
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    now = time.monotonic()
+    for name in ("heartbeat", "telemetry", "image"):
+        tracker._watchdogs.touch(name, now)
+    tracker._vehicle_state.ingest_attitude(sim_s=10.0, wall_s=10.0, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=10.0, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+    finish_calls = []
+    tracker.telemetry = SimpleNamespace(
+        step=lambda **kwargs: None,
+        finish=lambda outcome, **kwargs: finish_calls.append((outcome, kwargs)),
+    )
+    tracker.recorder = None
+    aborted_command = SimpleNamespace(
+        locked=True, tracking=False, source=None,
+        velocity_ned=[0.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,
+        tracking_state=TrackingState.ABORT, abort_reason="max_prediction_gap_exceeded",
+    )
+    tracker.guidance = SimpleNamespace(update=lambda *args, **kwargs: aborted_command)
+    assert tracker._setpoints.stats.failed is False
+    status = tracker.step()
+    assert status == "target_lost"
+    assert tracker._setpoints.stats.failed is True
+    assert tracker._setpoints.stats.fatal_reason == "target_lost:max_prediction_gap_exceeded"
+    assert len(finish_calls) == 1
+    outcome, kwargs = finish_calls[0]
+    assert outcome.name == "TARGET_LOST"
+    assert kwargs["reason"] == "target_lost"
+    # One-way, like `SetpointStream.mark_fatal` itself: a later non-ABORT command must
+    # not un-fail the stream or re-report a fresh outcome.
+    tracker.guidance = SimpleNamespace(update=lambda *args, **kwargs: SimpleNamespace(
+        locked=True, tracking=True, source="forward",
+        velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,
+    ))
+    tracker._vehicle_state.ingest_attitude(sim_s=10.1, wall_s=10.1, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker.step()
+    assert tracker._setpoints.stats.failed is True
+
+
 @pytest.mark.parametrize("reason", ["ground", "timeout"])
 def test_tracker_step_reports_flight_end(tracker_module, monkeypatch, reason):
     tracker = _new_tracker(tracker_module, monkeypatch)

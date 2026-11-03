@@ -1,5 +1,43 @@
 # Updates
 
+## 4.8.0 - Recoverable tracking state machine (plan Phase 5)
+- New `rotorpy/guidance/tracking.py`: a pure, camera-agnostic `TrackingStateMachine`
+  (`STARTUP -> ACQUIRE -> TRACK -> TEMPORARY_LOSS -> REACQUIRE`, terminal
+  `ABORT`/`COMPLETE`). Replaces `HomingGuidance`'s old one-way
+  `_upward_latched`/`_lost`/`_permanent_loss` bookkeeping, shared by the legacy
+  no-mounts path and the Gazebo mounts path alike: once the upward camera latched, any
+  later loss disabled guidance for the rest of the flight even with the forward camera
+  still seeing the target (the plan's documented baseline-failure evidence, now proven
+  recoverable by `tests/test_homing_recorded_handoff_replay.py`, which replays the
+  actual recorded frames from `Results/camera_homing_gazebo.html`).
+- Camera selection: priority (upward over forward, the existing documented design)
+  first, confidence second, with a switching-hysteresis margin that only protects an
+  already-active, still-visible camera from a marginal rival (losing the active
+  camera's own visibility always falls back immediately, no margin).
+- Bounded recovery: `TEMPORARY_LOSS` tolerates a gap bounded by age
+  (`PROPOSED_MAX_PREDICTION_GAP_S`) and, on the Gazebo path, by the per-camera
+  associator's own growing track uncertainty (`PROPOSED_MAX_TRACK_UNCERTAINTY_PX`);
+  whichever bound is tighter triggers the explicit, one-way `ABORT` failure response
+  first. No permanent loss accumulates before the target is ever acquired or while
+  acquisition/reacquisition is unconfirmed (`PROPOSED_ACQUIRE_FRAMES`/
+  `PROPOSED_REACQUIRE_FRAMES`, default 1 frame: unchanged single-sighting lock/steer
+  behavior).
+- `HomingCommand.tracking_state`/`abort_reason` expose the state (also in telemetry's
+  `decision_from_command`). Decision: `ABORT` maps to the T3
+  `SetpointStream.mark_fatal()` failure-response path and the T1
+  `RunOutcome.TARGET_LOST` outcome, wired into `camera_homing_tracker.py`'s `step()` --
+  never a silently-held stale command after a prolonged loss.
+  `HomingGuidance.complete(reason)` is the separate, external "flight is over"
+  transition for the truth-side scorer/runner (Task 8 owns scoring); guidance itself
+  never reads truth to decide either transition.
+- Every camera switch, reacquire, or `reset_derivative_history()` (clock discontinuity)
+  resets the proportional-navigation derivative history, generalizing a check that
+  previously only covered the upward camera's first-ever steer.
+- New proposed, unverified config defaults in `homing_config.py`
+  (`tracking_thresholds()`): `PROPOSED_ACQUIRE_FRAMES`, `PROPOSED_REACQUIRE_FRAMES`,
+  `PROPOSED_CAMERA_SWITCH_MARGIN`, `PROPOSED_MAX_PREDICTION_GAP_S`,
+  `PROPOSED_MAX_TRACK_UNCERTAINTY_PX`.
+
 ## 4.7.0 - Detection acceptance, held-out evaluation, and guidance wiring (plan Phase 4)
 - Acceptance test (`test_homing_pixels.py::test_opening_failure_frame_selects_the_cylinder_not_an_image_wide_region`) decodes the actual opening forward-camera frame from `Results/camera_homing_gazebo.html` (the plan's documented baseline-failure evidence) and proves the legacy `target_square` spans nearly the whole frame while `detect_target` picks the small cylinder; no detector code changed for this (the Phase-4 detector already did this correctly).
 - `pixels.py` gained a held-out evaluation harness: `LabeledFrame`, `DetectionRates`, `split_tuning_and_held_out` (disjoint, reproducible via an injected `rng`) and `evaluate_detection_rates` (false-positive/missed-detection rates of bare per-frame `detect_target` calls, with a labeled ground-truth match radius so a wrong-target detection still counts as a miss). `test_homing_detection_eval.py` reports rates over a synthetic labeled set (lighting, texture, shadows, distractors, tiny distant targets) -- synthetic-set numbers only, not a real-world claim.

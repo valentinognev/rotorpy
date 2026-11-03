@@ -20,11 +20,27 @@ from rotorpy.guidance.pixels import (
 )
 from rotorpy.guidance.sightline import ground_relative_position, reference_relative_position
 from rotorpy.guidance.speed import COMPONENT_CAP, desired_velocity
+from rotorpy.guidance.tracking import CameraSignal, TrackingState, TrackingStateMachine
 
 # Default below this horizontal speed the measured velocity has no usable heading, when
 # the caller does not pass `min_course_speed_m_s`. The Gazebo config path overrides this
 # with the named `PROPOSED_MIN_COURSE_SPEED_M_S` in `homing_config.py`.
 _MIN_COURSE_SPEED_M_S = 1.0
+
+# Private literal defaults matching `homing_config`'s named `PROPOSED_*` tracking
+# thresholds (see `tracking_thresholds()` there): kept here, not imported from
+# `homing_config`, so direct construction (every existing test) keeps working without
+# naming every threshold, and so `homing_config` (which imports `HomingGuidance`) never
+# has to be imported back by this module.
+_ACQUIRE_FRAMES = 1
+_REACQUIRE_FRAMES = 1
+_CAMERA_SWITCH_MARGIN = 0.1
+_MAX_PREDICTION_GAP_S = 2.0
+_MAX_TRACK_UNCERTAINTY_PX = 150.0
+# Documented design (unchanged by this module): home from the forward camera until the
+# upward camera latches, then home from upward -- so upward outranks forward whenever
+# both are visible, not just the first time upward is ever seen.
+_CAMERA_PRIORITY = ("upward", "forward")
 
 
 class HomingCommand(object):
@@ -42,6 +58,8 @@ class HomingCommand(object):
         tracker_center: Optional[np.ndarray],
         tracker_side: Optional[float],
         detections: Optional[Dict[str, TargetObservation]] = None,
+        tracking_state: Optional[TrackingState] = None,
+        abort_reason: Optional[str] = None,
     ) -> None:
         self.velocity_ned = np.array(velocity_ned, dtype=float, copy=True)
         self.acceleration_ned = np.array(acceleration_ned, dtype=float, copy=True)
@@ -58,6 +76,17 @@ class HomingCommand(object):
         # Per-camera `pixels.TargetObservation` for this tick, Gazebo (mounts) path only.
         # `None` on the legacy no-mounts path, which keeps target_square/target_pixel_count.
         self.detections = detections
+        # `tracking.TrackingState` this tick ended in. `ABORT` is the guidance's own
+        # explicit, one-way failure response to a prolonged loss or runaway prediction
+        # uncertainty: the documented, configurable decision is that a caller sees this
+        # and maps it to the T1 `RunOutcome.TARGET_LOST` outcome and the T3
+        # `SetpointStream.mark_fatal()` failure-response path, instead of continuing to
+        # accept this (or any later) command as a normal stale-command hold. `COMPLETE`
+        # is set only by a caller's own `HomingGuidance.complete()` call (the truth-side
+        # scorer's signal; guidance itself never reads truth), never internally.
+        self.tracking_state = tracking_state
+        # Why `tracking_state` is `ABORT`, or `None` otherwise.
+        self.abort_reason = abort_reason
 
 
 def body_frd_velocity(velocity_ned: np.ndarray, attitude_sim_quat: np.ndarray) -> np.ndarray:
@@ -215,6 +244,11 @@ class HomingGuidance(object):
         target_reference_height_m: float = 0.0,
         min_course_speed_m_s: float = _MIN_COURSE_SPEED_M_S,
         detector_config: DetectorConfig = DEFAULT_CONFIG,
+        acquire_frames: int = _ACQUIRE_FRAMES,
+        reacquire_frames: int = _REACQUIRE_FRAMES,
+        camera_switch_margin: float = _CAMERA_SWITCH_MARGIN,
+        max_prediction_gap_s: float = _MAX_PREDICTION_GAP_S,
+        max_track_uncertainty_px: float = _MAX_TRACK_UNCERTAINTY_PX,
     ) -> None:
         if initial_velocity_ned is None and initial_speed is None:
             raise ValueError("give an initial velocity or an initial speed")
@@ -246,9 +280,20 @@ class HomingGuidance(object):
             self._set_course(np.array(initial_velocity_ned, dtype=float, copy=True))
         self._locked = False
         self._tracking = False
-        self._lost = False
-        self._upward_latched = False
-        self._upward_steered = False
+        # Explicit STARTUP -> ACQUIRE -> TRACK -> TEMPORARY_LOSS -> REACQUIRE state
+        # machine, with terminal ABORT/COMPLETE; replaces the old one-way
+        # "_upward_latched"/"_lost" pair, which had no recovery path (see
+        # `tests/test_homing_recorded_handoff_replay.py`). Shared by both the legacy
+        # (no-mounts) and Gazebo (mounts) paths: the bug it fixes was in this shared
+        # camera-selection logic, not in the Gazebo-only detection pieces.
+        self._tracker = TrackingStateMachine(
+            acquire_frames=acquire_frames,
+            reacquire_frames=reacquire_frames,
+            switch_margin=camera_switch_margin,
+            max_prediction_gap_s=max_prediction_gap_s,
+            max_uncertainty_px=max_track_uncertainty_px,
+            camera_priority=_CAMERA_PRIORITY,
+        )
         self._source: Optional[str] = None
         self._tracker_center: Optional[np.ndarray] = None
         self._tracker_side: Optional[float] = None
@@ -327,8 +372,8 @@ class HomingGuidance(object):
             self._adopt_course(velocity_ned, attitude_sim_quat)
         if forward_image is None and upward_image is None:
             return self._command(attitude_sim_quat)
-        if self._lost:
-            return self._command(attitude_sim_quat)
+        if self._tracker.is_terminal:
+            return self._terminal_command(attitude_sim_quat)
 
         forward_obs = self._detect("forward", forward_image, t)
         upward_obs = self._detect("upward", upward_image, t)
@@ -339,23 +384,21 @@ class HomingGuidance(object):
         upward_sees = self._sees(upward_image, upward_obs)
         if forward_sees or upward_sees:
             self._locked = True
-        if upward_sees:
-            self._upward_latched = True
 
-        if self._upward_latched and not upward_sees:
-            return self._permanent_loss(attitude_sim_quat)
-
-        if self._upward_latched:
-            source = "upward"
-            image = upward_image
-            obs = upward_obs
-        elif forward_sees:
-            source = "forward"
-            image = forward_image
-            obs = forward_obs
-        else:
+        self._tracker.update(t, {
+            "forward": self._camera_signal("forward", forward_sees, forward_obs),
+            "upward": self._camera_signal("upward", upward_sees, upward_obs),
+        })
+        if self._tracker.is_terminal:
+            return self._terminal_command(attitude_sim_quat)
+        if self._tracker.state is not TrackingState.TRACK:
+            # ACQUIRE (not yet confirmed), TEMPORARY_LOSS or REACQUIRE: not steering
+            # this tick, but not a failure either -- bounded, recoverable hold.
             return self._hold(attitude_sim_quat)
 
+        source = self._tracker.camera
+        image = forward_image if source == "forward" else upward_image
+        obs = forward_obs if source == "forward" else upward_obs
         center, side = self._tracked_square(image, obs)
         if center is None:
             return self._hold(attitude_sim_quat)
@@ -364,7 +407,29 @@ class HomingGuidance(object):
             return self._hold(attitude_sim_quat)
         return self._steer(
             t, attitude_sim_quat, velocity_ned, source, center, side, sightline, relative,
+            discontinuous=self._tracker.discontinuous,
         )
+
+    def _camera_signal(
+        self, camera: str, sees: bool, obs: Optional[TargetObservation]
+    ) -> CameraSignal:
+        """This tick's `tracking.CameraSignal` for `camera`.
+
+        With structured detections (Gazebo/mounts path), confidence comes from
+        `pixels.detect_target`'s own score and uncertainty from the per-camera
+        associator's current track sigma (whether or not *this* tick detected
+        anything: a stale, growing sigma is exactly the "runaway prediction
+        uncertainty" the state machine's uncertainty bound exists to catch). The
+        legacy no-mounts path has neither: a visible camera counts as maximally
+        confident (so the documented upward/forward priority still governs
+        selection) and uncertainty never bounds it.
+        """
+        if self._associators is None:
+            return CameraSignal(visible=sees, confidence=1.0 if sees else 0.0)
+        confidence = obs.confidence if (obs is not None and sees) else 0.0
+        track = self._associators[camera].track
+        uncertainty_px = None if track is None else track.sigma_px
+        return CameraSignal(visible=sees, confidence=confidence, uncertainty_px=uncertainty_px)
 
     def _detect(self, camera: str, image: Optional[np.ndarray], t: float) -> Optional[TargetObservation]:
         """`TargetObservation` through this camera's associator, or None on the legacy
@@ -416,6 +481,15 @@ class HomingGuidance(object):
         if self._associators is not None:
             for associator in self._associators.values():
                 associator.reset()
+        self._tracker.force_discontinuity()
+
+    def complete(self, reason: Optional[str] = None) -> None:
+        """External "the flight is over" signal (the truth-side scorer, through the
+        tracker/runner): never set from inside this module, and guidance itself never
+        reads truth. One-way: a call after `ABORT` is a no-op, so a late completion
+        signal cannot paper over an already-declared failure.
+        """
+        self._tracker.complete(reason)
 
     def _sees(self, image: Optional[np.ndarray], obs: Optional[TargetObservation] = None) -> bool:
         if obs is not None:
@@ -434,10 +508,16 @@ class HomingGuidance(object):
             self._velocity_ned = np.array(self._initial_velocity_ned, dtype=float, copy=True)
         return self._command(attitude_sim_quat)
 
-    def _permanent_loss(self, attitude_sim_quat: np.ndarray) -> HomingCommand:
-        self._lost = True
+    def _terminal_command(self, attitude_sim_quat: np.ndarray) -> HomingCommand:
+        """`ABORT`/`COMPLETE`: stop commanding, instead of holding a stale velocity
+        indefinitely. The documented, configurable decision (see `HomingCommand`) is
+        that a caller maps `ABORT` to `SetpointStream.mark_fatal()`; this zeroed
+        velocity is a safety fallback for any caller that does not check
+        `tracking_state` and still forwards the command as-is.
+        """
         self._tracking = False
         self._acceleration_ned = np.zeros(3)
+        self._velocity_ned = np.zeros(3)
         self._source = None
         self._tracker_center = None
         self._tracker_side = None
@@ -453,12 +533,10 @@ class HomingGuidance(object):
         side: int,
         sightline: np.ndarray,
         relative: np.ndarray,
+        discontinuous: bool = False,
     ) -> HomingCommand:
-        if source == "upward" and not self._upward_steered:
+        if discontinuous or self._last_image_time is None:
             previous_sightline = None
-            dt = 0
-        elif self._last_image_time is None:
-            previous_sightline = self._last_sightline
             dt = 0.0
         else:
             previous_sightline = self._last_sightline
@@ -478,8 +556,6 @@ class HomingGuidance(object):
         self._source = source
         self._tracker_center = np.array(center, dtype=float, copy=True)
         self._tracker_side = float(side)
-        if source == "upward":
-            self._upward_steered = True
         return self._command(attitude_sim_quat)
 
     def _command(self, attitude_sim_quat: np.ndarray) -> HomingCommand:
@@ -502,4 +578,6 @@ class HomingGuidance(object):
             ),
             self._tracker_side,
             self._detections,
+            self._tracker.state,
+            self._tracker.abort_reason,
         )

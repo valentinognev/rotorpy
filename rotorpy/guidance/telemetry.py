@@ -65,6 +65,10 @@ def decision_from_command(command: Any) -> Dict[str, Any]:
         "source": command.source,
         "tracker_center": command.tracker_center,
         "tracker_side": command.tracker_side,
+        # `tracking.TrackingState`/reason (Gazebo and legacy paths alike); `None` from
+        # any caller whose command predates this field (kept optional for that reason).
+        "tracking_state": getattr(command, "tracking_state", None),
+        "abort_reason": getattr(command, "abort_reason", None),
     })
 
 
