@@ -201,6 +201,105 @@ def test_pn_lead_integration_changes_the_transmitted_velocity_with_nav_constant(
     assert not np.allclose(low.requested_velocity_ned, high.requested_velocity_ned)
 
 
+def test_pn_lead_point_is_unchanged_for_a_stationary_target_with_a_moving_vehicle(config):
+    """Task 10 (reviewer-confirmed Task 7 defect): `_steer`'s PN-lead branch must
+    advance the aim point by the TARGET's own estimated ground velocity
+    (`target_motion.target_velocity_ned`), not the vehicle-relative rate
+    (`target_motion.relative_velocity_ned` = target velocity minus vehicle velocity).
+    For a genuinely stationary target, `target_velocity_ned` is ~zero regardless of
+    vehicle motion, so `navigation.pn_lead_point`'s own documented contract ("a
+    stationary target's lead point is its relative position unchanged") means
+    `nav_constant` must NOT change the transmitted command direction. Every prior
+    PN-lead test primed the estimator with a stationary vehicle
+    (`vehicle_velocity_ned=np.zeros(3)`), where `relative_velocity_ned` and
+    `target_velocity_ned` are numerically identical (both zero), masking the bug: a
+    nonzero vehicle velocity here is the only way to distinguish the two fields.
+    """
+    relative_initial = np.array([40.0, 10.0, 15.0])
+    vehicle_velocity = np.array([6.0, 4.0, 0.0])
+    dt = 0.1
+
+    def _primed(nav_constant):
+        guidance = guidance_from_config(config)
+        guidance.nav_constant = nav_constant
+        cx, cy = _image_center(guidance)
+        relative = relative_initial.copy()
+        t = 0.0
+        for _ in range(60):
+            # Target fixed in the world, vehicle moving: the relative position
+            # drifts by exactly -vehicle_velocity * dt (target_estimator.py's own
+            # docstring), which the filter must attribute entirely to the known
+            # vehicle motion, leaving the estimated target velocity at ~zero.
+            relative = relative - vehicle_velocity * dt
+            guidance._estimator.update(
+                t=t, vehicle_velocity_ned=vehicle_velocity, ray_origin_ned=np.zeros(3),
+                ray_direction_ned=relative / np.linalg.norm(relative), height_m=15.0, reference_height_m=0.0,
+                fx=guidance.intrinsics["fx"], fy=guidance.intrinsics["fy"], uncertainty_px=1.0,
+            )
+            t += dt
+        _prime_for_direct_steer(guidance, vehicle_velocity, t)
+        sightline = relative / np.linalg.norm(relative)
+        return guidance._steer(
+            t, IDENTITY, vehicle_velocity, "forward", np.array([cx, cy]), 10.0, sightline, relative
+        )
+
+    low = _primed(2.0)
+    high = _primed(5.0)
+    assert low.target_motion.status is TargetMotionStatus.OBSERVABLE
+    assert np.linalg.norm(low.target_motion.target_velocity_ned) < 0.5
+    # Sanity: the (buggy) vehicle-relative field is NOT near zero here, so this test
+    # can actually distinguish the fix from the bug.
+    assert np.linalg.norm(low.target_motion.relative_velocity_ned) > 1.0
+    low_unit = low.requested_velocity_ned / np.linalg.norm(low.requested_velocity_ned)
+    high_unit = high.requested_velocity_ned / np.linalg.norm(high.requested_velocity_ned)
+    assert np.allclose(low_unit, high_unit, atol=1e-6)
+
+
+def test_pn_lead_point_uses_the_target_own_velocity_not_the_vehicle_relative_rate(config):
+    """Task 10: with a genuinely moving target AND a genuinely moving vehicle (so
+    `target_velocity_ned` and `relative_velocity_ned` differ materially, not just in
+    the zero-vehicle-velocity case above), the transmitted command's direction must
+    match the aim point built from `target_velocity_ned`, not the one built from
+    `relative_velocity_ned`.
+    """
+    relative_initial = np.array([40.0, 10.0, 15.0])
+    true_velocity = np.array([2.0, -1.0, 0.0])
+    vehicle_velocity = np.array([6.0, 4.0, 0.0])
+    dt = 0.1
+
+    guidance = guidance_from_config(config)
+    cx, cy = _image_center(guidance)
+    relative = relative_initial.copy()
+    t = 0.0
+    for _ in range(60):
+        relative = relative + (true_velocity - vehicle_velocity) * dt
+        guidance._estimator.update(
+            t=t, vehicle_velocity_ned=vehicle_velocity, ray_origin_ned=np.zeros(3),
+            ray_direction_ned=relative / np.linalg.norm(relative), height_m=15.0, reference_height_m=0.0,
+            fx=guidance.intrinsics["fx"], fy=guidance.intrinsics["fy"], uncertainty_px=1.0,
+        )
+        t += dt
+    _prime_for_direct_steer(guidance, vehicle_velocity, t)
+    sightline = relative / np.linalg.norm(relative)
+    command = guidance._steer(
+        t, IDENTITY, vehicle_velocity, "forward", np.array([cx, cy]), 10.0, sightline, relative
+    )
+    assert command.target_motion.status is TargetMotionStatus.OBSERVABLE
+
+    lead = guidance.nav_constant * guidance._pn_lead_time_s
+    correct_aim = relative + lead * command.target_motion.target_velocity_ned
+    wrong_aim = relative + lead * command.target_motion.relative_velocity_ned
+    # Sanity: the two candidate aim points are materially different (otherwise this
+    # test cannot distinguish the fix from the bug).
+    assert not np.allclose(correct_aim, wrong_aim, atol=0.5)
+
+    correct_unit = correct_aim / np.linalg.norm(correct_aim)
+    wrong_unit = wrong_aim / np.linalg.norm(wrong_aim)
+    requested_unit = command.requested_velocity_ned / np.linalg.norm(command.requested_velocity_ned)
+    assert np.allclose(requested_unit, correct_unit, atol=1e-6)
+    assert not np.allclose(requested_unit, wrong_unit, atol=1e-3)
+
+
 def test_acceleration_ned_is_consistent_with_the_transmitted_velocity_command(config):
     """Reviewer finding (fix round 1): `acceleration_ned` must describe the SAME
     motion as the transmitted `velocity_ned` (no double counting), not an

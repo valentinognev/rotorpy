@@ -734,10 +734,20 @@ class HomingGuidance(object):
             if (
                 target_motion_now is not None
                 and target_motion_now.status is TargetMotionStatus.OBSERVABLE
-                and target_motion_now.relative_velocity_ned is not None
+                and target_motion_now.target_velocity_ned is not None
             ):
+                # Fix round 1 (Task 10): `pn_lead_point` advances the aim point along
+                # the TARGET's own estimated ground velocity, not the vehicle-relative
+                # rate (`relative_velocity_ned` = target velocity minus vehicle
+                # velocity -- nonzero for a stationary target whenever the vehicle is
+                # moving, per `target_estimator.TargetMotionEstimate`'s own
+                # docstring). Every test exercising this branch before Task 10 primed
+                # the estimator with a stationary vehicle, where the two fields are
+                # numerically identical, masking the bug (see
+                # `tests/test_homing_vehicle_envelope.py`'s nonzero-vehicle-velocity
+                # PN-lead tests).
                 aim_point = pn_lead_point(
-                    self.nav_constant, relative, target_motion_now.relative_velocity_ned, self._pn_lead_time_s
+                    self.nav_constant, relative, target_motion_now.target_velocity_ned, self._pn_lead_time_s
                 )
             elif target_motion_now is not None:
                 reasons.append(
