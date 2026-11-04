@@ -39,6 +39,22 @@ _REACQUIRE_FRAMES = 1
 _CAMERA_SWITCH_MARGIN = 0.1
 _MAX_PREDICTION_GAP_S = 2.0
 _MAX_TRACK_UNCERTAINTY_PX = 150.0
+# Final-approach dead-reckoning grace (plan: survive the brief nadir blind spot between the
+# forward and upward cameras near the end of the dive). Once height drops to or below
+# `_FINAL_APPROACH_HEIGHT_M` while the track still held a confident lock
+# (`>= _FINAL_APPROACH_MIN_CONFIDENCE` on its last visible frame), the prediction-gap bound
+# is multiplied by `_FINAL_APPROACH_GAP_SCALE` so a short two-camera dropout coasts on the
+# constant-velocity prediction instead of aborting immediately. The uncertainty bound is
+# untouched. Defaults match `homing_config`'s `PROPOSED_FINAL_APPROACH_*`.
+#
+# `_FINAL_APPROACH_MIN_CONFIDENCE` is deliberately below 0.5: `pixels._observation` halves
+# confidence outright (`clipped_confidence=0.5`) once a target is clipped, and a clipped,
+# near-fill, large target is exactly the confident near-field lock this grace exists for
+# (confirmed from recorded Gazebo telemetry: 0.41-0.45 immediately before the blind-spot
+# dropout). A 0.6 gate never engages for that case -- the one it is meant for.
+_FINAL_APPROACH_HEIGHT_M = 20.0
+_FINAL_APPROACH_GAP_SCALE = 2.0
+_FINAL_APPROACH_MIN_CONFIDENCE = 0.35
 # Private literal defaults matching `homing_config`'s named `PROPOSED_*` target-motion
 # thresholds (see `target_motion_thresholds()` there); same reasoning as the tracking
 # thresholds above.
@@ -302,6 +318,9 @@ class HomingGuidance(object):
         camera_switch_margin: float = _CAMERA_SWITCH_MARGIN,
         max_prediction_gap_s: float = _MAX_PREDICTION_GAP_S,
         max_track_uncertainty_px: float = _MAX_TRACK_UNCERTAINTY_PX,
+        final_approach_height_m: float = _FINAL_APPROACH_HEIGHT_M,
+        final_approach_gap_scale: float = _FINAL_APPROACH_GAP_SCALE,
+        final_approach_min_confidence: float = _FINAL_APPROACH_MIN_CONFIDENCE,
         max_speed_m_s: float = _TARGET_MAX_SPEED_M_S,
         max_accel_m_s2: float = _TARGET_MAX_ACCEL_M_S2,
         outlier_chi2_threshold: float = _TARGET_OUTLIER_CHI2_THRESHOLD,
@@ -406,6 +425,15 @@ class HomingGuidance(object):
             max_uncertainty_px=max_track_uncertainty_px,
             camera_priority=_CAMERA_PRIORITY,
         )
+        # Final-approach dead-reckoning grace across the nadir blind spot (see the module
+        # `_FINAL_APPROACH_*` constants). `_last_track_confidence` is the confidence of the
+        # active camera's most recent visible frame, carried into a loss so the extended
+        # gap only applies to a track that was a confident lock before it dropped out.
+        self._max_prediction_gap_s = float(max_prediction_gap_s)
+        self._final_approach_height_m = float(final_approach_height_m)
+        self._final_approach_gap_scale = float(final_approach_gap_scale)
+        self._final_approach_min_confidence = float(final_approach_min_confidence)
+        self._last_track_confidence = 0.0
         self._source: Optional[str] = None
         self._tracker_center: Optional[np.ndarray] = None
         self._tracker_side: Optional[float] = None
@@ -528,10 +556,25 @@ class HomingGuidance(object):
         if forward_sees or upward_sees:
             self._locked = True
 
+        forward_signal = self._camera_signal("forward", forward_sees, forward_obs)
+        upward_signal = self._camera_signal("upward", upward_sees, upward_obs)
+        # Extend the prediction-gap grace only when a confident lock has reached final
+        # approach, so a brief two-camera dropout over the nadir blind spot coasts on dead
+        # reckoning instead of aborting at once. Uses the confidence carried from the last
+        # visible frame (this tick is a loss when it matters), so a never-confident or
+        # high-altitude track keeps the nominal bound.
+        gap_override = None
+        if (height_m <= self._final_approach_height_m
+                and self._last_track_confidence >= self._final_approach_min_confidence):
+            gap_override = self._max_prediction_gap_s * self._final_approach_gap_scale
+
         self._tracker.update(t, {
-            "forward": self._camera_signal("forward", forward_sees, forward_obs),
-            "upward": self._camera_signal("upward", upward_sees, upward_obs),
-        })
+            "forward": forward_signal,
+            "upward": upward_signal,
+        }, max_prediction_gap_s=gap_override)
+        active_signal = forward_signal if self._tracker.camera == "forward" else upward_signal
+        if active_signal.visible:
+            self._last_track_confidence = active_signal.confidence
         if self._tracker.is_terminal:
             return self._terminal_command(attitude_sim_quat)
         if self._tracker.state is not TrackingState.TRACK:

@@ -110,6 +110,28 @@ def test_growing_track_uncertainty_aborts_before_the_time_gap_does():
     assert machine.abort_reason == "max_track_uncertainty_exceeded"
 
 
+def test_per_tick_gap_override_extends_the_grace_before_aborting():
+    machine = _machine(max_prediction_gap_s=1.0)
+    machine.update(0.0, {"forward": SEEN})
+    machine.update(0.1, {"forward": UNSEEN})
+    # A gap that would abort at the 1.0 s default is tolerated when the caller raises the
+    # bound for this tick (final-approach dead reckoning across the nadir blind spot).
+    machine.update(1.5, {"forward": UNSEEN}, max_prediction_gap_s=2.0)
+    assert machine.state is TrackingState.TEMPORARY_LOSS
+    machine.update(2.5, {"forward": UNSEEN}, max_prediction_gap_s=2.0)
+    assert machine.state is TrackingState.ABORT
+    assert machine.abort_reason == "max_prediction_gap_exceeded"
+
+
+def test_per_tick_gap_override_does_not_relax_the_uncertainty_bound():
+    machine = _machine(max_prediction_gap_s=1.0, max_uncertainty_px=10.0)
+    machine.update(0.0, {"forward": SEEN})
+    machine.update(0.1, {"forward": CameraSignal(visible=False, uncertainty_px=50.0)},
+                   max_prediction_gap_s=100.0)
+    assert machine.state is TrackingState.ABORT
+    assert machine.abort_reason == "max_track_uncertainty_exceeded"
+
+
 def test_complete_is_external_and_one_way():
     machine = _machine()
     machine.update(0.0, {"forward": SEEN})

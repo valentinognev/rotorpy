@@ -65,6 +65,15 @@ class DetectorConfig:
     base_uncertainty_px: float = 0.5
     extent_uncertainty: float = 0.1  # per pixel of the longer bounding-box side
     clipped_extent_uncertainty: float = 0.5
+    # Saturating cap on the bounding-box side fed into the extent-based uncertainty terms
+    # above. The extent penalty models centroid-localization ambiguity, which grows with a
+    # blob's linear size but must not grow without bound: a large, near-field target that
+    # fills (and clips) the frame on final approach is a *well*-localized, confident lock,
+    # not a highly uncertain one. Without this cap its raw extent (300+ px on a 2236 px
+    # frame) alone produced `uncertainty_px > _MAX_TRACK_UNCERTAINTY_PX`, aborting the
+    # track the instant one frame was missed. Capping keeps "clipped > unclipped" ordering
+    # (every existing test uses far smaller blobs) while bounding the worst-case penalty.
+    max_uncertainty_extent_px: float = 120.0
     gate_sigmas: float = 3.0
     gate_ambiguity_ratio: float = 2.0
     gate_ambiguity_margin_px: float = 1.0
@@ -112,21 +121,29 @@ class _Component:
         return self.area * self.fill * (config.clipped_score if self.clipped else 1.0)
 
 
-def _as_unit_float(image: np.ndarray) -> np.ndarray:
-    if np.issubdtype(image.dtype, np.integer):
-        return image.astype(float) / 255.0
-    return image.astype(float, copy=False)
-
-
 def _red_mask(image: np.ndarray, config: DetectorConfig) -> np.ndarray:
-    red, green, blue = image[:, :, 0], image[:, :, 1], image[:, :, 2]
+    """Boolean red mask. Only pixels passing a cheap red-dominance prefilter in the image's
+    own dtype (with a margin so float32 rounding cannot drop a borderline pixel) get the
+    exact float64 test."""
+    integer = np.issubdtype(image.dtype, np.integer)
+    scale = 255.0 if integer else 1.0
+    margin = 1e-6
+    mask = np.zeros(image.shape[:2], dtype=bool)
+    red = image[:, :, 0]
+    if integer:
+        red = red.astype(np.int16)
+    dominance = red - np.maximum(image[:, :, 1], image[:, :, 2])
+    rows, columns = np.nonzero(dominance >= (config.min_dominance - margin) * scale)
+    pixels = image[rows, columns].astype(float) / scale
+    red, green, blue = pixels[:, 0], pixels[:, 1], pixels[:, 2]
     dominance = red - np.maximum(green, blue)
     saturation = (red - np.minimum(green, blue)) / np.maximum(red, 1e-6)
-    return (
+    mask[rows, columns] = (
         (red >= config.min_red)
         & (dominance >= config.min_dominance)
         & (saturation >= config.min_saturation)
     )
+    return mask
 
 
 def _components(image: np.ndarray, config: DetectorConfig) -> List[_Component]:
@@ -162,10 +179,11 @@ def _components(image: np.ndarray, config: DetectorConfig) -> List[_Component]:
 def _observation(component: _Component, timestamp: float, camera: str,
                  count: int, config: DetectorConfig) -> TargetObservation:
     extent = component.extent
-    uncertainty = config.base_uncertainty_px + config.extent_uncertainty * extent
+    bounded_extent = min(extent, config.max_uncertainty_extent_px)
+    uncertainty = config.base_uncertainty_px + config.extent_uncertainty * bounded_extent
     confidence = component.fill * min(1.0, np.sqrt(component.area) / 5.0)
     if component.clipped:
-        uncertainty += config.clipped_extent_uncertainty * extent
+        uncertainty += config.clipped_extent_uncertainty * bounded_extent
         confidence *= config.clipped_confidence
     return TargetObservation(
         status=DetectionStatus.DETECTED,
@@ -215,7 +233,7 @@ def detect_target(image: Optional[np.ndarray], timestamp: float = 0.0, camera: s
     """
     if image is None:
         return TargetObservation(DetectionStatus.NO_FRAME, timestamp, camera)
-    components = _components(_as_unit_float(np.asarray(image)), config)
+    components = _components(np.asarray(image), config)
     if not components:
         return TargetObservation(DetectionStatus.NO_DETECTION, timestamp, camera)
     status, chosen = _select(components, prediction, config)

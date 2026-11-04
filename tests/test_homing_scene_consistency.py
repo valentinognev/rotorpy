@@ -102,9 +102,9 @@ def test_parsers_read_the_spawn_and_model_values():
     assert set(cameras) == {"forward", "upward"}
     forward = cameras["forward"]
     assert np.allclose(forward["position_flu_m"], [0.36, 0.0, 0.05])
-    assert np.isclose(forward["rpy_rad"][1], np.deg2rad(10.0), atol=1e-8)
+    assert np.isclose(forward["rpy_rad"][1], np.deg2rad(40.0), atol=1e-8)
     assert forward["width"] == 2236 and forward["update_rate_hz"] == 20.0
-    assert np.isclose(cameras["upward"]["rpy_rad"][1], np.deg2rad(-70.0), atol=1e-8)
+    assert np.isclose(cameras["upward"]["rpy_rad"][1], np.deg2rad(-40.0), atol=1e-8)
     cylinder = parse_cylinder_sdf(TARGET_SDF.read_text())
     assert cylinder == {"radius_m": 0.75, "length_m": 3.0, "visual_radius_m": 0.75, "visual_length_m": 3.0}
     spawns = parse_launch_spawns(LAUNCH_SCRIPT.read_text())
@@ -135,7 +135,7 @@ def test_changed_forward_camera_position_in_the_config_is_reported(config):
 
 
 def test_changed_camera_pitch_in_the_sdf_is_reported(config):
-    vehicle = VEHICLE_SDF.read_text().replace("0.174532925", "0.3")
+    vehicle = VEHICLE_SDF.read_text().replace("0.698131701", "0.3")
     assert any("forward" in problem and "pitch" in problem for problem in _mismatches(config, vehicle=vehicle))
 
 
@@ -205,7 +205,7 @@ def test_replay_world_matches_the_spawned_cylinder(config):
     ]
     assert np.allclose(world.get_block_bounding_boxes()[0], expected)
     assert np.allclose(forward.extrinsics["position"], [0.36, 0.0, 0.05])
-    assert np.allclose(upward.extrinsics["position"], [0.0, 0.0, 0.0])
+    assert np.allclose(upward.extrinsics["position"], [0.0, 0.0, 0.05])
 
 
 def test_replay_scene_is_independent_of_the_python_example_box(config):

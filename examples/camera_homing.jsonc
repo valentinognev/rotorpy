@@ -85,8 +85,12 @@
   // sdf sensor pose. Checked against the sdf by rotorpy.guidance.scene_consistency.
   "forward_camera_position_flu_m": [0.36, 0.0, 0.05],
 
-  // Gazebo upward camera position in the body, forward-left-up, metres.
-  "upward_camera_position_flu_m": [0.0, 0.0, 0.0],
+  // Gazebo upward camera position in the body, forward-left-up, metres. Raised 0.05 m above
+  // the rotor plane (rotor_0..3 at z=0.01 m) so the front rotor (which the forward-tilted
+  // -40 deg pitch below would otherwise put in frame) stays out of the upward camera's
+  // 90 deg FOV. Confirmed by projecting each rotor disk (radius 0.1 m) with
+  // rotorpy.guidance.camera_geometry.project_ned_point.
+  "upward_camera_position_flu_m": [0.0, 0.0, 0.05],
 
   // Gazebo target cylinder radius, metres. Matches gazeboModels/homing/target_cylinder.sdf.
   "gazebo_target_radius_m": 0.75,
@@ -103,10 +107,10 @@
   "estimator_yaw_offset_deg": 0.0,
 
   // Forward camera pitch, degrees. Positive looks down from the body forward axis.
-  "forward_pitch_deg": 10.0,
+  "forward_pitch_deg": 40.0,
 
-  // Upward camera pitch, degrees. Negative looks up. -70 is 70 degrees above the nose.
-  "upward_pitch_deg": -70.0,
+  // Upward camera pitch, degrees. Negative looks up. -40 is 40 degrees above the nose.
+  "upward_pitch_deg": -40.0,
 
   // Radius of each splatted feature, pixels.
   "splat_radius_px": 1,

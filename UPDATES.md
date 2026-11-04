@@ -1,5 +1,79 @@
 # Updates
 
+## 4.14.0 - Reduce `TARGET_LOST` on final approach: camera re-tilt, uncertainty cap, final-approach grace
+
+Following 4.13.1's `TARGET_LOST` near final approach, investigated via real-Gazebo telemetry and
+found two independent root causes plus a user-flagged propeller-visibility defect; fixed all three.
+
+- **Camera re-tilt (reduces the blind spot)**: `forward_pitch_deg` 10&deg;&rarr;40&deg; and
+  `upward_pitch_deg` -70&deg;&rarr;-40&deg; in `examples/camera_homing.jsonc`, with matching SDF
+  `<pose>` pitch updates in `gazeboModels/hummingbird/hummingbird.sdf.jinja`
+  (must stay radian-exact with the jsonc per `scene_consistency.py`'s runtime check). Both
+  cameras now tilt 30&deg; further forward, narrowing the near-nadir gap between their two FOVs.
+- **Propeller no longer in the upward camera's view**: at the new -40&deg; pitch the front rotor
+  (2 of 4 rotors use `Gazebo/Red` material -- a real false-detection risk) fell inside the
+  camera's 90&deg; FOV (verified analytically via `camera_geometry.project_ned_point` over each
+  rotor disk). Fixed by raising the upward camera's mount 0.05 m above the rotor plane
+  (`upward_camera_position_flu_m` `[0,0,0]`&rarr;`[0,0,0.05]`, SDF pose to match); re-verified
+  zero rotor pixels project into frame at the new position+pitch.
+- **Fix A (`pixels.py`'s `_observation`, uncertainty-inflation bug)**: `uncertainty_px` scaled
+  linearly and unboundedly with a detected target's raw bounding-box extent, so a large,
+  near-field, clipped (but genuinely confident) target could already exceed the 150 px abort
+  threshold from its own last successful detection -- the very next missed frame aborted
+  immediately via `max_track_uncertainty_exceeded`. Added `DetectorConfig.max_uncertainty_extent_px`
+  (120.0) and bounded the extent term with it. Regression test:
+  `tests/test_homing_pixels.py::test_large_near_field_clipped_target_uncertainty_stays_bounded`.
+- **Fix B (final-approach prediction-gap grace)**: a genuine camera-geometry blind spot near
+  nadir can cause several seconds of continuous target loss even with the re-tilt. Added an
+  optional per-tick `max_prediction_gap_s` override to `TrackingStateMachine.update`/`_on_invisible`
+  (`rotorpy/guidance/tracking.py`) and wired `HomingGuidance`/`homing_config.py` to double the
+  gap bound during low-altitude (&le;20 m), confident (&ge;0.35 last-track confidence) final
+  approach. The 0.35 threshold (not an initially-tried 0.6) is required because
+  `pixels._observation` halves confidence for any clipped detection (ceiling ~0.5) -- exactly
+  the large/near-field/clipped case Fix B targets -- found via e2e telemetry showing the gate
+  never engaging at 0.6. Regression tests: `tests/test_tracking.py::test_per_tick_gap_override_*`,
+  `tests/test_homing_detection_wiring.py::test_final_approach_grace_coasts_across_a_dropout_a_confident_clipped_lock_would_otherwise_abort`.
+- Verified via multiple real `HEADLESS=1` Gazebo e2e runs: no more premature uncertainty-based
+  aborts; the final-approach gap extension engages correctly (observed ~4.45 s coasted vs. the
+  un-extended 2.0 s bound). `TARGET_LOST` can still occur when genuine occlusion exceeds even
+  the extended ~4.0 s grace window -- a known, reduced-but-not-eliminated residual risk, not
+  further tuned here. A separate 14.4 m lateral-miss `TIMEOUT` was also observed in one run
+  (navigation/trajectory tuning, out of scope for this fix).
+- Full `pytest` run in the `px4-noetic-sim-ros` container: 725 passed, the same 20 pre-existing
+  failures as the 4.13.1 baseline (confirmed via `git stash` comparison), 0 regressions.
+
+## 4.13.1 - Fix real-Gazebo `offboard_lost` from slow red-target detection
+
+Ran the real-Gazebo e2e (`HEADLESS=1 ./run_camera_homing_sitl.sh`), which until now
+had never been exercised end-to-end during this effort (per the reliability plan,
+"No new Gazebo flight was run during planning"). It consistently failed a few
+seconds into homing with `offboard_lost`: the 2236x2236 PX4 camera frames are much
+larger than any synthetic test/harness fixture, and `pixels._red_mask` computed its
+float64 dominance/saturation test over every pixel, taking 0.5-0.9s per detection
+call (two cameras) against PX4's offboard-setpoint-stream grace window — so real
+frames alone (no offline-harness substitute) revealed the defect. Root-caused with
+`cProfile` instrumentation added around `HomingGuidance.update` in a scratch copy of
+`Dockerfiles/camera_homing_tracker.py` (not committed); confirmed `_red_mask` was
+~90% of per-tick cost via Gazebo's own recorded frames.
+
+- **Fix (`rotorpy/guidance/pixels.py`'s `_red_mask`)**: prefilter on a cheap red-vs-max(green,blue)
+  dominance test in the image's native dtype (int16 for uint8 input) before paying for the
+  float64 saturation/dominance test, and only on the pixels that pass. Verified bit-for-bit
+  identical masks against the original implementation on 6 real recorded Gazebo frames
+  (`docker run ... pyulog`-free direct `_red_mask` comparison, see session). ~8x faster
+  (0.16s vs 0.025s per 2236x2236 frame measured in-container); no change to `detect_target`'s
+  public contract.
+- After the fix, two full `HEADLESS=1` Gazebo e2e runs completed without `offboard_lost`,
+  reaching a scored `RUN_OUTCOME` (`TARGET_LOST`, both runs) instead of crashing early.
+  `TARGET_LOST` near final approach is a separate, pre-existing issue (the forward/upward
+  camera pair has a blind spot roughly below the vehicle; the plan's "Decisions still to
+  commission" section already flags unresolved reliability work) -- not introduced or fixed
+  by this change, and out of scope here.
+- Full `pytest` run in the `px4-noetic-sim-ros` container (the 8 files needing
+  `gymnasium`/other deps missing from that image skipped): 721 passed, 20 pre-existing
+  failures unchanged with or without this fix (unrelated missing deps/environment issues),
+  0 regressions.
+
 ## 4.13.0 - Fix PN-lead field bug and harness camera/backprojection mismatch (Task 10)
 **Supersedes 4.12.0's 0% campaign numbers** (stale; those were measured before both fixes below). Final campaign (seed 0, same default scenario): **nominal 94/100 success (94.0%, Wilson 95% CI 87.5-97.2%), stress 18/20 (90.0%, CI 69.9-97.2%)**, `non_finite_detected=False` throughout. Up from 0/120 (0%, CI 0.0-3.7%).
 

@@ -15,9 +15,11 @@ from rotorpy.guidance.gazebo_bridge import attitude_gazebo_to_homing
 from rotorpy.guidance.homing_config import guidance_from_config, load_homing_config
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "examples" / "camera_homing.jsonc"
-# Gazebo sdf: forward camera 0.36 m ahead and 0.05 m above the body, pitched 10 deg down.
-FORWARD = {"position_flu": np.array([0.36, 0.0, 0.05]), "pitch_deg": 10.0}
-UPWARD = {"position_flu": np.zeros(3), "pitch_deg": -70.0}
+# Gazebo sdf: forward camera 0.36 m ahead and 0.05 m above the body, pitched 40 deg down.
+FORWARD = {"position_flu": np.array([0.36, 0.0, 0.05]), "pitch_deg": 40.0}
+# Upward camera is raised 0.05 m above the body origin (clears the propeller disks from
+# its 40 deg-above-the-nose FOV), pitched 40 deg above the nose.
+UPWARD = {"position_flu": np.array([0.0, 0.0, 0.05]), "pitch_deg": -40.0}
 NORTH_FACING = Rotation.from_euler("z", 90.0, degrees=True)
 
 
@@ -171,9 +173,10 @@ def test_locked_guidance_keeps_steering_at_and_below_the_reference_height(config
     """Once locked, fresh pixels at/below the 1.5 m visible-centre reference height must
     still move the command: no frozen replay of the last pre-descent velocity/acceleration.
 
-    The upward mount has zero translation offset, so height_m == reference_height_m (1.5 m)
-    is exactly the degenerate plane-intersection case `reference_relative_position` cannot
-    solve; smaller heights (1.0, 0.5 m) stay degenerate too. The diving attitude keeps the
+    The upward mount's translation offset (0.05 m) is negligible next to the reference
+    height, so height_m == reference_height_m (1.5 m) is effectively the degenerate
+    plane-intersection case `reference_relative_position` cannot solve; smaller heights
+    (1.0, 0.5 m) stay degenerate too. The diving attitude keeps the
     upward-camera ray aimed below the horizon throughout (a level attitude would make the
     upward camera look at the sky, a separate, legitimate no-bearing case). Each step uses a
     very different pixel position, so a correct fix tracks it (a bug freezes velocity_ned

@@ -105,6 +105,47 @@ def test_detections_expose_distinct_statuses_for_no_frame_no_detection_and_ambig
     assert ambiguous.tracking is False and ambiguous.locked is False
 
 
+def test_final_approach_grace_coasts_across_a_dropout_a_confident_clipped_lock_would_otherwise_abort(config):
+    """Regression for the Gazebo `TARGET_LOST` finding: a large, near-field, clipped
+    target right before the nadir blind-spot handoff is a confident lock (its discounted
+    `confidence` lands in pixels.py's clipped range, well under 0.5 -- not a weak
+    detection), so a brief two-camera dropout during final approach (height at or below
+    `homing_config.PROPOSED_FINAL_APPROACH_HEIGHT_M`) must coast past the default
+    `max_prediction_gap_s` instead of aborting immediately."""
+    from rotorpy.guidance.homing_config import tracking_thresholds
+    from rotorpy.guidance.tracking import TrackingState
+
+    attitude = attitude_gazebo_to_homing(NORTH_FACING.as_quat())
+    velocity = np.zeros(3)
+    guidance = guidance_from_config(config)
+    width, height = int(config["image_width_px"]), int(config["image_height_px"])
+
+    # A large blob that touches the right edge (clipped) and fills most of the frame:
+    # the near-field, end-of-approach geometry the grace targets.
+    clipped_image = _blank(config)
+    clipped_image[height // 4:3 * height // 4, width // 2:, 0] = 1.0
+    final_approach_height_m = 15.0
+    lock = guidance.update(0.0, final_approach_height_m, attitude, velocity, clipped_image, None)
+    assert lock.tracking_state is TrackingState.TRACK
+    assert lock.detections["forward"].clipped
+    assert 0.0 < lock.detections["forward"].confidence <= 0.5
+
+    default_gap_s = tracking_thresholds()["max_prediction_gap_s"]
+    # Past the un-extended bound, inside the final-approach-extended one: must not abort.
+    mid_gap_t = default_gap_s + 0.2
+    held = guidance.update(mid_gap_t, final_approach_height_m, attitude, velocity, _blank(config), None)
+    assert held.tracking_state is not TrackingState.ABORT
+
+    # Past the extended bound too: must abort (the grace is bounded, not infinite). Either
+    # reason is acceptable here -- the per-camera sigma also keeps growing during the loss
+    # (`TargetAssociator.growth_px_per_s`), so it can cross the uncertainty bound first;
+    # what matters is that the grace does not coast forever.
+    far_gap_t = default_gap_s * tracking_thresholds().get("final_approach_gap_scale", 2.0) + 0.5
+    aborted = guidance.update(far_gap_t, final_approach_height_m, attitude, velocity, _blank(config), None)
+    assert aborted.tracking_state is TrackingState.ABORT
+    assert aborted.abort_reason in ("max_prediction_gap_exceeded", "max_track_uncertainty_exceeded")
+
+
 def test_reset_derivative_history_drops_stale_per_camera_tracks(config):
     """After a clock discontinuity, a stale associator track must not gate away a target
     that has genuinely moved past it -- without the reset, `allow_reacquire` still

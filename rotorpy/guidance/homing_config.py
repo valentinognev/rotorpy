@@ -49,6 +49,18 @@ PROPOSED_REACQUIRE_FRAMES = 1
 PROPOSED_CAMERA_SWITCH_MARGIN = 0.1
 PROPOSED_MAX_PREDICTION_GAP_S = 2.0
 PROPOSED_MAX_TRACK_UNCERTAINTY_PX = 150.0
+# Final-approach dead-reckoning grace across the brief nadir blind spot between the forward
+# and upward cameras near the end of the dive. Below PROPOSED_FINAL_APPROACH_HEIGHT_M, a
+# track that still held a confident lock (last visible frame confidence at or above
+# PROPOSED_FINAL_APPROACH_MIN_CONFIDENCE) gets its prediction-gap bound multiplied by
+# PROPOSED_FINAL_APPROACH_GAP_SCALE, so a short two-camera dropout coasts on the
+# constant-velocity prediction instead of aborting the instant both cameras lose the target.
+# PROPOSED_FINAL_APPROACH_MIN_CONFIDENCE is below 0.5 because pixels._observation halves
+# confidence once a target clips the frame, and a clipped, near-fill, large target is
+# exactly the confident near-field lock this grace targets (see homing._FINAL_APPROACH_*).
+PROPOSED_FINAL_APPROACH_HEIGHT_M = 20.0
+PROPOSED_FINAL_APPROACH_GAP_SCALE = 2.0
+PROPOSED_FINAL_APPROACH_MIN_CONFIDENCE = 0.35
 
 
 # Proposed, not verified: `target_estimator.TargetMotionEstimator`'s bounded ground-
@@ -160,6 +172,9 @@ def tracking_thresholds() -> dict:
         "camera_switch_margin": PROPOSED_CAMERA_SWITCH_MARGIN,
         "max_prediction_gap_s": PROPOSED_MAX_PREDICTION_GAP_S,
         "max_track_uncertainty_px": PROPOSED_MAX_TRACK_UNCERTAINTY_PX,
+        "final_approach_height_m": PROPOSED_FINAL_APPROACH_HEIGHT_M,
+        "final_approach_gap_scale": PROPOSED_FINAL_APPROACH_GAP_SCALE,
+        "final_approach_min_confidence": PROPOSED_FINAL_APPROACH_MIN_CONFIDENCE,
     }
 
 

@@ -24,8 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "examples" / "camera_homing.jsonc"
 INTRINSICS = pinhole_intrinsics(2236, 2236, 90.0, 90.0)
 
-FORWARD_POSE = ((0.36, 0.0, 0.05), (0.0, 0.174532925, 0.0))
-UPWARD_POSE = ((0.0, 0.0, 0.0), (0.0, -1.221730476, 0.0))
+FORWARD_POSE = ((0.36, 0.0, 0.05), (0.0, 0.698131701, 0.0))
+UPWARD_POSE = ((0.0, 0.0, 0.05), (0.0, -0.698131701, 0.0))
 
 
 @pytest.fixture(scope="module")
@@ -36,16 +36,16 @@ def mounts():
 def test_forward_mount_is_ahead_and_above_the_body_in_frd(mounts):
     forward, _ = mounts
     assert np.allclose(forward.position_frd_m, [0.36, 0.0, -0.05])
-    pitch = np.deg2rad(10.0)
+    pitch = np.deg2rad(40.0)
     assert np.allclose(forward.rotation_frd_from_camera @ [0, 0, 1], [np.cos(pitch), 0.0, np.sin(pitch)])
     assert np.allclose(forward.rotation_frd_from_camera @ [1, 0, 0], [0.0, 1.0, 0.0])
     assert np.allclose(forward.rotation_frd_from_camera @ [0, 1, 0], [-np.sin(pitch), 0.0, np.cos(pitch)])
 
 
-def test_upward_mount_looks_seventy_degrees_above_the_nose(mounts):
+def test_upward_mount_looks_forty_degrees_above_the_nose(mounts):
     _, upward = mounts
-    assert np.allclose(upward.position_frd_m, np.zeros(3))
-    pitch = np.deg2rad(-70.0)
+    assert np.allclose(upward.position_frd_m, [0.0, 0.0, -0.05])
+    pitch = np.deg2rad(-40.0)
     assert np.allclose(upward.rotation_frd_from_camera @ [0, 0, 1], [np.cos(pitch), 0.0, np.sin(pitch)])
     assert upward.rotation_frd_from_camera[2, 2] < 0.0
 
@@ -89,7 +89,7 @@ def test_homing_attitude_adapter_agrees_with_the_frames_module(seed):
 def test_pixel_right_of_center_is_east_for_a_north_facing_vehicle(mounts):
     north_facing_ned = np.eye(3)
     origin, direction = pixel_ray_ned(1118.0 + 223.6, 1118.0, INTRINSICS, mounts[0], north_facing_ned)
-    pitch = np.deg2rad(10.0)
+    pitch = np.deg2rad(40.0)
     expected = np.array([np.cos(pitch), 0.2, np.sin(pitch)]) / np.sqrt(1.04)
     assert direction[1] > 0.0
     assert np.allclose(direction, expected, atol=1e-6)

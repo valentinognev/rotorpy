@@ -99,8 +99,17 @@ class TrackingStateMachine(object):
     def is_terminal(self) -> bool:
         return self.state in _TERMINAL_STATES
 
-    def update(self, t: float, signals: Mapping[str, CameraSignal]) -> None:
-        """Advance one tick. No-op once terminal (`ABORT`/`COMPLETE` are one-way)."""
+    def update(self, t: float, signals: Mapping[str, CameraSignal],
+               max_prediction_gap_s: Optional[float] = None) -> None:
+        """Advance one tick. No-op once terminal (`ABORT`/`COMPLETE` are one-way).
+
+        `max_prediction_gap_s` optionally overrides the constructor's gap bound for this
+        tick only (the uncertainty bound is unaffected). `homing.py` raises it during a
+        low-altitude final approach that was holding a confident lock, so dead reckoning
+        can coast across the brief nadir blind spot between the two cameras instead of
+        aborting the moment the target drops out of both. `None` keeps the constructor
+        default, so every other caller is unchanged.
+        """
         if self.is_terminal:
             self.discontinuous = False
             return
@@ -110,7 +119,7 @@ class TrackingStateMachine(object):
         if chosen is not None:
             self._on_visible(t, chosen)
             return
-        self._on_invisible(t, signals)
+        self._on_invisible(t, signals, max_prediction_gap_s)
 
     def complete(self, reason: Optional[str] = None) -> None:
         """External, truth-scored "the flight is over" signal (Task 8's scorer, or a
@@ -157,7 +166,8 @@ class TrackingStateMachine(object):
         self.discontinuous = natural_break or self._force_discontinuity
         self._force_discontinuity = False
 
-    def _on_invisible(self, t: float, signals: Mapping[str, CameraSignal]) -> None:
+    def _on_invisible(self, t: float, signals: Mapping[str, CameraSignal],
+                      max_prediction_gap_s: Optional[float] = None) -> None:
         self._consecutive = 0
         self.discontinuous = False
         if self.state is TrackingState.STARTUP:
@@ -171,9 +181,10 @@ class TrackingStateMachine(object):
             self._lost_since = t
         self.state = TrackingState.TEMPORARY_LOSS
         gap_s = t - self._lost_since
+        max_gap_s = self._max_gap_s if max_prediction_gap_s is None else float(max_prediction_gap_s)
         uncertainty = None if self.camera is None else signals.get(self.camera)
         uncertainty_px = None if uncertainty is None else uncertainty.uncertainty_px
-        if gap_s > self._max_gap_s:
+        if gap_s > max_gap_s:
             self._abort("max_prediction_gap_exceeded")
         elif uncertainty_px is not None and uncertainty_px > self._max_uncertainty_px:
             self._abort("max_track_uncertainty_exceeded")

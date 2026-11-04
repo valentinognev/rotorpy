@@ -200,6 +200,22 @@ def test_clipped_only_candidate_is_flagged_with_inflated_uncertainty():
     assert obs.confidence < base.confidence
 
 
+def test_large_near_field_clipped_target_uncertainty_stays_bounded():
+    from rotorpy.guidance.homing import _MAX_TRACK_UNCERTAINTY_PX
+
+    # A big near-field target that fills (and clips) most of a real-size frame on final
+    # approach is a confident lock, not a highly uncertain one. Its raw bounding-box side
+    # (300+ px) must not inflate uncertainty_px past the track-abort threshold, or a single
+    # missed frame right after a good detection aborts the homing run (the Gazebo
+    # `TARGET_LOST` failure). The saturating extent cap keeps it safely bounded.
+    image = _background(height=360, width=360)
+    _blob(image, 100, 0, 150, 360)  # 360 px wide, runs to both side edges -> clipped
+    obs = detect_target(image)
+    assert obs.status is DetectionStatus.DETECTED
+    assert obs.clipped
+    assert obs.uncertainty_px < _MAX_TRACK_UNCERTAINTY_PX
+
+
 def test_unclipped_candidate_is_preferred_over_a_slightly_larger_clipped_one():
     image = _background()
     _blob(image, 40, 118, 20, 10)
