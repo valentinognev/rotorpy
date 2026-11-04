@@ -121,19 +121,29 @@ class _Component:
         return self.area * self.fill * (config.clipped_score if self.clipped else 1.0)
 
 
+def _dominance_candidate_mask(image: np.ndarray, config: DetectorConfig) -> np.ndarray:
+    """Cheap red-dominance prefilter mask, in the image's own dtype (int16 for integer
+    input) with a margin so float32 rounding cannot drop a borderline pixel. A strict
+    superset of `_red_mask`'s exact test: no pixel outside it can ever be part of a
+    detected component, by construction."""
+    integer = np.issubdtype(image.dtype, np.integer)
+    scale = 255.0 if integer else 1.0
+    margin = 1e-6
+    red = image[:, :, 0]
+    if integer:
+        red = red.astype(np.int16)
+    dominance = red - np.maximum(image[:, :, 1], image[:, :, 2])
+    return dominance >= (config.min_dominance - margin) * scale
+
+
 def _red_mask(image: np.ndarray, config: DetectorConfig) -> np.ndarray:
     """Boolean red mask. Only pixels passing a cheap red-dominance prefilter in the image's
     own dtype (with a margin so float32 rounding cannot drop a borderline pixel) get the
     exact float64 test."""
     integer = np.issubdtype(image.dtype, np.integer)
     scale = 255.0 if integer else 1.0
-    margin = 1e-6
     mask = np.zeros(image.shape[:2], dtype=bool)
-    red = image[:, :, 0]
-    if integer:
-        red = red.astype(np.int16)
-    dominance = red - np.maximum(image[:, :, 1], image[:, :, 2])
-    rows, columns = np.nonzero(dominance >= (config.min_dominance - margin) * scale)
+    rows, columns = np.nonzero(_dominance_candidate_mask(image, config))
     pixels = image[rows, columns].astype(float) / scale
     red, green, blue = pixels[:, 0], pixels[:, 1], pixels[:, 2]
     dominance = red - np.maximum(green, blue)
@@ -146,17 +156,54 @@ def _red_mask(image: np.ndarray, config: DetectorConfig) -> np.ndarray:
     return mask
 
 
+# Padding (px) added around the tight candidate bounding box before cropping. Not load-bearing
+# for correctness (the box is already exact), just a safety margin.
+_CANDIDATE_CROP_PAD_PX = 4
+
+
+def _candidate_crop(image: np.ndarray, config: DetectorConfig):
+    """`(crop, (row_offset, col_offset))` tightly bounding every pixel that could possibly
+    pass `_red_mask`'s exact test, or `(None, None)` when there is none.
+
+    `_components` only needs `ndimage.label`/`find_objects` to see whatever region could
+    contain a detected component; everywhere outside this crop is guaranteed all-background
+    (`_dominance_candidate_mask` is a strict superset of the exact test, so nothing out
+    there could ever pass it either). Labeling the crop instead of the whole frame is
+    therefore mathematically identical to labeling the whole frame -- just far cheaper
+    when, as in the normal hot path, a compact target sits in a much larger frame (a real
+    2236x2236 Gazebo capture made per-tick detection take 0.2-0.9s, well past the 0.5s
+    PX4 offboard setpoint expiry -- see UPDATES.md 4.15.2).
+    """
+    height, width = image.shape[:2]
+    candidate = _dominance_candidate_mask(image, config)
+    rows_any = candidate.any(axis=1)
+    if not rows_any.any():
+        return None, None
+    cols_any = candidate.any(axis=0)
+    row_indices = np.flatnonzero(rows_any)
+    col_indices = np.flatnonzero(cols_any)
+    row_min = max(0, int(row_indices[0]) - _CANDIDATE_CROP_PAD_PX)
+    row_max = min(height, int(row_indices[-1]) + 1 + _CANDIDATE_CROP_PAD_PX)
+    col_min = max(0, int(col_indices[0]) - _CANDIDATE_CROP_PAD_PX)
+    col_max = min(width, int(col_indices[-1]) + 1 + _CANDIDATE_CROP_PAD_PX)
+    return image[row_min:row_max, col_min:col_max], (row_min, col_min)
+
+
 def _components(image: np.ndarray, config: DetectorConfig) -> List[_Component]:
     height, width = image.shape[:2]
-    labels, count = ndimage.label(_red_mask(image, config), structure=np.ones((3, 3)))
+    crop, origin = _candidate_crop(image, config)
+    if crop is None:
+        return []
+    row_offset, col_offset = origin
+    labels, count = ndimage.label(_red_mask(crop, config), structure=np.ones((3, 3)))
     components = []
     for index, box in enumerate(ndimage.find_objects(labels), start=1):
         rows, columns = np.nonzero(labels[box] == index)
         area = rows.size
         if area < config.min_area or area > config.max_area_fraction * height * width:
             continue
-        v_min, u_min = box[0].start, box[1].start
-        v_max, u_max = box[0].stop - 1, box[1].stop - 1
+        v_min, u_min = box[0].start + row_offset, box[1].start + col_offset
+        v_max, u_max = box[0].stop - 1 + row_offset, box[1].stop - 1 + col_offset
         box_height, box_width = v_max - v_min + 1, u_max - u_min + 1
         fill = area / (box_height * box_width)
         clipped = u_min == 0 or v_min == 0 or u_max == width - 1 or v_max == height - 1

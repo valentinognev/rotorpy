@@ -366,3 +366,95 @@ def test_integer_images_are_scaled_and_observations_are_frozen():
     assert obs.status is DetectionStatus.DETECTED
     with pytest.raises(FrozenInstanceError):
         obs.status = DetectionStatus.NO_FRAME
+
+
+def _components_without_cropping(image, config=None):
+    """Reference implementation: the pre-crop pipeline, labeling the whole frame
+    directly instead of going through `_candidate_crop`. Used only to prove the
+    cropped fast path (`_components`) is output-identical, not as a replacement
+    for it."""
+    from scipy import ndimage as _ndimage
+
+    from rotorpy.guidance.pixels import DEFAULT_CONFIG, _Component, _red_mask
+
+    config = config or DEFAULT_CONFIG
+    height, width = image.shape[:2]
+    labels, _ = _ndimage.label(_red_mask(image, config), structure=np.ones((3, 3)))
+    components = []
+    for index, box in enumerate(_ndimage.find_objects(labels), start=1):
+        rows, columns = np.nonzero(labels[box] == index)
+        area = rows.size
+        if area < config.min_area or area > config.max_area_fraction * height * width:
+            continue
+        v_min, u_min = box[0].start, box[1].start
+        v_max, u_max = box[0].stop - 1, box[1].stop - 1
+        box_height, box_width = v_max - v_min + 1, u_max - u_min + 1
+        fill = area / (box_height * box_width)
+        clipped = u_min == 0 or v_min == 0 or u_max == width - 1 or v_max == height - 1
+        if fill < config.min_fill:
+            continue
+        if not clipped and max(box_height, box_width) > config.max_aspect * min(box_height, box_width):
+            continue
+        components.append(
+            _Component(
+                bounds=(u_min, v_min, u_max, v_max),
+                centroid=(float(columns.mean() + u_min), float(rows.mean() + v_min)),
+                area=area,
+                fill=fill,
+                clipped=clipped,
+            )
+        )
+    return components
+
+
+def test_candidate_crop_detection_matches_uncropped_detection_on_a_large_frame():
+    """`_components` crops to the candidate bounding box (performance fix for the
+    real-Gazebo 2236x2236 frames that made full-frame `ndimage.label` too slow to
+    keep up with the 0.5s PX4 setpoint expiry -- see UPDATES.md 4.15.2). That crop
+    must be exactly equivalent to labeling the whole frame, never an approximation."""
+    from rotorpy.guidance.pixels import _components
+
+    from rotorpy.guidance.pixels import DEFAULT_CONFIG
+
+    image = _background(height=1024, width=1024)
+    _blob(image, 400, 500, 24, 12)
+    cropped = _components(image, DEFAULT_CONFIG)
+    reference = _components_without_cropping(image)
+    assert len(cropped) == 1 and len(reference) == 1
+    assert cropped[0].bounds == reference[0].bounds
+    assert cropped[0].centroid == reference[0].centroid
+    assert cropped[0].area == reference[0].area
+    assert cropped[0].fill == reference[0].fill
+    assert cropped[0].clipped == reference[0].clipped is False
+
+
+def test_candidate_crop_still_flags_a_true_frame_edge_target_as_clipped():
+    """The `clipped`/`max_area_fraction` checks must use the original image's
+    height/width, not the (smaller) crop's -- otherwise a target abutting the crop
+    boundary, but not the real camera frame edge, would be wrongly flagged clipped."""
+    from rotorpy.guidance.pixels import _components
+
+    from rotorpy.guidance.pixels import DEFAULT_CONFIG
+
+    image = _background(height=1024, width=1024)
+    _blob(image, 400, 0, 24, 12)  # touches the true left edge (col 0)
+    components = _components(image, DEFAULT_CONFIG)
+    assert len(components) == 1
+    assert components[0].clipped is True
+    reference = _components_without_cropping(image)
+    assert components[0].bounds == reference[0].bounds
+
+
+def test_candidate_crop_handles_no_candidates_and_an_image_wide_candidate():
+    from rotorpy.guidance.pixels import DEFAULT_CONFIG, _components
+
+    empty = _background(height=512, width=512)
+    assert _components(empty, DEFAULT_CONFIG) == []
+
+    # A large blob (within `max_area_fraction`) spanning the full image width, touching
+    # both the left and right true edges: the crop should cover the whole row span.
+    large = _background(height=512, width=512)
+    _blob(large, 0, 0, 300, 512)
+    components = _components(large, DEFAULT_CONFIG)
+    assert len(components) == 1
+    assert components[0].clipped is True

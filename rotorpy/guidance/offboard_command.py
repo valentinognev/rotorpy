@@ -1,5 +1,6 @@
 """Offboard setpoint kinds the Gazebo homing tracker can send to PX4."""
 
+from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import List, Mapping, Optional, Tuple
@@ -47,7 +48,14 @@ OFFBOARD_PX4_PARAMETERS: Tuple[str, ...] = (
     "MC_ROLLRATE_MAX",
     "MC_PITCHRATE_MAX",
     "MC_YAWRATE_MAX",
+    "MPC_ACC_HOR",
+    "MPC_ACC_UP_MAX",
+    "MPC_ACC_DOWN_MAX",
 )
+
+
+# PX4 firmware defaults for parameters the cascade's GAINS table does not carry.
+_EXTRA_DEFAULTS = {"MPC_ACC_HOR": 5.0, "MPC_ACC_UP_MAX": 4.0, "MPC_ACC_DOWN_MAX": 3.0}
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,9 @@ class OffboardGains:
     yaw_p: float
     yaw_weight: float
     rate_limit_rad: np.ndarray
+    acc_hor: float
+    acc_up_max: float
+    acc_down_max: float
     track_tau_s: float
     max_tilt_deg: float
     min_specific_up_g: float
@@ -90,7 +101,7 @@ def offboard_gains(
         raw = px4_params.get(name)
         if raw is None or not np.isfinite(float(raw)):
             fallback.append(name)
-            values[name] = float(GAINS[name])
+            values[name] = float(_EXTRA_DEFAULTS[name] if name in _EXTRA_DEFAULTS else GAINS[name])
         else:
             values[name] = float(raw)
     gains = OffboardGains(
@@ -110,6 +121,9 @@ def offboard_gains(
                 values["MC_YAWRATE_MAX"],
             ]
         ),
+        acc_hor=values["MPC_ACC_HOR"],
+        acc_up_max=values["MPC_ACC_UP_MAX"],
+        acc_down_max=values["MPC_ACC_DOWN_MAX"],
         track_tau_s=float(config["track_tau_s"]),
         max_tilt_deg=float(config["max_tilt_deg"]),
         min_specific_up_g=float(config["min_specific_up_g"]),
@@ -122,6 +136,44 @@ def _finite_vector(name: str, value) -> np.ndarray:
     if vector.shape != (3,) or not np.all(np.isfinite(vector)):
         raise ValueError("{} must be a finite 3-vector".format(name))
     return vector
+
+
+class HoverThrustEstimator:
+    """Median of recent PX4 thrust outputs measured while hovering.
+
+    `MPC_THR_HOVER` is only a prior: the airframe's real hover thrust is what PX4's
+    own estimator settles on, and an attitude setpoint is open-loop in thrust.
+    """
+
+    MIN_PLAUSIBLE = 0.1
+    MAX_PLAUSIBLE = 0.9
+
+    def __init__(self, min_samples: int = 5, max_samples: int = 100) -> None:
+        self._min_samples = int(min_samples)
+        self._samples: deque = deque(maxlen=int(max_samples))
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def add(self, thrust: float) -> None:
+        value = float(thrust)
+        if np.isfinite(value) and self.MIN_PLAUSIBLE <= value <= self.MAX_PLAUSIBLE:
+            self._samples.append(value)
+
+    def estimate(self) -> Optional[float]:
+        if len(self._samples) < self._min_samples:
+            return None
+        return float(np.median(np.array(self._samples)))
+
+
+def limit_acceleration(acc_sim, gains: OffboardGains) -> np.ndarray:
+    """Clamp a simulator-frame (north, east, up) acceleration: horizontal norm, up and down."""
+    limited = np.array(acc_sim, dtype=float, copy=True)
+    horizontal = float(np.linalg.norm(limited[:2]))
+    if horizontal > gains.acc_hor:
+        limited[:2] *= gains.acc_hor / horizontal
+    limited[2] = np.clip(limited[2], -gains.acc_down_max, gains.acc_up_max)
+    return limited
 
 
 def attitude_setpoint(
@@ -152,6 +204,8 @@ def attitude_setpoint(
         max_tilt_deg=gains.max_tilt_deg,
         min_specific_up_g=gains.min_specific_up_g,
     )
+    # Like PX4's own acceleration limits: an abrupt demand must not become a dive or a lurch.
+    acc_sim = limit_acceleration(acc_sim, gains)
     thrust_vector = thrust_from_acceleration(
         sim_to_ned(acc_sim), gains.hover_thrust, gains.tilt_max_rad, gains.thr_min
     )

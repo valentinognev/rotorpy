@@ -35,6 +35,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,7 @@ from rotorpy.guidance.observation_buffer import ObservationBuffer, PROPOSED_CAME
 from rotorpy.guidance.offboard_command import (
     OFFBOARD_PX4_PARAMETERS,
     CommandMode,
+    HoverThrustEstimator,
     attitude_setpoint,
     offboard_gains,
     rate_setpoint,
@@ -186,7 +188,9 @@ def _position_target_type_mask(enable_acceleration_feedforward):
 # Comms links whose loss latches the setpoint stream fatal. The image link is excluded on
 # purpose: camera dropouts are recoverable and handled by command expiry.
 _FATAL_WATCHDOG_LINKS = ("heartbeat", "telemetry")
-_MAVLINK_POLL_TYPES = ("HEARTBEAT", "STATUSTEXT", "ATTITUDE_QUATERNION", "LOCAL_POSITION_NED")
+_MAVLINK_POLL_TYPES = ("HEARTBEAT", "STATUSTEXT", "ATTITUDE_QUATERNION", "LOCAL_POSITION_NED", "ATTITUDE_TARGET")
+# A hover sample counts only while the vehicle is nearly still.
+_HOVER_SAMPLE_MAX_SPEED_M_S = 0.5
 
 
 def _placeholder_command():
@@ -269,6 +273,7 @@ class CameraHomingTracker(object):
         self._offboard_gains = offboard_gains(self._offboard_config, {})[0]
         self._attitude_skips = 0
         self._last_transmitted_attitude = None
+        self._hover_estimator = HoverThrustEstimator()
         self._watchdogs = CommsWatchdogs(watchdog_timeouts())
         self._setpoints = SetpointStream(
             publish=self._publish_setpoint,
@@ -374,6 +379,14 @@ class CameraHomingTracker(object):
                 _warn("PX4 MPC_THR_HOVER read failed ({}: {})".format(type(exc).__name__, exc))
             gains, fallback = offboard_gains(self._offboard_config, params)
         self._offboard_gains = gains
+        print(
+            "offboard gains: hover_thrust={:.3f} thr_min={:.2f} thr_max={:.2f} acc_hor={:.1f} "
+            "acc_up={:.1f} acc_down={:.1f} tilt_max_deg={:.0f} fallback={}".format(
+                gains.hover_thrust, gains.thr_min, gains.thr_max, gains.acc_hor,
+                gains.acc_up_max, gains.acc_down_max, np.degrees(gains.tilt_max_rad), fallback,
+            ),
+            flush=True,
+        )
         for name in fallback:
             if name == "MPC_THR_HOVER":
                 continue
@@ -436,6 +449,8 @@ class CameraHomingTracker(object):
                 self._vehicle_state.ingest_attitude(
                     sim_s=rospy.get_time(), wall_s=wall_now, quat_estimator_xyzw=quat_xyzw
                 )
+            elif kind == "ATTITUDE_TARGET":
+                self._note_hover_thrust(msg.thrust, wall_now)
             elif kind == "LOCAL_POSITION_NED":
                 self._watchdogs.touch("telemetry", wall_now)
                 self._vehicle_state.ingest_local_position(
@@ -443,6 +458,37 @@ class CameraHomingTracker(object):
                     position_estimator_ned=[msg.x, msg.y, msg.z],
                     velocity_estimator_ned=[msg.vx, msg.vy, msg.vz],
                 )
+
+    def _note_hover_thrust(self, thrust, wall_now):
+        """While the startup velocity hover is still, PX4's own thrust output is the airframe's
+        true hover thrust; `MPC_THR_HOVER` is only a prior and the angle law is open-loop in it."""
+        estimator = getattr(self, "_hover_estimator", None)
+        if estimator is None or getattr(self, "_startup_done", False):
+            return
+        if getattr(self, "_command_mode", CommandMode.VELOCITY) is CommandMode.VELOCITY:
+            return
+        self._attitude_targets_seen = getattr(self, "_attitude_targets_seen", 0) + 1
+        velocity = self._vehicle_state.sample_at(None, wall_now).velocity_ned
+        self._last_hover_probe = (float(thrust), None if velocity is None else float(np.linalg.norm(velocity)))
+        if velocity is not None and float(np.linalg.norm(velocity)) < _HOVER_SAMPLE_MAX_SPEED_M_S:
+            estimator.add(thrust)
+
+    def _adopt_measured_hover_thrust(self):
+        estimator = getattr(self, "_hover_estimator", None)
+        estimate = None if estimator is None else estimator.estimate()
+        if estimate is None:
+            if getattr(self, "_command_mode", CommandMode.VELOCITY) is not CommandMode.VELOCITY:
+                _warn(
+                    "no hover thrust measured during startup ({} ATTITUDE_TARGET messages seen, "
+                    "{} usable, last (thrust, speed)={}); using PX4's MPC_THR_HOVER".format(
+                        getattr(self, "_attitude_targets_seen", 0),
+                        0 if estimator is None else len(estimator),
+                        getattr(self, "_last_hover_probe", None),
+                    )
+                )
+            return
+        self._offboard_gains = replace(self._offboard_gains, hover_thrust=estimate)
+        print("hover thrust measured from PX4: {:.3f}".format(estimate), flush=True)
 
     def _pose_truth(self):
         """Gazebo ground truth: recording and outcome scoring only, never guidance."""
@@ -741,6 +787,7 @@ class CameraHomingTracker(object):
         if decision.homing_active:
             if self._startup_done:
                 return False
+            self._adopt_measured_hover_thrust()
             with _lock_for(self, "_flags_lock"):
                 self._startup_done = True
             print("startup gate open; beginning camera homing", flush=True)

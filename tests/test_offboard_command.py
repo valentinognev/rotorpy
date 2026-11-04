@@ -15,6 +15,7 @@ from rotorpy.guidance.homing_config import (
     load_homing_config,
 )
 from rotorpy.guidance.offboard_command import (
+    HoverThrustEstimator,
     OFFBOARD_PX4_PARAMETERS,
     AttitudeSetpoint,
     CommandMode,
@@ -253,3 +254,58 @@ def test_bad_current_attitude_raises(current):
     sp = attitude_setpoint(ZERO, ZERO, 0.0, ZERO, _gains())
     with pytest.raises(ValueError):
         rate_setpoint(sp, current, _gains())
+
+
+def test_descent_acceleration_is_limited_to_px4_acc_down_max():
+    gains = _gains()
+    expected = gains.hover_thrust * (1.0 - gains.acc_down_max / 9.80665)
+    for demand in (8.0, 20.0):
+        sp = attitude_setpoint([0, 0, demand], ZERO, 0, ZERO, gains)
+        assert sp.thrust == pytest.approx(expected, rel=1e-2)
+
+
+def test_climb_acceleration_is_limited_to_px4_acc_up_max():
+    gains = _gains()
+    expected = gains.hover_thrust * (1.0 + gains.acc_up_max / 9.80665)
+    for demand in (-8.0, -20.0):
+        sp = attitude_setpoint([0, 0, demand], ZERO, 0, ZERO, gains)
+        assert sp.thrust == pytest.approx(expected, rel=1e-2)
+
+
+def test_horizontal_acceleration_is_limited_to_px4_acc_hor():
+    gains = _gains()
+    expected_tilt = np.arctan(gains.acc_hor / 9.80665)
+    sp = attitude_setpoint([30.0, 40.0, 0], ZERO, 0, ZERO, gains)
+    _, pitch, roll = _euler(sp)
+    assert np.hypot(pitch, roll) == pytest.approx(expected_tilt, rel=2e-2)
+
+
+def test_offboard_gains_read_px4_acceleration_limits():
+    gains, fallback = offboard_gains(CONFIG, {"MPC_ACC_DOWN_MAX": 2.0, "MPC_ACC_HOR": 7.0})
+    assert (gains.acc_down_max, gains.acc_hor) == (2.0, 7.0)
+    assert gains.acc_up_max == 4.0
+    assert "MPC_ACC_UP_MAX" in fallback
+
+
+def test_hover_thrust_estimator_is_none_without_enough_samples():
+    estimator = HoverThrustEstimator(min_samples=5)
+    for _ in range(4):
+        estimator.add(0.55)
+    assert estimator.estimate() is None
+
+
+def test_hover_thrust_estimator_returns_the_median_of_recent_samples():
+    estimator = HoverThrustEstimator(min_samples=3, max_samples=5)
+    for value in (0.9, 0.9, 0.55, 0.56, 0.54, 0.55, 0.57):
+        estimator.add(value)
+    assert estimator.estimate() == pytest.approx(0.55)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), 0.0, 0.05, 0.95, 1.5, -0.3])
+def test_hover_thrust_estimator_ignores_implausible_samples(bad):
+    estimator = HoverThrustEstimator(min_samples=2)
+    estimator.add(bad)
+    estimator.add(0.5)
+    estimator.add(0.5)
+    assert estimator.estimate() == pytest.approx(0.5)
+    assert len(estimator) == 2

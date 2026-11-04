@@ -13,6 +13,7 @@ from rotorpy.guidance.homing import HomingCommand
 from rotorpy.guidance.homing_config import PROPOSED_TELEMETRY_TIMEOUT_S, load_homing_config
 from rotorpy.guidance.offboard_command import (
     CommandMode,
+    HoverThrustEstimator,
     OffboardGains,
     attitude_setpoint,
     offboard_gains,
@@ -309,7 +310,7 @@ def _scripted_dump(monkeypatch, tracker_module, replies):
 
 
 def test_hover_thrust_retried_alone_when_first_read_misses_it(tracker_module, monkeypatch):
-    others = {name: GAINS[name] for name in tracker_module.OFFBOARD_PX4_PARAMETERS if name != "MPC_THR_HOVER"}
+    others = {name: 1.0 for name in tracker_module.OFFBOARD_PX4_PARAMETERS if name != "MPC_THR_HOVER"}
     calls = _scripted_dump(monkeypatch, tracker_module, [others, {}, {"MPC_THR_HOVER": 0.28}])
     link = SimpleNamespace(target_system=1, target_component=1, wait_heartbeat=lambda timeout=None: object())
     warnings = []
@@ -515,3 +516,50 @@ def test_telemetry_tick_reports_velocity_when_only_a_velocity_was_sent(tracker_m
     assert tick.get("transmitted_attitude_quat") is None
     assert tick.get("transmitted_thrust") is None
     assert tick.get("transmitted_body_rates_frd") is None
+
+def _hovering_tracker(tracker_module, monkeypatch, mode=CommandMode.ATTITUDE, prior=0.28):
+    tracker = _angle_tracker(tracker_module, monkeypatch, mode, hover_thrust=prior)
+    tracker._startup_done = False
+    tracker._hover_estimator = HoverThrustEstimator(min_samples=3)
+    return tracker
+
+
+def test_hover_thrust_is_learned_from_attitude_target_while_hovering(tracker_module, monkeypatch):
+    tracker = _hovering_tracker(tracker_module, monkeypatch)
+    _ingest(tracker, velocity=(0.0, 0.0, 0.05))
+    for thrust in (0.55, 0.56, 0.54, 0.55):
+        tracker._note_hover_thrust(thrust, time.monotonic())
+    tracker._adopt_measured_hover_thrust()
+    assert tracker._offboard_gains.hover_thrust == pytest.approx(0.55)
+
+
+def test_moving_samples_do_not_teach_hover_thrust(tracker_module, monkeypatch):
+    tracker = _hovering_tracker(tracker_module, monkeypatch)
+    _ingest(tracker, velocity=(3.0, 0.0, 0.0))
+    for _ in range(5):
+        tracker._note_hover_thrust(0.9, time.monotonic())
+    tracker._adopt_measured_hover_thrust()
+    assert tracker._offboard_gains.hover_thrust == pytest.approx(0.28)
+
+
+def test_samples_after_startup_are_ignored(tracker_module, monkeypatch):
+    tracker = _hovering_tracker(tracker_module, monkeypatch)
+    _ingest(tracker)
+    tracker._startup_done = True
+    for _ in range(5):
+        tracker._note_hover_thrust(0.6, time.monotonic())
+    tracker._adopt_measured_hover_thrust()
+    assert tracker._offboard_gains.hover_thrust == pytest.approx(0.28)
+
+
+def test_velocity_mode_never_learns_hover_thrust(tracker_module, monkeypatch):
+    tracker = _hovering_tracker(tracker_module, monkeypatch, mode=CommandMode.VELOCITY)
+    _ingest(tracker)
+    for _ in range(5):
+        tracker._note_hover_thrust(0.6, time.monotonic())
+    tracker._adopt_measured_hover_thrust()
+    assert tracker._offboard_gains.hover_thrust == pytest.approx(0.28)
+
+
+def test_attitude_target_messages_are_polled(tracker_module):
+    assert "ATTITUDE_TARGET" in tracker_module._MAVLINK_POLL_TYPES

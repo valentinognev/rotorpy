@@ -1,4 +1,4 @@
-"""Truth-side scoring of a homing run: target contact, ground contact, miss distance.
+"""Truth-side scoring of a homing run: target contact, ground contact.
 
 This module is the only place Gazebo (or simulator) *truth* about the vehicle and the
 target is combined. The guidance and estimator modules never import it -- that boundary
@@ -16,9 +16,6 @@ Scoring model:
   cylinder is exact (the point-to-cylinder distance is convex along a segment). A
   high-speed pass cannot disappear between samples. Collision events from the simulator
   (`note_collision`) are accepted as a second, independent source of contact.
-* Target contact (the vehicle touching the cylinder) is separate from ground contact.
-  Ground contact alone is never `TARGET_REACHED`; the outcome comes from
-  `outcome.classify_run` with the truth miss distance.
 """
 
 from collections import deque
@@ -268,7 +265,7 @@ class TruthScorer(object):
     def _target_reference(self, t_s: float) -> Optional[np.ndarray]:
         """Best-effort target position for *reporting* (`ground_miss_m`) only -- unlike
         `_target_at`, falls back to the most recent raw sample even when it is stale, so
-        a diagnostic miss distance is still recorded instead of silently omitted. Never
+        a diagnostic is still recorded instead of silently omitted. Never
         used to decide a match or a score."""
         value = self._target_at(t_s)
         if value is not None:
@@ -388,7 +385,7 @@ class TruthScorer(object):
         )
 
     def miss_m(self) -> Optional[float]:
-        """Truth miss distance (to the cylinder surface); 0 when contact was reported."""
+        """Truth ((to the cylinder surface); 0 when contact was reported."""
         return 0.0 if self._target_contact else self._min_distance
 
     def _reach_eligible(self) -> bool:
