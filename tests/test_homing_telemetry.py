@@ -191,6 +191,36 @@ def test_setpoint_stats_round_trip(tmp_path):
     assert run.ticks[0].setpoint_stats["expired_count"] == 1
 
 
+def test_angle_command_fields_round_trip(tmp_path):
+    log = TelemetryLog.create(tmp_path, _metadata())
+    tick = _tick(0)
+    tick.transmitted_setpoint = None
+    tick.command_mode = "rate"
+    tick.transmitted_attitude_quat = [0.0, 0.1, 0.0, 0.995]
+    tick.transmitted_thrust = 0.42
+    tick.transmitted_body_rates_frd = [0.1, -0.2, 0.0]
+    assert log.write_tick(tick)
+    log.close()
+    got = read_telemetry(log.path).ticks[0]
+    assert got.command_mode == "rate"
+    assert got.transmitted_attitude_quat == [0.0, 0.1, 0.0, 0.995]
+    assert got.transmitted_thrust == 0.42
+    assert got.transmitted_body_rates_frd == [0.1, -0.2, 0.0]
+
+
+def test_pre_angle_command_tick_loads_with_none_fields(tmp_path):
+    log = TelemetryLog.create(tmp_path, _metadata())
+    log.close()
+    with open(log.path, "a") as handle:
+        handle.write('{"schema": 1, "kind": "tick", "seq": 0, "transmitted_setpoint": [1.0, 0.0, 0.0]}\n')
+    got = read_telemetry(log.path).ticks[0]
+    assert got.transmitted_setpoint == [1.0, 0.0, 0.0]
+    assert got.command_mode is None
+    assert got.transmitted_attitude_quat is None
+    assert got.transmitted_thrust is None
+    assert got.transmitted_body_rates_frd is None
+
+
 def test_tick_schema_covers_the_plan_fields():
     fields = set(TickRecord.__dataclass_fields__)
     assert {

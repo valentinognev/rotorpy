@@ -6,8 +6,10 @@ from scipy.spatial.transform import Rotation
 from rotorpy.controllers.px4_cascade import Px4Cascade
 from rotorpy.frames import attitude_enu_flu_to_ned_frd, enu_to_ned
 from rotorpy.guidance.homing import HomingCommand
+from rotorpy.guidance.offboard_command import CommandMode, offboard_gains
 from rotorpy.guidance.outcome import HomingOutcome
 from rotorpy.guidance.runner import (
+    control_from_homing,
     _fly_homing,
     flight_status,
     format_nominal,
@@ -100,3 +102,75 @@ def test_homing_command_matches_px4_ned_at_the_no_lock_start():
     assert "make_controller" in source
     assert "control_from_homing" in source
     assert "set_frame" not in source
+
+
+_GAIN_CONFIG = {"track_tau_s": 0.5, "max_tilt_deg": 45.0, "min_specific_up_g": 0.3}
+
+
+def _no_lock_start():
+    state = nominal_initial_state()
+    homing_yaw = float(np.arctan2(TARGET_GROUND_NED[1], TARGET_GROUND_NED[0]))
+    command = HomingCommand(
+        initial_velocity_ned(START_NED, TARGET_GROUND_NED, INITIAL_SPEED),
+        np.zeros(3),
+        np.zeros(3),
+        homing_yaw,
+        False,
+        False,
+        None,
+        None,
+        None,
+    )
+    return state, command
+
+
+def test_attitude_command_matches_px4_ned_at_the_no_lock_start():
+    state, command = _no_lock_start()
+    gains = offboard_gains(_GAIN_CONFIG, {})[0]
+    px4 = px4_command_from_homing(
+        command,
+        CommandMode.ATTITUDE,
+        measured_velocity_cascade_ned=enu_to_ned(state["v"]),
+        gains=gains,
+    )
+    assert px4["tier"] == "attitude"
+    ned_yaw, pitch, roll = Rotation.from_quat(px4["attitude"]).as_euler("ZYX")
+    state_yaw = Rotation.from_quat(attitude_enu_flu_to_ned_frd(state["q"])).as_euler("ZYX")[0]
+    assert ned_yaw == pytest.approx(state_yaw)
+    assert abs(pitch) < 1e-6 and abs(roll) < 1e-6
+    assert px4["thrust"] == pytest.approx(gains.hover_thrust)
+
+
+def test_rate_command_is_zero_at_the_no_lock_start():
+    state, command = _no_lock_start()
+    gains = offboard_gains(_GAIN_CONFIG, {})[0]
+    px4 = px4_command_from_homing(
+        command,
+        CommandMode.RATE,
+        measured_velocity_cascade_ned=enu_to_ned(state["v"]),
+        state_q_cascade_ned=attitude_enu_flu_to_ned_frd(state["q"]),
+        gains=gains,
+    )
+    assert px4["tier"] == "rate"
+    assert np.allclose(px4["rate_frd"], 0.0, atol=1e-6)
+    assert px4["thrust"] == pytest.approx(gains.hover_thrust)
+
+
+def test_default_mode_is_velocity_and_matches_the_velocity_dict():
+    _, command = _no_lock_start()
+    assert px4_command_from_homing(command)["tier"] == "velocity"
+    assert px4_command_from_homing(command, CommandMode.VELOCITY)["tier"] == "velocity"
+
+
+def test_control_from_homing_follows_the_config_command_mode():
+    state, command = _no_lock_start()
+    base = dict(_GAIN_CONFIG)
+    # Only the velocity tier reports a nonzero cmd_v.
+    for mode, uses_velocity_tier in (("attitude", False), ("rate", False), ("velocity", True)):
+        out = control_from_homing(
+            "pid", Px4Cascade(quad_params), 0.0, state, command, base | {"command_mode": mode}
+        )
+        assert np.all(np.isfinite(out["cmd_motor_speeds"]))
+        assert np.allclose(out["cmd_v"], state["v"], atol=1e-8) == uses_velocity_tier
+    out = control_from_homing("pid", Px4Cascade(quad_params), 0.0, state, command, None)
+    assert np.allclose(out["cmd_v"], state["v"], atol=1e-8)

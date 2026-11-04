@@ -16,9 +16,17 @@ from rotorpy.world import World
 
 from rotorpy.controllers.px4_cascade import Px4Cascade
 from rotorpy.controllers.quadrotor_control import SE3Control
+from rotorpy.frames import attitude_enu_flu_to_ned_frd, enu_to_ned
 from rotorpy.guidance.frames import sim_to_ned
 from rotorpy.guidance.homing import HomingCommand, HomingGuidance, flat_output
-from rotorpy.guidance.homing_config import scene_from_config
+from rotorpy.guidance.homing_config import command_mode_from_config, scene_from_config
+from rotorpy.guidance.offboard_command import (
+    CommandMode,
+    OffboardGains,
+    attitude_setpoint,
+    offboard_gains,
+    rate_setpoint,
+)
 from rotorpy.guidance.outcome import HomingOutcome, miss_outcome, timeout_outcome
 from rotorpy.guidance.scene import (
     INITIAL_SPEED,
@@ -201,9 +209,22 @@ def make_controller(kind: str, params: dict):
 
 
 def control_from_homing(kind: str, controller, t: float, state: dict, command: HomingCommand, config: Optional[dict]):
-    """One inner-loop update. `pid` takes a PX4 velocity command. `geometric` takes a flat output."""
+    """One inner-loop update. `pid` takes a PX4 command in the config's `command_mode`. `geometric` takes a flat output."""
     if kind == "pid":
-        return controller.update(t, state, px4_command_from_homing(command))
+        mode = CommandMode.VELOCITY if config is None else command_mode_from_config(config)
+        if mode is CommandMode.VELOCITY:
+            return controller.update(t, state, px4_command_from_homing(command))
+        return controller.update(
+            t,
+            state,
+            px4_command_from_homing(
+                command,
+                mode,
+                measured_velocity_cascade_ned=enu_to_ned(state["v"]),
+                state_q_cascade_ned=attitude_enu_flu_to_ned_frd(state["q"]),
+                gains=offboard_gains(config, {})[0],
+            ),
+        )
     if kind == "geometric":
         if config is None:
             output = flat_output(state["x"], command, state["v"])
@@ -220,19 +241,48 @@ def control_from_homing(kind: str, controller, t: float, state: dict, command: H
     raise ValueError("controller must be 'geometric' or 'pid'")
 
 
-def px4_command_from_homing(command: HomingCommand) -> dict:
-    """Velocity-tier PX4 command. Homing north/east/down becomes east/north/down."""
+def px4_command_from_homing(
+    command: HomingCommand,
+    mode: CommandMode = CommandMode.VELOCITY,
+    measured_velocity_cascade_ned=None,
+    state_q_cascade_ned=None,
+    gains: Optional[OffboardGains] = None,
+) -> dict:
+    """PX4 cascade command. Homing north/east/down becomes east/north/down.
+
+    `VELOCITY` is the velocity tier. `ATTITUDE` and `RATE` need the measured velocity
+    and `gains`; `RATE` also needs the current attitude (scalar-last NED/FRD).
+    """
     velocity = command.velocity_ned
     acceleration = command.acceleration_ned
-    return {
-        "tier": "velocity",
-        "velocity_ned": np.array([velocity[1], velocity[0], velocity[2]], dtype=float),
-        "acceleration_ned": np.array(
-            [acceleration[1], acceleration[0], acceleration[2]], dtype=float
-        ),
-        "yaw": math.pi / 2.0 - command.yaw_rad,
-        "yaw_rate": 0.0,
-    }
+    velocity_cascade = np.array([velocity[1], velocity[0], velocity[2]], dtype=float)
+    acceleration_cascade = np.array(
+        [acceleration[1], acceleration[0], acceleration[2]], dtype=float
+    )
+    yaw = math.pi / 2.0 - command.yaw_rad
+    if mode is CommandMode.VELOCITY:
+        return {
+            "tier": "velocity",
+            "velocity_ned": velocity_cascade,
+            "acceleration_ned": acceleration_cascade,
+            "yaw": yaw,
+            "yaw_rate": 0.0,
+        }
+    if measured_velocity_cascade_ned is None or gains is None:
+        raise ValueError("attitude and rate modes need measured_velocity_cascade_ned and gains")
+    setpoint = attitude_setpoint(
+        velocity_cascade,
+        acceleration_cascade,
+        yaw,
+        measured_velocity_cascade_ned,
+        gains,
+    )
+    if mode is CommandMode.ATTITUDE:
+        return {"tier": "attitude", "attitude": setpoint.quat_xyzw, "thrust": setpoint.thrust}
+    if state_q_cascade_ned is None:
+        raise ValueError("rate mode needs state_q_cascade_ned")
+    setpoint = rate_setpoint(setpoint, state_q_cascade_ned, gains)
+    return {"tier": "rate", "rate_frd": setpoint.body_rates_frd, "thrust": setpoint.thrust}
 
 
 def _fly_homing(

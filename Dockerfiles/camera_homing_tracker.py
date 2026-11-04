@@ -59,12 +59,20 @@ from rotorpy.guidance.homing_config import (
     PROPOSED_STARTUP_MODE,
     PROPOSED_TELEMETRY_TIMEOUT_S,
     alignment_from_config,
+    command_mode_from_config,
     guidance_from_config,
     load_homing_config,
     startup_thresholds,
     watchdog_timeouts,
 )
 from rotorpy.guidance.observation_buffer import ObservationBuffer, PROPOSED_CAMERA_FUSION_MAX_AGE_S, select_fresh_or_recent
+from rotorpy.guidance.offboard_command import (
+    OFFBOARD_PX4_PARAMETERS,
+    CommandMode,
+    attitude_setpoint,
+    offboard_gains,
+    rate_setpoint,
+)
 from rotorpy.guidance.outcome import RunOutcome, classify_run
 from rotorpy.guidance.recording_worker import PROPOSED_RECORDING_QUEUE_DEPTH, RecordingWorker
 from rotorpy.guidance.run_failure import (
@@ -106,6 +114,10 @@ from rotorpy.guidance.tracking import TrackingState
 from rotorpy.guidance.vehicle_state import VehicleState
 from rotorpy.guidance.watchdog import CommsWatchdogs
 
+# Dockerfiles/ is not a package and is only on sys.path when run as a script.
+sys.path.append(str(Path(__file__).resolve().parent))
+from px4_characterization import dump_px4_parameters  # noqa: E402
+
 _OFFBOARD_MAIN = 6
 _BODY_LINKS = ("base_link", "/imu_link", "rotor_0", "rotor_1", "rotor_2", "rotor_3", "gps0::link")
 _ROTOR_JOINTS = ("rotor_0_joint", "rotor_1_joint", "rotor_2_joint", "rotor_3_joint")
@@ -131,6 +143,7 @@ _INFRASTRUCTURE_OUTCOMES = (
 # Proposed, not verified: how often the independent setpoint publisher ticks, decoupled
 # from the camera/perception rate configured as "camera_rate_hz".
 _PROPOSED_SETPOINT_RATE_HZ = 50.0
+_HOVER_THRUST_RETRIES = 3
 _POSITION_IGNORE = (
     mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE
@@ -145,6 +158,13 @@ _ACCELERATION_IGNORE = (
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
     | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
 )
+# SET_ATTITUDE_TARGET: attitude mode sends the quaternion and thrust, rate mode the body rates and thrust.
+_ATTITUDE_MODE_TYPE_MASK = (
+    mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_ROLL_RATE_IGNORE
+    | mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_PITCH_RATE_IGNORE
+    | mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_YAW_RATE_IGNORE
+)
+_RATE_MODE_TYPE_MASK = mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE
 
 
 def _position_target_type_mask(enable_acceleration_feedforward):
@@ -175,6 +195,14 @@ def _placeholder_command():
     return HomingCommand(
         np.zeros(3), np.zeros(3), np.zeros(3), 0.0, False, False, None, None, None
     )
+
+
+def _warn(message):
+    """`rospy.logwarn`, but a logging failure must never abort startup."""
+    try:
+        rospy.logwarn(message)
+    except Exception:
+        print(message, file=sys.stderr, flush=True)
 
 
 def _lazy(obj, attr_name, factory):
@@ -235,6 +263,12 @@ class CameraHomingTracker(object):
         self._startup_error = None
         self._observations = ObservationBuffer(cameras=("forward", "upward"))
         self._vehicle_state = VehicleState(alignment_from_config(config, self.startup_mode))
+        self._command_mode = command_mode_from_config(config)
+        self._offboard_config = {key: config[key] for key in ("track_tau_s", "max_tilt_deg", "min_specific_up_g")}
+        # PX4's own values replace these in `_connect`; until then (or if that fails) the defaults hold.
+        self._offboard_gains = offboard_gains(self._offboard_config, {})[0]
+        self._attitude_skips = 0
+        self._last_transmitted_attitude = None
         self._watchdogs = CommsWatchdogs(watchdog_timeouts())
         self._setpoints = SetpointStream(
             publish=self._publish_setpoint,
@@ -315,9 +349,41 @@ class CameraHomingTracker(object):
             raise StartupFailure("heartbeat_timeout")
         self._watchdogs.touch("heartbeat", time.monotonic())
         print("PX4 system {} (startup mode {})".format(self._mav.target_system, self.startup_mode.value), flush=True)
+        if self._command_mode is not CommandMode.VELOCITY:
+            self._read_offboard_gains()
         # Independent of the camera-rate step() loop: a stale command must stop being sent
         # even if perception or the main loop stalls.
         rospy.Timer(rospy.Duration(1.0 / _PROPOSED_SETPOINT_RATE_HZ), self._on_setpoint_timer)
+
+    def _read_offboard_gains(self):
+        """Read the angle-law gains from PX4 once; anything that does not answer falls back,
+        except hover thrust, whose unknown value drops the tracker back to velocity setpoints."""
+        try:
+            params = dump_px4_parameters(self._mav, OFFBOARD_PX4_PARAMETERS)
+        except Exception as exc:
+            _warn("PX4 parameter read failed ({}: {})".format(type(exc).__name__, exc))
+            params = {}
+        gains, fallback = offboard_gains(self._offboard_config, params)
+        # Each retry waits at most one parameter timeout, so this is bounded.
+        for _ in range(_HOVER_THRUST_RETRIES):
+            if "MPC_THR_HOVER" not in fallback:
+                break
+            try:
+                params.update(dump_px4_parameters(self._mav, ("MPC_THR_HOVER",)))
+            except Exception as exc:
+                _warn("PX4 MPC_THR_HOVER read failed ({}: {})".format(type(exc).__name__, exc))
+            gains, fallback = offboard_gains(self._offboard_config, params)
+        self._offboard_gains = gains
+        for name in fallback:
+            if name == "MPC_THR_HOVER":
+                continue
+            _warn("PX4 parameter {} did not answer; using the built-in default".format(name))
+        if "MPC_THR_HOVER" in fallback:
+            _warn(
+                "ERROR: angle commands are disabled because hover thrust is unknown "
+                "(MPC_THR_HOVER did not answer); flying velocity setpoints"
+            )
+            self._command_mode = CommandMode.VELOCITY
 
     # --- lightweight receivers -----------------------------------------------------
 
@@ -835,6 +901,18 @@ class CameraHomingTracker(object):
             stats = dict(self._setpoints.stats_snapshot(), stale_links=list(getattr(self, "_stale_links", ())))
             with _lock_for(self, "_flags_lock"):
                 transmitted = getattr(self, "_last_transmitted", None)
+                angle = getattr(self, "_last_transmitted_attitude", None)
+            angle_fields = {}
+            if angle is not None:
+                rates = angle.get("body_rates_frd")
+                angle_fields = dict(
+                    command_mode=str(angle["mode"]),
+                    transmitted_attitude_quat=[float(v) for v in angle["quat_xyzw"]],
+                    transmitted_thrust=float(angle["thrust"]),
+                    transmitted_body_rates_frd=None if rates is None else [float(v) for v in rates],
+                )
+            elif transmitted is not None:
+                angle_fields = dict(command_mode="velocity")
             telemetry.step(
                 seq=seq,
                 t_s=now,
@@ -857,6 +935,7 @@ class CameraHomingTracker(object):
                 position_ned=sample.position_ned,
                 measured_velocity_ned=sample.velocity_ned,
                 transmitted_setpoint=transmitted,
+                **angle_fields,
                 state=state,
                 px4_mode=None if self._hb_mode is None else str(self._hb_mode),
                 camera=command.source,
@@ -884,9 +963,82 @@ class CameraHomingTracker(object):
         self._setpoints.tick()
 
     def _publish_setpoint(self, command):
-        """Send one offboard velocity setpoint. Called by the setpoint stream's own thread;
-        the command is whatever the stream holds (startup setpoint or homing command)."""
-        self._send(command)
+        """Send one offboard setpoint. Called by the setpoint stream's own thread; the command
+        is whatever the stream holds (startup setpoint or homing command).
+
+        Startup and anything that is not a homing command always go out as velocity. Homing
+        commands in an angle mode are recomputed here from PX4's freshest state; when that
+        state is stale nothing is sent, so PX4 loses offboard rather than holding an old angle.
+        """
+        mode = getattr(self, "_command_mode", CommandMode.VELOCITY)
+        with _lock_for(self, "_flags_lock"):
+            startup_done = getattr(self, "_startup_done", False)
+        if mode is CommandMode.VELOCITY or not startup_done or not isinstance(command, HomingCommand):
+            self._send(command)
+            return
+        setpoint = self._attitude_target_for(command, time.monotonic())
+        if setpoint is None:
+            with _lock_for(self, "_flags_lock"):
+                self._attitude_skips = getattr(self, "_attitude_skips", 0) + 1
+                self._last_transmitted_attitude = None
+            return
+        self._send_attitude_target(setpoint)
+
+    def _attitude_target_for(self, command, now_wall_s):
+        """The estimator-frame attitude (or rate) setpoint for `command`, or None when PX4's
+        attitude or velocity is missing, older than the telemetry timeout, or non-finite."""
+        sample = self._vehicle_state.sample_at(None, now_wall_s)
+        if sample.attitude_quat_world is None or sample.velocity_ned is None:
+            return None
+        for age_s in (sample.attitude_age_s, sample.velocity_age_s):
+            if age_s is None or not age_s <= PROPOSED_TELEMETRY_TIMEOUT_S:
+                return None
+        alignment = self._vehicle_state.alignment
+        gains = self._offboard_gains
+        enable_feedforward = bool(
+            getattr(getattr(self, "guidance", None), "enable_acceleration_feedforward", False)
+        )
+        try:
+            setpoint = attitude_setpoint(
+                alignment.world_vector_to_estimator(command.velocity_ned),
+                alignment.world_vector_to_estimator(command.acceleration_ned),
+                alignment.heading_to_estimator(command.yaw_rad),
+                alignment.world_vector_to_estimator(sample.velocity_ned),
+                gains,
+                enable_acceleration_feedforward=enable_feedforward,
+            )
+            if getattr(self, "_command_mode", CommandMode.VELOCITY) is CommandMode.RATE:
+                setpoint = rate_setpoint(
+                    setpoint, alignment.attitude_to_estimator(sample.attitude_quat_world), gains
+                )
+        except ValueError:
+            return None
+        return setpoint
+
+    def _send_attitude_target(self, setpoint):
+        rate_mode = setpoint.body_rates_frd is not None
+        x, y, z, w = (float(value) for value in setpoint.quat_xyzw)
+        rates = [0.0, 0.0, 0.0] if not rate_mode else [float(value) for value in setpoint.body_rates_frd]
+        thrust = float(setpoint.thrust)
+        # pymavlink is not thread-safe: serialise against the step thread's `_poll_mavlink`.
+        with _lock_for(self, "_mav_lock"):
+            self._mav.mav.set_attitude_target_send(
+                0,
+                self._mav.target_system,
+                self._mav.target_component,
+                _RATE_MODE_TYPE_MASK if rate_mode else _ATTITUDE_MODE_TYPE_MASK,
+                [w, x, y, z],
+                rates[0], rates[1], rates[2],
+                thrust,
+            )
+        with _lock_for(self, "_flags_lock"):
+            self._last_transmitted_attitude = {
+                "mode": "rate" if rate_mode else "attitude",
+                "quat_xyzw": [x, y, z, w],
+                "thrust": thrust,
+                "body_rates_frd": rates if rate_mode else None,
+            }
+            self._last_transmitted = None
 
     def _send(self, command):
         velocity = command.velocity_ned
@@ -912,6 +1064,7 @@ class CameraHomingTracker(object):
             )
         with _lock_for(self, "_flags_lock"):
             self._last_transmitted = [float(velocity[0]), float(velocity[1]), float(velocity[2])]
+            self._last_transmitted_attitude = None
 
     def _motors_ready(self):
         for name in _ROTOR_JOINTS:

@@ -181,6 +181,10 @@ class VehicleState(object):
         self._pending_discontinuity: Optional[str] = None
         self._lock = threading.Lock()
 
+    @property
+    def alignment(self) -> EstimatorOriginAlignment:
+        return self._alignment
+
     def ingest_attitude(self, sim_s: float, wall_s: float, quat_estimator_xyzw) -> None:
         """Record one PX4 `ATTITUDE_QUATERNION`-style sample (estimator-frame, FRD body)."""
         world_quat = self._alignment.attitude_to_world(quat_estimator_xyzw)

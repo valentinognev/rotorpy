@@ -211,6 +211,12 @@ class TickRecord:
     requested_setpoint: Optional[List[float]] = None
     limited_setpoint: Optional[List[float]] = None
     transmitted_setpoint: Optional[List[float]] = None
+    # Angle-mode transmissions (estimator NED/FRD, scalar-last quaternion); `command_mode`
+    # is the kind actually sent this tick: "attitude", "rate" or "velocity".
+    command_mode: Optional[str] = None
+    transmitted_attitude_quat: Optional[List[float]] = None
+    transmitted_thrust: Optional[float] = None
+    transmitted_body_rates_frd: Optional[List[float]] = None
     limiting_reasons: List[str] = field(default_factory=list)
     measured_velocity_ned: Optional[List[float]] = None
     state: Optional[str] = None

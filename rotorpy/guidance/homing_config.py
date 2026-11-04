@@ -8,6 +8,7 @@ import numpy as np
 from rotorpy.guidance.camera_geometry import mount_from_pitch
 from rotorpy.guidance.command_limits import VehicleEnvelope
 from rotorpy.guidance.homing import HomingGuidance
+from rotorpy.guidance.offboard_command import CommandMode, parse_command_mode
 from rotorpy.guidance.origin_alignment import EstimatorOriginAlignment
 from rotorpy.guidance.scene import (
     TargetReference,
@@ -148,6 +149,13 @@ PROPOSED_PN_LEAD_TIME_S = 0.2
 # `docs/superpowers/plans/2026-11-03-gazebo-homing-reliability.md` Phase 7).
 PROPOSED_ENABLE_ACCELERATION_FEEDFORWARD = False
 
+# Proposed default for how the Gazebo tracker commands PX4 offboard once startup is done.
+PROPOSED_COMMAND_MODE = "attitude"
+
+
+def command_mode_from_config(config: dict) -> CommandMode:
+    return parse_command_mode(config.get("command_mode", PROPOSED_COMMAND_MODE))
+
 
 def vehicle_envelope() -> dict:
     """Named vehicle-envelope limits, for
@@ -286,6 +294,7 @@ def load_homing_config(path) -> dict:
         )
     if config["vehicle"] != "hummingbird":
         raise ValueError("camera homing flies the hummingbird")
+    command_mode_from_config(config)
     return config
 
 

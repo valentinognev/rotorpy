@@ -133,6 +133,9 @@
   // Smallest upward specific force for the geometric controller, as a fraction of gravity.
   "min_specific_up_g": 0.3,
 
+  // Gazebo offboard setpoint: "attitude", "rate" or "velocity".
+  "command_mode": "attitude",
+
   // Vehicle parameter set. This example flies the AscTec Hummingbird.
   "vehicle": "hummingbird",
 
