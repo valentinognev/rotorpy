@@ -1,5 +1,7 @@
 """Truth-side scoring: target contact vs ground contact, moving target, between samples."""
 
+import math
+
 import numpy as np
 import pytest
 
@@ -105,7 +107,9 @@ def test_ground_contact_beside_the_target_within_reach_radius_scores_reached():
     scorer = _scorer()
     scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
     scorer.add_vehicle_sample(0.0, [90.0, 50.0, -10.0])
-    assert scorer.add_vehicle_sample(1.0, [100.0, 51.5, -0.1]) == "ground"
+    # Within the tightened default `PROPOSED_MAX_TARGET_GAP_S` (0.25 s) of the one target
+    # sample, and within the reach window of this same (terminal) ground-contact tick.
+    assert scorer.add_vehicle_sample(0.2, [100.0, 51.5, -0.1]) == "ground"
     assert scorer.result().min_surface_distance_m < 1.5
     assert scorer.outcome() is RunOutcome.TARGET_REACHED
 
@@ -179,3 +183,128 @@ def test_batch_scoring_matches_the_online_scorer():
     result = score_traces(vehicle, target, SHAPE, contact_margin_m=0.3)
     assert result.target_contact
     assert result.min_surface_distance_m == 0.0
+
+
+# --- Fix round 1 (finding 2): bounded reach window, ground-projected miss ---------------
+
+
+def test_a_fly_over_followed_by_a_crash_far_away_is_not_reached():
+    # Previously the *minimum* distance over the whole flight decided TARGET_REACHED, so
+    # an early close fly-over followed by a crash somewhere else entirely still counted.
+    # The close approach must be recent relative to the terminal event, not merely
+    # sometime during the flight.
+    scorer = _scorer()
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    scorer.add_target_sample(100.0, [100.0, 50.0, 0.0])
+    assert scorer.add_vehicle_sample(0.0, [110.0, 50.0, -1.5]) is None
+    assert scorer.add_vehicle_sample(1.0, [102.0, 50.0, -1.5]) is None  # a close pass (1.25 m)
+    assert scorer.add_vehicle_sample(2.0, [500.0, 500.0, -30.0]) is None  # flies off
+    assert scorer.add_vehicle_sample(50.0, [500.0, 500.0, -0.1]) == "ground"  # crashes elsewhere
+    result = scorer.result()
+    assert result.min_surface_distance_m < 1.5  # the fly-over really was that close
+    assert not result.target_contact
+    assert scorer.outcome() is RunOutcome.GROUND_MISS  # not TARGET_REACHED
+
+
+def test_a_close_pass_shortly_before_timeout_still_counts_as_reached():
+    # The symmetric case: the close approach *is* within the bounded window of the
+    # terminal event (here, the timeout), so it still counts.
+    scorer = _scorer(timeout_s=20.0)
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    scorer.add_target_sample(100.0, [100.0, 50.0, 0.0])
+    assert scorer.add_vehicle_sample(0.0, [110.0, 50.0, -1.5]) is None
+    assert scorer.add_vehicle_sample(19.0, [102.0, 50.0, -1.5]) is None  # 1.25 m, no contact
+    assert scorer.add_vehicle_sample(21.0, [102.0, 50.0, -1.5]) == "timeout"
+    assert scorer.outcome() is RunOutcome.TARGET_REACHED
+
+
+def test_actual_contact_is_reached_regardless_of_the_reach_window():
+    # Contact is itself a terminal event (the run ends there): the bounded window never
+    # applies to it, only to proximity-alone claims.
+    scorer = _scorer()
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    assert scorer.add_vehicle_sample(0.0, [120.0, 50.0, -1.5]) is None  # far, no contact yet
+    assert scorer.add_vehicle_sample(0.1, [100.0, 50.0, -1.5]) == "target"  # the segment passes through
+    assert scorer.outcome() is RunOutcome.TARGET_REACHED
+
+
+def test_ground_impact_near_the_target_without_contact_per_the_documented_rule():
+    # Documented rule (finding 2): the vehicle's final (ground-impact) position is 2.25 m
+    # from the axis -- surface distance 2.25 - 0.75 (radius) = 1.5 m, exactly
+    # PROPOSED_REACH_RADIUS_M -- and the ground impact *is* the terminal event (no
+    # fly-over ambiguity: whatever the segment's true closest approach is, it occurred on
+    # the very last, terminal tick), so it counts.
+    scorer = _scorer()
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    scorer.add_vehicle_sample(0.0, [100.0, 50.0, -10.0])
+    assert scorer.add_vehicle_sample(0.2, [102.25, 50.0, -0.1]) == "ground"
+    result = scorer.result()
+    assert result.min_surface_distance_m <= 1.5  # the impact point itself is right at the bound
+    assert result.ground_contact and not result.target_contact
+    assert result.ground_miss_m == pytest.approx(2.25, abs=1e-6)
+    assert scorer.outcome() is RunOutcome.TARGET_REACHED
+
+
+def test_ground_miss_is_recorded_at_ground_impact():
+    scorer = _scorer()
+    scorer.add_target_sample(0.0, [100.0, 0.0, 0.0])
+    scorer.add_vehicle_sample(0.0, [0.0, 0.0, -30.0])
+    assert scorer.add_vehicle_sample(1.0, [40.0, 0.0, -0.1]) == "ground"
+    assert scorer.result().ground_miss_m == pytest.approx(60.0, abs=1e-6)
+
+
+def test_ground_miss_is_recorded_at_timeout_when_there_is_no_ground_contact():
+    scorer = _scorer(timeout_s=2.0)
+    scorer.add_target_sample(0.0, [100.0, 0.0, 0.0])
+    scorer.add_vehicle_sample(0.0, [0.0, 0.0, -30.0])
+    assert scorer.add_vehicle_sample(3.0, [70.0, 0.0, -30.0]) == "timeout"
+    assert scorer.result().ground_miss_m == pytest.approx(30.0, abs=1e-6)
+
+
+def test_ground_miss_falls_back_to_the_last_sample_with_no_ground_contact_or_timeout():
+    scorer = _scorer(timeout_s=100.0)
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    scorer.add_vehicle_sample(0.0, [0.0, 0.0, -30.0])
+    assert scorer.outcome() is None  # the run has not ended
+    assert scorer.result().ground_miss_m == pytest.approx(math.hypot(100.0, 50.0), abs=1e-6)
+
+
+def test_ground_miss_falls_back_to_a_stale_target_sample_rather_than_omitting_it():
+    # `ground_miss_m` is a best-effort report, unlike the reach/contact score: it still
+    # uses a stale target sample rather than silently reporting `None`.
+    scorer = _scorer(max_target_gap_s=0.25)
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    assert scorer.add_vehicle_sample(10.0, [100.0, 0.0, -0.1]) == "ground"
+    result = scorer.result()
+    assert result.target_truth_unavailable
+    assert not result.target_contact
+    assert result.ground_miss_m == pytest.approx(50.0, abs=1e-6)
+
+
+# --- Fix round 1 (minor b): tightened gap / target_truth_unavailable --------------------
+
+
+def test_default_max_target_gap_is_tightened_to_a_quarter_second():
+    from rotorpy.guidance.scoring import PROPOSED_MAX_TARGET_GAP_S
+
+    assert PROPOSED_MAX_TARGET_GAP_S == pytest.approx(0.25)
+
+
+def test_target_truth_unavailable_is_recorded_and_the_run_is_not_scored_as_reached():
+    scorer = _scorer()
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    # Far outside the (tightened) default gap: the pairing is unmatched, not scored.
+    assert scorer.add_vehicle_sample(5.0, [100.0, 50.0, -1.5]) is None
+    result = scorer.result()
+    assert result.target_truth_unavailable
+    assert result.unmatched_samples == 1
+    assert not result.target_contact
+    assert result.min_surface_distance_m is None
+
+
+def test_target_truth_available_is_false_once_every_sample_matches():
+    scorer = _scorer()
+    scorer.add_target_sample(0.0, [100.0, 50.0, 0.0])
+    scorer.add_vehicle_sample(0.0, [90.0, 50.0, -1.5])
+    assert not scorer.result().target_truth_unavailable
+

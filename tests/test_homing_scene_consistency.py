@@ -161,6 +161,22 @@ def test_changed_vehicle_spawn_height_or_heading_is_reported(config):
     assert any("yaw" in problem for problem in _mismatches(config, launch=launch))
 
 
+def test_changed_takeoff_ground_spawn_height_is_reported(config):
+    # Minor (e), fix round 1: the airborne-spawn line ("-z 30 -Y", checked above by
+    # `test_changed_vehicle_spawn_height_or_heading_is_reported`) was the only
+    # hummingbird_0 spawn the consistency check ever looked at -- the ground spawn used
+    # in takeoff mode ("-x 0 -y 0 -z 0.2 -Y", only taken when
+    # HOMING_STARTUP_MODE=takeoff) was never checked against
+    # `PROPOSED_TAKEOFF_SPAWN_HEIGHT_M`.
+    launch = LAUNCH_SCRIPT.read_text().replace("-x 0 -y 0 -z 0.2 -Y", "-x 0 -y 0 -z 5.0 -Y")
+    assert any("takeoff" in problem.lower() for problem in _mismatches(config, launch=launch))
+
+
+def test_changed_takeoff_ground_spawn_horizontal_position_is_reported(config):
+    launch = LAUNCH_SCRIPT.read_text().replace("-x 0 -y 0 -z 0.2 -Y", "-x 3 -y 0 -z 0.2 -Y")
+    assert any("takeoff" in problem.lower() for problem in _mismatches(config, launch=launch))
+
+
 def test_target_reference_separates_the_visible_centre_from_the_ground_contact(config):
     reference = gazebo_target_reference(config)
     assert np.allclose(reference.ground_contact_ned, [100.0, 50.0, 0.0])

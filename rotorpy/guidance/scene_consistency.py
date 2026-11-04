@@ -171,6 +171,19 @@ def parse_launch_spawns(text: str) -> dict:
     }
 
 
+def parse_takeoff_spawn(text: str):
+    """The ground-spawn pose used only when `HOMING_STARTUP_MODE=takeoff` -- a second
+    `hummingbird_0` spawn line in the same script (fix round 1, minor e), distinct from
+    the one `parse_launch_spawns` finds (the first, airborne-spawn one). Anchored on the
+    script's own "(takeoff mode)" marker so it is found regardless of which branch
+    `parse_launch_spawns`'s plain first-match search happens to pick up."""
+    pattern = r"\(takeoff mode\)[\s\S]*?--model-name=\"?hummingbird_0\"?\s+-x\s+{0}\s+-y\s+{0}\s+-z\s+{0}".format(
+        _NUMBER
+    )
+    found = re.search(pattern, text)
+    return None if found is None else tuple(float(value) for value in found.groups())
+
+
 def _angle_difference(first: float, second: float) -> float:
     return abs(math.atan2(math.sin(first - second), math.cos(first - second)))
 
@@ -245,6 +258,18 @@ def _check_target_and_launch(config: dict, target_sdf: str, launch_script: str, 
     if yaw is None or _angle_difference(yaw, wanted_yaw) > _ANGLE_TOLERANCE_RAD * 10:
         problems.append("vehicle spawn yaw {} rad differs from the configured course heading {:.6f}".format(
             yaw, wanted_yaw))
+    # Fix round 1 (minor e): the takeoff-mode ground spawn ("-x 0 -y 0 -z 0.2 -Y ...",
+    # only taken when HOMING_STARTUP_MODE=takeoff) was never checked -- the airborne
+    # spawn above is the only hummingbird_0 line `parse_launch_spawns` ever sees (the
+    # first match in the script). A deferred import avoids a circular import: this
+    # module is itself imported by `homing_config`.
+    from rotorpy.guidance.homing_config import PROPOSED_TAKEOFF_SPAWN_HEIGHT_M
+
+    takeoff = parse_takeoff_spawn(launch_script)
+    wanted_takeoff = (wanted_vehicle[0], wanted_vehicle[1], PROPOSED_TAKEOFF_SPAWN_HEIGHT_M)
+    if takeoff is None or not np.allclose(takeoff, wanted_takeoff, atol=_LENGTH_TOLERANCE_M):
+        problems.append("takeoff-mode ground spawn {} differs from the expected {} (same north/east, "
+                         "PROPOSED_TAKEOFF_SPAWN_HEIGHT_M above the ground)".format(takeoff, wanted_takeoff))
 
 
 def check_scene_consistency(config: dict, vehicle_sdf: str, target_sdf: str, launch_script: str) -> List[str]:

@@ -422,12 +422,13 @@ def test_abort_marks_the_setpoint_stream_fatal_and_reports_target_lost(tracker_m
 
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
+    tracker._startup_done = True  # this test is about homing-time ABORT, not startup
     now = time.monotonic()
     for name in ("heartbeat", "telemetry", "image"):
         tracker._watchdogs.touch(name, now)
-    tracker._vehicle_state.ingest_attitude(sim_s=10.0, wall_s=10.0, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_attitude(sim_s=10.0, wall_s=now, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
     tracker._vehicle_state.ingest_local_position(
-        wall_s=10.0, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+        wall_s=now, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
     )
     finish_calls = []
     tracker.telemetry = SimpleNamespace(
@@ -456,9 +457,67 @@ def test_abort_marks_the_setpoint_stream_fatal_and_reports_target_lost(tracker_m
         locked=True, tracking=True, source="forward",
         velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,
     ))
-    tracker._vehicle_state.ingest_attitude(sim_s=10.1, wall_s=10.1, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_attitude(sim_s=10.1, wall_s=time.monotonic(), quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
     tracker.step()
     assert tracker._setpoints.stats.failed is True
+
+
+def test_guidance_abort_during_startup_does_not_end_the_run(tracker_module, monkeypatch):
+    # Finding 3 (fix round 1, promoted): during a long takeoff climb the target can be
+    # out of view long enough for guidance's own one-way ABORT latch to fire before the
+    # startup gate ever opens. That must not end the run (or even be seen): guidance is
+    # not fed anything -- so its internal loss clocks never advance -- until homing has
+    # actually started.
+    from rotorpy.guidance.tracking import TrackingState
+
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker._startup_done = False  # the gate has not opened yet
+    now = time.monotonic()
+    for name in ("heartbeat", "telemetry", "image"):
+        tracker._watchdogs.touch(name, now)
+    tracker._vehicle_state.ingest_attitude(sim_s=10.0, wall_s=10.0, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=10.0, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+    finish_calls = []
+    tracker.telemetry = SimpleNamespace(
+        step=lambda **kwargs: None,
+        finish=lambda outcome, **kwargs: finish_calls.append((outcome, kwargs)),
+    )
+    tracker.recorder = None
+    guidance_calls = []
+    aborted_command = SimpleNamespace(
+        locked=True, tracking=False, source=None,
+        velocity_ned=[0.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,
+        tracking_state=TrackingState.ABORT, abort_reason="max_prediction_gap_exceeded",
+    )
+
+    def update(*args, **kwargs):
+        guidance_calls.append((args, kwargs))
+        return aborted_command
+
+    tracker.guidance = SimpleNamespace(update=update)
+    status = tracker.step()
+    assert status != "target_lost"
+    assert guidance_calls == []  # never fed: the state machine's loss clocks never ran
+    assert tracker._setpoints.stats.failed is False
+    assert finish_calls == []
+    # The gate opening later (a normal, non-abort guidance command) still works: the
+    # earlier ABORT left no sticky state behind.
+    tracker._motors_ready = lambda: True
+    tracker._startup_done = True
+    tracker.guidance = SimpleNamespace(update=lambda *args, **kwargs: SimpleNamespace(
+        locked=True, tracking=True, source="forward",
+        velocity_ned=[1.0, 0.0, 0.0], acceleration_ned=[0.0, 0.0, 0.0], yaw_rad=0.0,
+    ))
+    tracker._vehicle_state.ingest_attitude(sim_s=10.1, wall_s=10.1, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=10.1, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
+    status = tracker.step()
+    assert status != "target_lost"
+    assert tracker._setpoints.stats.failed is False
 
 
 def _end_by(tracker, reason):
@@ -673,6 +732,78 @@ def test_main_passes_an_explicit_startup_mode_flag(tracker_module, monkeypatch):
         tracker_module.main()
 
 
+def _patch_main_io(tracker_module, monkeypatch, argv):
+    rospy = tracker_module.rospy
+    monkeypatch.setattr(sys, "argv", list(argv))
+    monkeypatch.setattr(tracker_module.atexit, "register", lambda callback: None)
+    monkeypatch.setattr(rospy, "init_node", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(rospy, "on_shutdown", lambda callback: None, raising=False)
+    monkeypatch.setattr(rospy, "Rate", lambda rate: SimpleNamespace(sleep=lambda: None), raising=False)
+    monkeypatch.setattr(rospy, "is_shutdown", lambda: False, raising=False)
+
+
+def test_main_announces_and_records_an_outcome_when_config_loading_fails(tracker_module, monkeypatch, capsys, tmp_path):
+    # Finding 1 (fix round 1): a config load failure must not escape as a bare
+    # traceback with no RUN_OUTCOME -- "every run has an outcome" must hold here too.
+    page_path = tmp_path / "Results" / "camera_homing_gazebo.html"
+    _patch_main_io(tracker_module, monkeypatch, ["tracker", "--config", "bad.jsonc"])
+    monkeypatch.setattr(
+        tracker_module, "load_homing_config",
+        lambda path: (_ for _ in ()).throw(ValueError("missing key: timeout_s")),
+    )
+    monkeypatch.setattr(tracker_module, "gazebo_page_path", lambda path: page_path)
+    exit_code = tracker_module.main()
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "RUN_OUTCOME" in output
+    assert "STARTUP_FAILURE" in output
+    assert "missing key: timeout_s" in output
+    outcome_file = page_path.with_suffix(".outcome.json")
+    assert outcome_file.is_file()
+    record = json.loads(outcome_file.read_text())
+    assert record["outcome"] == "STARTUP_FAILURE"
+    assert "missing key: timeout_s" in record["reason"]
+
+
+def test_main_announces_and_records_an_outcome_when_the_constructor_fails(tracker_module, monkeypatch, capsys, tmp_path):
+    # Covers construction failures *after* `load_homing_config` (TruthScorer, telemetry,
+    # the recorder, ...) that are not guarded by the tracker's own internal `_connect`
+    # try/except -- the gap the reviewer found: these ran unguarded in `main()`.
+    page_path = tmp_path / "Results" / "camera_homing_gazebo.html"
+    _patch_main_io(tracker_module, monkeypatch, ["tracker", "--config", "config.jsonc"])
+    monkeypatch.setattr(tracker_module, "load_homing_config", lambda path: {"camera_rate_hz": 20})
+    monkeypatch.setattr(tracker_module, "gazebo_page_path", lambda path: page_path)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(tracker_module, "CameraHomingTracker", _boom)
+    exit_code = tracker_module.main()
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "RUN_OUTCOME" in output
+    assert "STARTUP_FAILURE" in output
+    assert "disk full" in output
+    record = json.loads(page_path.with_suffix(".outcome.json").read_text())
+    assert record["outcome"] == "STARTUP_FAILURE"
+
+
+def test_main_init_failure_outcome_write_never_raises_even_with_an_unwritable_page_path(
+    tracker_module, monkeypatch, capsys
+):
+    # Best-effort: a page path that cannot be written to (for example its parent cannot
+    # be created) must not turn the outcome announce itself into an unhandled traceback.
+    _patch_main_io(tracker_module, monkeypatch, ["tracker", "--config", "config.jsonc"])
+    monkeypatch.setattr(
+        tracker_module, "load_homing_config",
+        lambda path: (_ for _ in ()).throw(ValueError("bad config")),
+    )
+    monkeypatch.setattr(tracker_module, "gazebo_page_path", lambda path: "/nonexistent/\0bad/path.html")
+    exit_code = tracker_module.main()
+    assert exit_code == 1
+    assert "RUN_OUTCOME" in capsys.readouterr().out
+
+
 def test_step_fuses_the_other_cameras_still_recent_cached_image(tracker_module, monkeypatch):
     # Spec: a fresh frame from one camera must not make the *other* camera's stale cached
     # frame appear fresh, but that other camera's still-valid recent observation (within
@@ -680,6 +811,7 @@ def test_step_fuses_the_other_cameras_still_recent_cached_image(tracker_module, 
     # dropped to `None`.
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
+    tracker._startup_done = True  # about camera fusion into guidance, not the startup gate
     monkeypatch.setattr(tracker_module.time, "monotonic", lambda: 1.0)
     tracker._watchdogs.touch("telemetry", 1.0)
     tracker._vehicle_state.ingest_attitude(sim_s=1.0, wall_s=1.0, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
@@ -717,6 +849,12 @@ def test_step_fuses_the_other_cameras_still_recent_cached_image(tracker_module, 
     # Much later: forward's tick-1 frame has aged out of the fusion window.
     monkeypatch.setattr(tracker_module.time, "monotonic", lambda: 10.0)
     tracker._watchdogs.touch("telemetry", 10.0)
+    # Keep the estimate itself fresh too (minor c, fix round 1: `have_estimate` now also
+    # checks each `VehicleSample` age, not just the combined watchdog).
+    tracker._vehicle_state.ingest_attitude(sim_s=10.0, wall_s=10.0, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._vehicle_state.ingest_local_position(
+        wall_s=10.0, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+    )
     tracker._observations.offer(
         "upward", capture_s=10.0, receipt_s=10.0, raw_bytes=raw, width=2, height=2, encoding="rgb8", step=2 * 3,
     )
@@ -729,11 +867,12 @@ def _stepping_tracker(tracker_module, monkeypatch, reason, telemetry):
     (spawn at (0, 0, 30 m) ENU, identity attitude, zero velocity), so world-frame
     telemetry fields come out the same as when Gazebo truth fed the control loop."""
     tracker = _new_tracker(tracker_module, monkeypatch)
-    tracker._vehicle_state.ingest_attitude(sim_s=9.9, wall_s=9.9, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    wall_now = time.monotonic()
+    tracker._vehicle_state.ingest_attitude(sim_s=9.9, wall_s=wall_now, quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
     tracker._vehicle_state.ingest_local_position(
-        wall_s=9.9, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
+        wall_s=wall_now, position_estimator_ned=[0.0, 0.0, 0.0], velocity_estimator_ned=[0.0, 0.0, 0.0]
     )
-    tracker._watchdogs.touch("telemetry", time.monotonic())
+    tracker._watchdogs.touch("telemetry", wall_now)
     tracker._command = SimpleNamespace(
         locked=True, tracking=True, source="forward", velocity_ned=[1.0, 0.0, 0.0]
     )
@@ -1002,6 +1141,29 @@ def test_startup_stream_goes_silent_when_the_estimate_stops_being_fresh(tracker_
     assert tracker._setpoints.tick(now_s=105.0) is None  # expired: nothing is sent
 
 
+def test_have_estimate_requires_fresh_position_not_just_the_combined_watchdog(tracker_module, monkeypatch):
+    # Minor (c), fix round 1: the single "telemetry" watchdog is touched by *either*
+    # ATTITUDE_QUATERNION or LOCAL_POSITION_NED messages, so it can stay "fresh" while
+    # one of the two has actually gone stale. `have_estimate` must also check each
+    # `VehicleSample` age (`attitude_age_s`/`position_age_s`) against
+    # `PROPOSED_TELEMETRY_TIMEOUT_S`, not rely on the combined watchdog alone.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker._setpoints = tracker_module.SetpointStream(publish=lambda command: None, expiry_s=0.5)
+    clock = [100.0]
+    monkeypatch.setattr(tracker_module.time, "monotonic", lambda: clock[0])
+    _fresh_estimate(tracker, 100.0)
+    tracker.step()
+    _, stamp = tracker._setpoints.peek()
+    # Position is never re-ingested, but attitude keeps arriving and re-touches the
+    # single combined "telemetry" watchdog all on its own, past PROPOSED_TELEMETRY_TIMEOUT_S.
+    clock[0] = 100.6
+    tracker._vehicle_state.ingest_attitude(sim_s=clock[0], wall_s=clock[0], quat_estimator_xyzw=[0.0, 0.0, 0.0, 1.0])
+    tracker._watchdogs.touch("telemetry", clock[0])
+    tracker.step()
+    assert tracker._setpoints.peek()[1] == stamp  # not restamped: the estimate is not fresh
+
+
 def test_nothing_is_streamed_during_startup_without_an_estimate(tracker_module, monkeypatch):
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
@@ -1010,15 +1172,22 @@ def test_nothing_is_streamed_during_startup_without_an_estimate(tracker_module, 
 
 
 def test_the_homing_command_never_transmits_while_the_gate_is_still_open(tracker_module, monkeypatch):
+    # Finding 3 (fix round 1): guidance is not even fed while the gate is closed (not
+    # merely "computed but not sent" as before), so the held command is the placeholder.
     tracker = _new_tracker(tracker_module, monkeypatch)
     tracker._motors_ready = lambda: False
-    tracker.guidance = _FakeGuidance()
+    guidance_calls = []
+    tracker.guidance = SimpleNamespace(update=lambda *a, **k: guidance_calls.append(1) or _FakeGuidance().update(
+        *a, **k
+    ))
     _fresh_estimate(tracker)
     _offer_frame(tracker, time.monotonic())
     tracker.step()
     command, _ = tracker._setpoints.peek()
     assert isinstance(command, tracker_module.StartupCommand)
-    assert tracker._command.velocity_ned == [1.0, 0.0, 0.0]  # guidance runs, but is not sent
+    assert guidance_calls == []  # guidance never ran while the gate is still closed
+    assert np.array_equal(tracker._command.velocity_ned, np.zeros(3))  # the placeholder
+
 
 
 def _takeoff_tracker(tracker_module, monkeypatch, clock):
@@ -1063,6 +1232,32 @@ def test_arming_is_requested_through_the_gate_and_bounded(tracker_module, monkey
             _fresh_estimate(tracker, clock[0])
             tracker.step()
     assert 1 <= len(engage_calls) <= 20  # PROPOSED_MAX_ARM_ATTEMPTS, never unbounded
+
+
+def test_armed_and_offboard_are_fed_as_separate_flags_to_the_startup_gate(tracker_module, monkeypatch):
+    # Minor (c), fix round 1: `_hb_armed` (the raw PX4 ARM state) and `_offboard`
+    # (armed AND in offboard mode) are separate data the tracker already has -- the gate
+    # must see each on its own field, not the same combined flag copied into both.
+    from rotorpy.guidance.startup import StartupDecision, StartupPhase
+
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker._motors_ready = lambda: False
+    tracker._hb_armed = True
+    tracker._flight_state = lambda: False  # armed, but not (yet) in offboard mode
+    captured = []
+
+    class FakeGate(object):
+        phase = StartupPhase.MOTOR_START
+
+        def update(self, inputs):
+            captured.append(inputs)
+            return StartupDecision(phase=StartupPhase.MOTOR_START)
+
+    tracker._gate = FakeGate()
+    tracker.step()
+    assert len(captured) == 1
+    assert captured[0].armed is True
+    assert captured[0].offboard is False
 
 
 def test_startup_failure_latches_the_stream_and_writes_exactly_one_outcome(tracker_module, monkeypatch, capsys):
@@ -1212,6 +1407,64 @@ def test_shutdown_after_an_orderly_outcome_keeps_it(tracker_module, monkeypatch)
     tracker._recording = SimpleNamespace(close=lambda timeout=None: None)
     tracker.shutdown()
     assert calls == ["GROUND_MISS", "close"]
+
+
+def test_shutdown_salvages_a_pending_outcome_instead_of_overwriting_it(tracker_module, monkeypatch, capsys):
+    # Minor (a), fix round 1: `_recording.close(timeout)` can return before its worker
+    # thread has drained a real, already-decided outcome still sitting in its queue (it
+    # raced the timeout). Shutdown must not shadow that outcome with a wrong
+    # SIMULATOR_FAILURE "shutdown_before_outcome" -- it must write the queued one.
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    finish_calls = []
+    tracker.telemetry = SimpleNamespace(
+        step=lambda **kwargs: None,
+        finish=lambda outcome, **kwargs: finish_calls.append((outcome, kwargs)) or True,
+    )
+    tracker.recorder = None
+    queued = []
+    # A worker that never drains anything: `submit` only queues, `close` times out
+    # without processing the queue (exactly the race this fix targets).
+    tracker._recording = SimpleNamespace(submit=queued.append, close=lambda timeout=None: None)
+    tracker._submit_outcome("timeout")
+    assert len(queued) == 1  # queued, but never processed by any worker thread
+    tracker.shutdown()
+    assert len(finish_calls) == 1
+    outcome, kwargs = finish_calls[0]
+    assert outcome.name == "TIMEOUT"
+    assert kwargs["reason"] == "timeout"
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("RUN_OUTCOME")]
+    assert len(lines) == 1
+    assert json.loads(lines[0].split(" ", 1)[1])["outcome"] == "TIMEOUT"
+
+
+def test_shutdown_is_guarded_by_an_atomic_lock(tracker_module, monkeypatch):
+    # Minor (a), fix round 1: two concurrent callers (for example `rospy.on_shutdown` and
+    # `atexit`) must never both enter the shutdown body -- a bare flag has a
+    # check-then-set race window a lock does not.
+    import threading
+
+    tracker = _new_tracker(tracker_module, monkeypatch)
+    tracker.telemetry = None
+    tracker.recorder = None
+    entered = threading.Event()
+    proceed = threading.Event()
+    calls = []
+
+    def slow_close(timeout=None):
+        entered.set()
+        proceed.wait(timeout=2.0)
+        calls.append(1)
+
+    tracker._recording = SimpleNamespace(close=slow_close)
+    threads = [threading.Thread(target=tracker.shutdown) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(timeout=2.0)
+    time.sleep(0.05)  # give a racing second caller every chance to also enter
+    proceed.set()
+    for thread in threads:
+        thread.join(timeout=2.0)
+    assert calls == [1]  # the body ran exactly once
 
 
 def test_telemetry_ticks_carry_the_phase_transmitted_setpoint_and_failure_reason(tracker_module, monkeypatch):

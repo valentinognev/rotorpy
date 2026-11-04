@@ -30,6 +30,7 @@ approximation (documented here, not claimed as verified).
 
 import atexit
 import argparse
+import json
 import os
 import sys
 import threading
@@ -56,6 +57,7 @@ from rotorpy.guidance.homing_config import (
     PROPOSED_REACH_RADIUS_M,
     PROPOSED_SERVICE_WAIT_TIMEOUT_S,
     PROPOSED_STARTUP_MODE,
+    PROPOSED_TELEMETRY_TIMEOUT_S,
     alignment_from_config,
     guidance_from_config,
     load_homing_config,
@@ -79,7 +81,7 @@ from rotorpy.guidance.run_failure import (
     is_recoverable,
     outcome_flags,
 )
-from rotorpy.guidance.run_lifecycle import RunLifecycle
+from rotorpy.guidance.run_lifecycle import OUTCOME_PREFIX, RunLifecycle
 from rotorpy.guidance.scoring import TargetShape, TruthScorer
 from rotorpy.guidance.setpoint_stream import PROPOSED_FAILURE_COMMAND, PROPOSED_SETPOINT_EXPIRY_S, SetpointStream
 from rotorpy.guidance.startup import (
@@ -251,6 +253,17 @@ class CameraHomingTracker(object):
         # Protects `_startup_done`/`_gravity_on`/`_startup_yaw`/`_last_transmitted`,
         # written by the step thread and/or the setpoint-publisher thread.
         self._flags_lock = threading.Lock()
+        # Guards `_shutdown_done` atomically (minor a, fix round 1): `shutdown()` can be
+        # called concurrently from rospy's shutdown hook, `atexit`, and the main loop's
+        # `finally`; a bare `getattr`/`setattr` flag can race and run the body twice.
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = False
+        # The most recently queued ("outcome", ...) recording item not yet confirmed
+        # processed (minor a, fix round 1): if `_recording.close(timeout)` returns while
+        # the worker thread is still draining it, `shutdown()` can write this one
+        # directly instead of a wrong SIMULATOR_FAILURE shadowing a real, decided
+        # outcome. Cleared once `_record_sink` actually processes it.
+        self._pending_outcome_item = None
         self._command = None
         self._sent = 0
         self._pending_status = None
@@ -487,6 +500,15 @@ class CameraHomingTracker(object):
             and homing_attitude is not None
             and sample.velocity_ned is not None
             and not self._watchdogs.stale("telemetry", wall_now)
+            # Minor (c), fix round 1: the combined "telemetry" watchdog is touched by
+            # *either* ATTITUDE_QUATERNION or LOCAL_POSITION_NED, so it can stay fresh
+            # while only one of the two keeps arriving. Check each `VehicleSample` age
+            # on its own too, so a stalled attitude or position stream is caught even
+            # while the other keeps the combined watchdog touched.
+            and sample.attitude_age_s is not None
+            and sample.attitude_age_s <= PROPOSED_TELEMETRY_TIMEOUT_S
+            and sample.position_age_s is not None
+            and sample.position_age_s <= PROPOSED_TELEMETRY_TIMEOUT_S
         )
         # A fresh frame from one camera must not make the *other* camera's stale cached
         # frame appear fresh, but that other camera's still-valid recent observation
@@ -498,8 +520,22 @@ class CameraHomingTracker(object):
         receipts = [obs.receipt_s for obs, is_fresh in ((forward_obs, forward_fresh), (upward_obs, upward_fresh))
                     if is_fresh and obs is not None]
         observation_wall_s = max(receipts) if receipts else wall_now
+        # Advanced before the command is computed: the gate decision (including whether
+        # homing opens this very tick) does not depend on `command`, and running it first
+        # lets `compute_command` below see an up-to-date `self._startup_done` -- so
+        # guidance starts on the same tick the gate opens, not one tick late.
+        self._advance_startup(wall_now, have_estimate, sample, homing_attitude)
 
         def compute_command():
+            # Finding 3 (fix round 1): guidance is not fed anything until the startup
+            # gate has opened. Its tracking state machine is a one-way latch (`ABORT`
+            # never recovers) and its loss clocks only advance on `update()` calls, so
+            # calling it during a long takeoff climb -- target out of view, nothing to
+            # do with it yet -- could latch a spurious `ABORT`/`TARGET_LOST` from pure
+            # startup, or leave it stuck in `ABORT` once homing opens. The placeholder
+            # keeps its `STARTUP` state untouched until there is an actual homing tick.
+            if not self._startup_done:
+                return _placeholder_command()
             # `t` is the image's own *capture* time (when the frame -- and the
             # `sample` above, already drawn from the T3 `VehicleState` history at
             # this same instant -- actually describe the world), not the processing
@@ -529,16 +565,20 @@ class CameraHomingTracker(object):
         # estimate never stops the stream (the held time must keep aging).
         if stamp_wall_s is not None:
             self._guidance_stamp = stamp_wall_s
-        just_started = self._advance_startup(wall_now, have_estimate, sample, homing_attitude)
         if self._startup_done:
             if stamp_wall_s is not None:
                 self._setpoints.set_command(command, stamp_wall_s)
-            elif just_started and getattr(self, "_guidance_stamp", None) is not None:
-                # Homing just opened: hand over the guidance command at its *own* age, so
-                # a command computed long ago expires instead of looking fresh.
+            elif getattr(self, "_guidance_stamp", None) is not None:
+                # No fresh frame the very tick homing opened (rare): hand over the
+                # guidance command at its own age once one exists, so a command computed
+                # long ago expires instead of looking fresh.
                 self._setpoints.set_command(command, self._guidance_stamp)
         status = None
-        if command is not None and getattr(command, "tracking_state", None) is TrackingState.ABORT:
+        # `self._startup_done` here: a command computed *before* the gate opened was
+        # unconditionally the placeholder (never fed to guidance above), so it cannot
+        # itself be an `ABORT`. Discarding it until homing is active also protects a
+        # resumed tracker whose startup history is unknown.
+        if self._startup_done and command is not None and getattr(command, "tracking_state", None) is TrackingState.ABORT:
             # The explicit, one-way failure response: do NOT keep issuing normal
             # stale-command homing after `ABORT` (decision, proposed default: map it to
             # the T3 `SetpointStream` failure-response path and the T1 `TARGET_LOST`
@@ -615,7 +655,14 @@ class CameraHomingTracker(object):
             attitude_valid=homing_attitude is not None,
             height_m=sample.height_above_ground_m,
             velocity_ned=sample.velocity_ned,
-            armed=bool(self._offboard),
+            # Minor (c), fix round 1: separate data -- `_hb_armed` is PX4's own raw ARM
+            # state; `_offboard` (via `_flight_state`) is "armed AND in offboard mode".
+            # Feeding the same combined flag into both fields hid the raw ARM state from
+            # the gate (it only ever reads `armed and offboard`, so this changes no
+            # decision today, but a future consumer of `armed` alone would otherwise see
+            # the wrong thing). Falls back to `_offboard` itself when a test-constructed
+            # tracker never set `_hb_armed` (no heartbeat ever polled).
+            armed=bool(getattr(self, "_hb_armed", self._offboard)),
             offboard=bool(self._offboard),
             motors_ready=motors_ready,
         ))
@@ -678,6 +725,13 @@ class CameraHomingTracker(object):
 
     # --- outcomes ---------------------------------------------------------------------
 
+    def _submit_recording_outcome(self, item):
+        """Queue an `("outcome", ...)` recording item, remembering it (minor a, fix
+        round 1) so `shutdown()` can still write it directly if the worker thread has
+        not drained it by the time the recording queue is closed."""
+        self._pending_outcome_item = item
+        self._recording.submit(item)
+
     def _submit_outcome(self, status):
         """Queue the run's one outcome (after the pending tick records, so the log is ordered)."""
         if getattr(self, "_outcome_queued", False):
@@ -691,11 +745,16 @@ class CameraHomingTracker(object):
                 "target": RunOutcome.TARGET_REACHED, "target_lost": RunOutcome.TARGET_LOST,
             }.get(status, RunOutcome.SIMULATOR_FAILURE)
         result = scorer.result()
-        self._recording.submit(("outcome", outcome, status, {
+        self._submit_recording_outcome(("outcome", outcome, status, {
             "miss_m": scorer.miss_m(),
             "target_contact": result.target_contact,
             "ground_contact": result.ground_contact,
             "min_distance_time_s": result.min_distance_time_s,
+            # Finding 2 (fix round 1): the ground-projected miss and whether the target
+            # truth was fully available, alongside the closest-surface-approach reported
+            # above, so a replay/report can show both without recomputing them.
+            "ground_miss_m": result.ground_miss_m,
+            "target_truth_unavailable": result.target_truth_unavailable,
             "scored_samples": result.matched_samples,
             "unmatched_samples": result.unmatched_samples,
         }))
@@ -744,7 +803,7 @@ class CameraHomingTracker(object):
         if not getattr(self, "_outcome_queued", False):
             self._outcome_queued = True
             outcome = classify_run(**outcome_flags(exc))
-            self._recording.submit(("outcome", outcome, reason, {"error": type(exc).__name__}))
+            self._submit_recording_outcome(("outcome", outcome, reason, {"error": type(exc).__name__}))
         return False
 
     # --- recording: off the control path, a slow sink cannot stall setpoints -------------
@@ -754,6 +813,8 @@ class CameraHomingTracker(object):
         if kind == "step":
             self._record_step(*item[1:])
         elif kind == "outcome":
+            if item is getattr(self, "_pending_outcome_item", None):
+                self._pending_outcome_item = None
             self._lifecycle_for().finish(item[1], item[2], **item[3])
 
     def _record_step(
@@ -914,11 +975,22 @@ class CameraHomingTracker(object):
         """Drain the recording queue, then settle the outcome and close every sink. Safe to
         call from every termination path (orderly, failure, rospy shutdown, atexit): a run
         torn down with no outcome gets one infrastructure outcome rather than silence."""
-        if getattr(self, "_shutdown_done", False):
-            return
-        self._shutdown_done = True
+        with _lock_for(self, "_shutdown_lock"):
+            # Atomic check-and-set (minor a, fix round 1): `rospy.on_shutdown`, `atexit`
+            # and the main loop's own `finally` can all reach this concurrently; a bare
+            # `getattr`/`setattr` flag can race two callers into the body at once.
+            if getattr(self, "_shutdown_done", False):
+                return
+            self._shutdown_done = True
         self._recording.close(timeout=5.0)
         lifecycle = self._lifecycle_for()
+        pending = getattr(self, "_pending_outcome_item", None)
+        if lifecycle.outcome is None and pending is not None:
+            # The worker thread raced the close timeout with a real, already-decided
+            # outcome still in its queue (minor a, fix round 1): write that one directly
+            # instead of letting `ensure_outcome` shadow it with a wrong
+            # SIMULATOR_FAILURE "shutdown_before_outcome".
+            self._record_sink(pending)
         lifecycle.ensure_outcome("shutdown_before_outcome")
         lifecycle.close()
 
@@ -935,6 +1007,32 @@ def _stamp_seconds(msg):
         return None
 
 
+def _announce_init_failure(page_path, exc):
+    """`main()`'s construction block (config load, the truth scorer, telemetry, the
+    recorder, ...) ran before any run directory or outcome sink existed. A failure there
+    used to be a bare traceback with no `RUN_OUTCOME` line -- "every run has an outcome"
+    failed on exactly this path. Announce the one outcome on stdout (the same line
+    `RunLifecycle.finish` would print) and, best effort, drop a minimal outcome JSON file
+    next to the configured page/results path. Never raises."""
+    failure = exc if isinstance(exc, FatalError) else StartupFailure(
+        "init_failed:{}: {}".format(type(exc).__name__, exc)
+    )
+    outcome = classify_run(**outcome_flags(failure))
+    fields = {"outcome": outcome.value, "reason": failure_reason(failure), "persisted": False}
+    try:
+        print("{} {}".format(OUTCOME_PREFIX, json.dumps(fields, default=str)), flush=True)
+    except Exception:
+        pass
+    if page_path is None:
+        return
+    try:
+        outcome_path = Path(page_path).with_suffix(".outcome.json")
+        outcome_path.parent.mkdir(parents=True, exist_ok=True)
+        outcome_path.write_text(json.dumps(fields, default=str))
+    except Exception:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="Camera-homing tracker for the Gazebo Hummingbird.")
     parser.add_argument("--config", required=True)
@@ -947,9 +1045,19 @@ def main():
         "simulation mode, spawned at the start height with gravity disabled until the rotors spin.",
     )
     args = parser.parse_args()
-    config = load_homing_config(args.config)
-    rospy.init_node("camera_homing_tracker", anonymous=True)
-    tracker = CameraHomingTracker(config, args.model, gazebo_page_path(args.config), startup_mode=args.startup_mode)
+    # Bounded fallback (finding 1, fix round 1): config load, the truth scorer, telemetry
+    # and the recorder all run here, outside the tracker's own `_connect` try/except --
+    # a failure must still end with exactly one announced/recorded outcome, not a
+    # traceback and silence.
+    page_path = None
+    try:
+        page_path = gazebo_page_path(args.config)
+        config = load_homing_config(args.config)
+        rospy.init_node("camera_homing_tracker", anonymous=True)
+        tracker = CameraHomingTracker(config, args.model, page_path, startup_mode=args.startup_mode)
+    except Exception as exc:
+        _announce_init_failure(page_path, exc)
+        return 1
     rospy.on_shutdown(tracker.write_page)
     rospy.on_shutdown(tracker.shutdown)
     atexit.register(tracker.write_page)

@@ -37,9 +37,21 @@ PROPOSED_CONTACT_MARGIN_M = 0.3
 # Proposed, not verified: height of the vehicle's reference point above the ground at
 # which it is on the ground (the Gazebo body rests a few centimetres above z = 0).
 PROPOSED_GROUND_CLEARANCE_M = 0.25
-# Proposed, not verified: a target truth sample older than this at a vehicle sample time
-# is not used (the pairing is counted as unmatched instead of extrapolated).
-PROPOSED_MAX_TARGET_GAP_S = 1.0
+# Proposed, not verified, tightened in fix round 1 (was 1.0 s): a target truth sample
+# older than this at a vehicle sample time is not used for scoring (the pairing is
+# counted as unmatched instead of extrapolated/held stale). A moving target can cover
+# several metres in even this bound; it existed mainly to tolerate normal publish
+# jitter, not to paper over a target truth source that stalled or was never sampled.
+PROPOSED_MAX_TARGET_GAP_S = 0.25
+# Proposed, not verified (finding 2, fix round 1): how recent -- relative to the run's
+# terminal event (ground contact, timeout, or the last sample) -- the single closest
+# surface approach must be for proximity alone (no actual contact) to decide
+# TARGET_REACHED. Without this bound the *minimum* distance over the whole flight would
+# decide the outcome, so an early close fly-over followed by a crash somewhere else
+# entirely would still count as reached. Actual `target_contact` is itself a terminal
+# event (segment-vs-cylinder contact or a collision event) and is never subject to this
+# bound.
+PROPOSED_REACH_WINDOW_S = 2.0
 # Bound on the target trace the online scorer keeps (oldest dropped first).
 PROPOSED_TARGET_TRACE_LEN = 4096
 
@@ -156,6 +168,15 @@ class TraceBuffer(object):
             previous_t, previous_v = sample_t, sample_v
         return last_v.copy()
 
+    def last(self) -> Optional[Tuple[float, np.ndarray]]:
+        """The most recent raw sample as-is (`None` if empty), with no gap bound: for
+        best-effort reporting (`ground_miss_m`) only, never used to decide a match or a
+        score -- `at()`'s gap bound is what guards those."""
+        if not self._samples:
+            return None
+        t_s, vector = self._samples[-1]
+        return t_s, vector.copy()
+
 
 @dataclass(frozen=True)
 class ScoreResult:
@@ -172,6 +193,17 @@ class ScoreResult:
     ground_time_s: Optional[float]
     timed_out: bool
     elapsed_s: Optional[float]
+    # Fix round 1 (finding 2): the horizontal ("ground-projected") distance from the
+    # vehicle to the target's ground-contact point at the run's terminal sample (ground
+    # impact, the timeout-triggering sample, or else the last sample seen) -- distinct
+    # from `min_surface_distance_m`, which is the closest 3-D approach to the cylinder
+    # anywhere in the flight.
+    ground_miss_m: Optional[float]
+    # Fix round 1 (minor b): at least one vehicle sample had no usable target truth at
+    # its time (the target trace was empty with no static fallback, or every sample was
+    # outside `max_target_gap_s`). Such samples are never scored as reached; this flag
+    # only surfaces that the run (or part of it) was not fully scorable.
+    target_truth_unavailable: bool
 
 
 class TruthScorer(object):
@@ -193,6 +225,7 @@ class TruthScorer(object):
         max_target_gap_s: float = PROPOSED_MAX_TARGET_GAP_S,
         static_target_ground_ned: Optional[Sequence[float]] = None,
         target_trace_len: int = PROPOSED_TARGET_TRACE_LEN,
+        reach_window_s: float = PROPOSED_REACH_WINDOW_S,
     ) -> None:
         self.shape = shape
         self.timeout_s = float(timeout_s)
@@ -201,10 +234,12 @@ class TruthScorer(object):
         self.ground_clearance_m = float(ground_clearance_m)
         self.ground_down_m = float(ground_down_m)
         self.max_target_gap_s = float(max_target_gap_s)
+        self.reach_window_s = float(reach_window_s)
         self._static = None if static_target_ground_ned is None else np.asarray(static_target_ground_ned, dtype=float)
         self._target = TraceBuffer(target_trace_len)
         self._t0: Optional[float] = None
         self._previous: Optional[Tuple[float, np.ndarray, np.ndarray]] = None
+        self._last_sample: Optional[Tuple[float, np.ndarray]] = None
         self._samples = 0
         self._matched = 0
         self._unmatched = 0
@@ -230,6 +265,29 @@ class TruthScorer(object):
             return None if self._static is None else self._static.copy()
         return self._target.at(t_s, self.max_target_gap_s)
 
+    def _target_reference(self, t_s: float) -> Optional[np.ndarray]:
+        """Best-effort target position for *reporting* (`ground_miss_m`) only -- unlike
+        `_target_at`, falls back to the most recent raw sample even when it is stale, so
+        a diagnostic miss distance is still recorded instead of silently omitted. Never
+        used to decide a match or a score."""
+        value = self._target_at(t_s)
+        if value is not None:
+            return value
+        last = self._target.last()
+        return None if last is None else last[1]
+
+    def _ground_projected_miss(self) -> Optional[float]:
+        """Horizontal distance from the vehicle to the target's ground-contact point at
+        the run's terminal sample (ground impact, the timeout-triggering sample, or else
+        the last sample seen so far)."""
+        if self._last_sample is None:
+            return None
+        t_s, vehicle = self._last_sample
+        target = self._target_reference(t_s)
+        if target is None:
+            return None
+        return float(math.hypot(vehicle[0] - target[0], vehicle[1] - target[1]))
+
     def add_vehicle_sample(self, t_s: float, position_ned) -> Optional[str]:
         t_s = float(t_s)
         vehicle = np.asarray(position_ned, dtype=float).reshape(3)
@@ -238,6 +296,7 @@ class TruthScorer(object):
         if self._previous is not None and t_s <= self._previous[0]:
             return None
         self._samples += 1
+        self._last_sample = (t_s, vehicle.copy())
         if self._t0 is None:
             self._t0 = t_s
         self._elapsed = t_s - self._t0
@@ -303,6 +362,14 @@ class TruthScorer(object):
             self._ended = True
         return kind if first else None
 
+    def _recent_enough(self) -> bool:
+        """Whether the closest surface approach happened within `reach_window_s` of the
+        most recent sample seen (the run's terminal tick: ground impact, the
+        timeout-triggering sample, or else the last sample so far)."""
+        if self._min_time is None or self._last_sample is None:
+            return False
+        return (self._last_sample[0] - self._min_time) <= self.reach_window_s
+
     def result(self) -> ScoreResult:
         return ScoreResult(
             samples=self._samples,
@@ -316,11 +383,27 @@ class TruthScorer(object):
             ground_time_s=self._ground_time,
             timed_out=self._timed_out,
             elapsed_s=self._elapsed,
+            ground_miss_m=self._ground_projected_miss(),
+            target_truth_unavailable=self._unmatched > 0,
         )
 
     def miss_m(self) -> Optional[float]:
         """Truth miss distance (to the cylinder surface); 0 when contact was reported."""
         return 0.0 if self._target_contact else self._min_distance
+
+    def _reach_eligible(self) -> bool:
+        """TARGET_REACHED-by-proximity criterion (finding 2, fix round 1): actual contact
+        with the target body always qualifies (it is itself a terminal event); a mere
+        closest-surface-approach within `reach_radius_m` only qualifies when it happened
+        within `reach_window_s` of the run's terminal tick -- so a close fly-over long
+        before a later, distant ground impact does not retroactively count."""
+        if self._target_contact:
+            return True
+        return (
+            self._min_distance is not None
+            and self._min_distance <= self.reach_radius_m
+            and self._recent_enough()
+        )
 
     def outcome(self, **failure_flags) -> Optional[RunOutcome]:
         """The run outcome once something ended it, else None.
@@ -330,8 +413,10 @@ class TruthScorer(object):
         """
         if not (self._ended or any(failure_flags.values())):
             return None
+        reach_eligible = self._reach_eligible()
+        classify_miss = 0.0 if self._target_contact else (self._min_distance if reach_eligible else None)
         return classify_run(
-            miss_m=self.miss_m(),
+            miss_m=classify_miss,
             ground_contact=self._ground_contact,
             timed_out=self._timed_out,
             reach_radius_m=self.reach_radius_m,
