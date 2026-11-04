@@ -22,11 +22,10 @@ from typing import Any, List, Optional
 
 import numpy as np
 
-from rotorpy.guidance.frames import ned_to_sim
+from rotorpy.guidance.gazebo_bridge import attitude_homing_to_ned_frd
 from rotorpy.guidance.homing import HomingCommand
 from rotorpy.guidance.homing_config import (
     PROPOSED_REACH_RADIUS_M,
-    gazebo_scene_from_config,
     guidance_from_config,
     vehicle_envelope,
 )
@@ -39,6 +38,7 @@ from rotorpy.guidance.tracking import TrackingState
 from rotorpy.guidance.validation.faults import FaultSchedule
 from rotorpy.guidance.validation.harness_config import harness_config
 from rotorpy.guidance.validation.target_world import MovingTargetWorldBuilder, TargetMotionProfile
+from rotorpy.guidance.validation.true_cameras import build_true_frd_cameras, world_to_true_ned
 from rotorpy.guidance.validation.vehicle_model import VehicleResponseModel
 
 # Proposed, harness-only: the wall-clock-equivalent delay between a transmitted
@@ -162,7 +162,13 @@ def run_trial(spec: TrialSpec, config: Optional[dict] = None) -> TrialResult:
     ground_down_m = -float(config["ground_z_m"])
 
     guidance = guidance_from_config(config)
-    _, forward_camera, upward_camera = gazebo_scene_from_config(config)
+    # True NED/FRD cameras (Task 10 fix), not `homing_config.gazebo_scene_from_config`'s
+    # cameras: those assume the standard "simulator body" convention
+    # (`scene.pitched_extrinsics`), which mismatches `attitude_sim_quat`'s actual
+    # "homing simulator" (mirrored) convention once the vehicle yaws away from its
+    # initial heading -- see `validation.true_cameras`'s module docstring and
+    # `task-10-report.md`'s investigation log.
+    forward_camera, upward_camera = build_true_frd_cameras(config)
     world_builder = MovingTargetWorldBuilder(config)
 
     start_ned, initial_velocity_ned, heading = _initial_course(config, spec)
@@ -232,20 +238,53 @@ def run_trial(spec: TrialSpec, config: Optional[dict] = None) -> TrialResult:
         dropout = spec.fault_schedule.camera_dropout_active(t)
         forward_image = upward_image = None
         fresh = False
+        capture_pose = None
         if not stalled and not dropout and _camera_due(t, camera_period_s):
-            pose = vehicle.delayed_pose(t)
-            state = {"x": ned_to_sim(pose.position_ned), "q": pose.attitude_sim_quat}
-            world = world_builder.world_at(target_position_ned)
+            capture_pose = vehicle.delayed_pose(t)
+            # True NED position / true FRD-in-NED attitude (Task 10 fix): matches
+            # `build_true_frd_cameras`'s extrinsics convention and `homing.py`'s own
+            # backprojection (`attitude_homing_to_ned_frd` is the same adapter
+            # `_sightline_and_relative` uses), instead of the mismatched
+            # "simulator body" pairing the previous `ned_to_sim(...)`/bare
+            # `attitude_sim_quat` state used.
+            state = {
+                "x": capture_pose.position_ned,
+                "q": attitude_homing_to_ned_frd(capture_pose.attitude_sim_quat),
+            }
+            world = world_to_true_ned(world_builder.world_at(target_position_ned))
             forward_image = forward_camera.measurement(state, world)["image"]
             upward_image = upward_camera.measurement(state, world)["image"]
             fresh = True
 
         have_estimate = not spec.fault_schedule.stale_telemetry_active(t)
-        height_above_ground_m = ground_down_m - vehicle.position_ned[2]
+        # Fix round 1 (Task 10, harness bug): on a fresh camera tick, the images were
+        # rendered from `vehicle.delayed_pose(t)` (`image_delay_s` stale), so the
+        # height/attitude/velocity handed to `guidance.update()` must describe that
+        # SAME instant, not "now" -- `guidance.update()`'s own docstring requires
+        # these three parameters to be "the vehicle state AT t [the measurement
+        # time]", exactly mirroring how the real tracker samples them from the T3
+        # `VehicleState` history at the image's own capture time. Feeding the
+        # vehicle's live (not delayed) height/velocity into the same-tick ray
+        # intersection and the target-motion estimator's Kalman-predict control
+        # input was geometrically inconsistent with the delayed pixels and produced
+        # a steadily growing spurious target-velocity estimate for even a genuinely
+        # stationary target (see task-10-report.md's investigation log). When there
+        # is no fresh frame this tick, there is no measurement to be consistent
+        # with, so the vehicle's current state is used (matching `predict_to`'s own
+        # "current, not historical" contract for the short processing-delay
+        # extrapolation it performs).
+        if capture_pose is not None:
+            height_above_ground_m = ground_down_m - capture_pose.position_ned[2]
+            attitude_for_update = capture_pose.attitude_sim_quat
+            velocity_for_update = capture_pose.velocity_ned
+        else:
+            height_above_ground_m = ground_down_m - vehicle.position_ned[2]
+            attitude_for_update = vehicle.attitude_sim_quat
+            velocity_for_update = vehicle.velocity_ned
 
         def compute_command():
             return guidance.update(
-                t, height_above_ground_m, vehicle.attitude_sim_quat, vehicle.velocity_ned,
+                t, height_above_ground_m, attitude_for_update, velocity_for_update,
                 forward_image, upward_image, control_t=t,
             )
 

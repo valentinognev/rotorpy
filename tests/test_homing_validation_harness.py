@@ -69,3 +69,34 @@ def test_recording_failure_is_isolated_but_the_outcome_is_still_recorded(config)
     assert isinstance(result.outcome, RunOutcome)
     assert len(result.closer_failures) == 1
     assert result.closer_failures[0][0] == "recording"
+
+
+def test_stationary_target_nominal_trial_reaches_the_target_without_a_false_velocity_estimate(config):
+    """Task 10 regression (two root causes, both fixed): the PN-lead branch's wrong
+    estimator field (`homing._steer`, Fix 1) and the harness's camera/backprojection
+    convention mismatch (`validation.true_cameras`, Fix 2) each independently fed the
+    target-motion estimator a spurious nonzero velocity for a genuinely stationary
+    target as the pursuing vehicle yawed off its initial heading, eventually crashing
+    it (`task-10-report.md`'s investigation log). With both fixed, the default
+    stationary scenario (`validation.scenarios.nominal_scenarios`'s first, seed-0
+    trial) reaches the target, and the estimator's own target-speed estimate stays
+    near zero throughout (never confused by the vehicle's own yaw/motion).
+    """
+    from rotorpy.guidance.validation.scenarios import nominal_scenarios
+
+    spec = nominal_scenarios(1, seed=0)[0]
+    assert spec.target_profile.kind == "stationary"
+    max_speed_estimate = [0.0]
+
+    def _on_tick(record):
+        command = record.command
+        target_motion = None if command is None else command.target_motion
+        if target_motion is not None and target_motion.target_velocity_ned is not None:
+            max_speed_estimate[0] = max(
+                max_speed_estimate[0], float(np.linalg.norm(target_motion.target_velocity_ned))
+            )
+
+    spec.on_tick = _on_tick
+    result = run_trial(spec, config=config)
+    assert result.outcome is RunOutcome.TARGET_REACHED
+    assert max_speed_estimate[0] < 1.0
