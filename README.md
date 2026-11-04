@@ -189,6 +189,35 @@ Startup, outcomes and replay (plan Phase 8). `guidance/startup.py`'s `StartupGat
 
 `Dockerfiles/px4_characterization.py` is a documented, importable (not run here) PX4 parameter-dump and command-response-characterization script; its `analyze_step_response`/`analyze_velocity_tracking` arithmetic is unit-tested on synthetic data so a future live-flight log only has to supply the recording.
 
+Offline reliability harness and campaign (plan Phase 9). `rotorpy/guidance/validation/` is a new, deliberately truth-side package (outside `tests/test_homing_truth_boundary.py`'s own non-recursive `rotorpy/guidance/*.py` glob, pinned down by `tests/test_homing_validation_truth_boundary.py`): it drives the *real* `HomingGuidance`/`TrackingStateMachine`/`TargetMotionEstimator`/`command_limits`/`SetpointStream` through a synthetic closed loop instead of Gazebo. `validation/vehicle_model.py`'s `VehicleResponseModel` is a first-order velocity/yaw-tracking truth vehicle (reusing `homing.track_acceleration`'s own tilt/upright-specific-force law), with command latency and a short pose history so the synthetic camera can render a deliberately stale pose. `validation/target_world.py`'s `TargetMotionProfile` (stationary/crossing/approaching/receding/turning/accelerating, bounded by `homing_config`'s own proposed target-motion envelope) and `MovingTargetWorldBuilder` turn that into a `World` the project's own `PinholeCamera` renders -- the feature template is built once and rigidly translated per tick (no RNG on the hot path). `validation/faults.py` injects camera dropout, processing stalls, stale telemetry, a sim-clock pause/reset, and a recording-closer failure. `validation/harness.py`'s `run_trial` wires all of this to the real `scoring.TruthScorer`/`run_lifecycle.RunLifecycle`, so every trial ends with exactly one `RunOutcome`. `validation/scenarios.py`/`stats.py`/`campaign.py` generate fixed-seed nominal/stress trials, compute Wilson confidence intervals and failure-category counts, and format a campaign report -- run with `python -m rotorpy.guidance.validation.campaign` (`--quick` for a tiny smoke run; never the real >=100-trial campaign inside the automated test suite). `harness_config.py` renders at a reduced (but still real-pinhole-projection) resolution so hundreds of trials run in minutes offline; every number this tooling reports is explicitly labelled a simulation-model result, not Gazebo validation, and no PX4/ROS/real flight is used anywhere in it. See `UPDATES.md`'s Phase 9 entry for the measured (honest, including failures) results of the one campaign run so far, and the section below for the proposed envelopes and the Gazebo campaign protocol that remains to be run.
+
+### Proposed operating envelope and reproducible validation (plan Phase 9 documentation)
+
+**Status: no real-flight (Gazebo/PX4) validation of any kind has been performed.** Every number below is a named `PROPOSED_*` constant in `rotorpy/guidance/homing_config.py` (or `rotorpy/guidance/validation/harness_config.py` for harness-only simplifications), not a measured or verified value.
+
+- **Target-motion envelope** (`homing_config.target_motion_thresholds()`): ground target only, up to `PROPOSED_MAX_TARGET_SPEED_M_S` = 5.0 m/s and `PROPOSED_MAX_TARGET_ACCEL_M_S2` = 2.0 m/s^2 (a brisk walk/jog and a generous acceleration for a person or small ground vehicle); `validation.target_world.TargetMotionProfile` rejects any scenario parameters outside this envelope.
+- **Vehicle envelope** (`homing_config.vehicle_envelope()`): `PROPOSED_VEHICLE_MAX_SPEED_M_S` = 15.0 m/s, `_MAX_ACCEL_M_S2` = 5.0, `_MAX_JERK_M_S3` = 10.0, `_MAX_YAW_RATE_RAD_S` = 1.0, `_MAX_VERTICAL_SPEED_M_S` = 8.0, plus a visibility margin (`PROPOSED_VISIBILITY_MARGIN_FRAC` = 0.2, floor `PROPOSED_VISIBILITY_MIN_SPEED_SCALE` = 0.3) that reduces speed/turn authority as the tracked target nears the image edge.
+- **Failure behaviour**: a recoverable camera dropout holds (not re-corrects) the last commanded velocity until either a fresh frame returns or `PROPOSED_MAX_PREDICTION_GAP_S` (2.0 s) elapses, at which point tracking aborts (`ABORT` -> `TARGET_LOST`, `SetpointStream.mark_fatal()`); independently, the transmitted setpoint itself expires after `PROPOSED_SETPOINT_EXPIRY_S` (0.5 s) of no new observation, sending nothing (`PROPOSED_FAILURE_COMMAND = None`) rather than a stale velocity -- PX4's own failsafe (RTL/land/hold), not this codebase, is the backstop. There is deliberately no terminal hover/stop phase.
+- **Configuration**: the authoritative scene is `examples/camera_homing.jsonc`; the harness's `validation.harness_config.harness_config()` loads it and overrides only the rendering resolution (`PROPOSED_HARNESS_IMAGE_SIZE_PX` = 600, large enough that the production 0.75 m target cylinder stays above the detector's 4-pixel minimum across the scene's ~110 m approach range) and feature spacing (`PROPOSED_HARNESS_FEATURE_SPACING_M` = 0.1 m, for per-trial rendering speed).
+
+**Reproducible validation commands** (all offline, no Gazebo/PX4/ROS):
+
+```bash
+# Release-gate and harness unit tests (small trial counts; this is what the automated
+# suite runs):
+/home/valento/Anaconda3/envs/rotorpy/bin/python -m pytest tests/test_homing_validation_*.py -q
+
+# A tiny smoke campaign (seconds, not minutes):
+/home/valento/Anaconda3/envs/rotorpy/bin/python -m rotorpy.guidance.validation.campaign --quick
+
+# The real campaign (>=100 nominal + separate stress trials; several minutes, run
+# manually, never inside the test suite):
+/home/valento/Anaconda3/envs/rotorpy/bin/python -m rotorpy.guidance.validation.campaign \
+    --n-nominal 100 --n-stress 20 --seed 0 --json
+```
+
+**The Gazebo campaign protocol that remains to be run** (requires Docker, the `px4-noetic-sim-ros` image, and a working X display -- none available in this environment): repeat this harness's stationary and moving-target scenarios as real `./run_camera_homing_sitl.sh` flights (varying heading/offset/height/speed for stationary; crossing/approaching/receding/turning/accelerating for moving), with the same fault categories injected at the PX4/Gazebo level where possible (kill the camera topic, pause Gazebo, stall `camera_homing_tracker.py`, disconnect MAVLink), at least 100 nominal flights plus separate stress flights with fixed scenario seeds, scoring every flight with `rotorpy/guidance/scoring.py` exactly as `camera_homing_tracker.py` already does, and reporting the same speed/tracking-error/visibility-loss/latency/saturation/success-rate bundle with Wilson confidence intervals this module computes. Only after that protocol has actually been run does any number above stop being a simulation-model result.
+
 ## Reading order for agents
 1. Read this `README.md`.
 2. Read `UPDATES.md` for the change history and current state before working. 
